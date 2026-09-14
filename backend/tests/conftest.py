@@ -28,9 +28,12 @@ def _mock_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture(autouse=True)
 def _ensure_test_tables() -> None:
-    """Create all database tables for tests that use the DB."""
+    """Create all database tables for tests that use the DB.
+
+    Drops and recreates tables to handle schema changes between runs.
+    """
     from app.core.database import Base, engine
 
+    Base.metadata.drop_all(bind=engine)
     Base.metadata.create_all(bind=engine)
     yield
-    # Optional cleanup between tests could go here

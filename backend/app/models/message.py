@@ -21,6 +21,9 @@ class Message(UUIDMixin, TimestampMixin, Base):
     content: Mapped[str | None] = mapped_column(Text, nullable=True)
     sequence: Mapped[int] = mapped_column(Integer, nullable=False)
 
+    # Full LLM message data (JSON) — stores tool_calls, tool_call_id, name
+    llm_data: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     # Cost tracking per message
     cost: Mapped[float | None] = mapped_column(Float, nullable=True)
     token_count: Mapped[int | None] = mapped_column(Integer, nullable=True)

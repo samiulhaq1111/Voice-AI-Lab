@@ -15,6 +15,7 @@ from app.models.usage_record import UsageRecord
 from app.models.voice_session import VoiceSession
 from app.providers.factory import ProviderError, get_llm_provider
 from app.providers.llm.interface import LLMInterface
+from app.providers.types import LLMMessage
 from app.services.tool_service import get_tool_registry
 from app.tools.executor import ToolExecutor
 
@@ -42,6 +43,45 @@ def _create_session(db: Session, llm_provider: str, llm_model: str | None) -> Vo
     return session
 
 
+def _message_to_llm(msg: Message) -> LLMMessage:
+    """Convert a persisted Message to a generic LLMMessage.
+
+    Uses llm_data (full JSON) when available, falls back to
+    role/content for backward compatibility.
+    """
+    if msg.llm_data:
+        try:
+            data = json.loads(msg.llm_data)
+            return LLMMessage(
+                role=data.get("role", msg.role),
+                content=data.get("content"),
+                tool_calls=data.get("tool_calls"),
+                tool_call_id=data.get("tool_call_id"),
+                name=data.get("name"),
+            )
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return LLMMessage(role=msg.role, content=msg.content)
+
+
+def _load_history(db: Session, session_id: str) -> list[LLMMessage]:
+    """Load recent conversation messages from the database.
+
+    Returns the latest N messages ordered by sequence, converted
+    to generic LLMMessage objects suitable for AgentRuntime.
+    """
+    limit = settings.max_conversation_messages
+    rows = (
+        db.query(Message)
+        .filter(Message.session_id == session_id)
+        .order_by(Message.sequence.desc())
+        .limit(limit)
+        .all()
+    )
+    rows.reverse()  # oldest first
+    return [_message_to_llm(m) for m in rows]
+
+
 def _save_message(
     db: Session,
     session_id: str,
@@ -49,6 +89,7 @@ def _save_message(
     content: str | None,
     sequence: int,
     token_count: int | None = None,
+    llm_data: dict[str, Any] | None = None,
 ) -> Message:
     """Persist a message to the database."""
     msg = Message(
@@ -57,6 +98,7 @@ def _save_message(
         content=content,
         sequence=sequence,
         token_count=token_count,
+        llm_data=json.dumps(llm_data) if llm_data else None,
     )
     db.add(msg)
     db.commit()
@@ -175,23 +217,49 @@ async def process_chat(
         config=config,
     )
 
-    # Save user message
-    seq = voice_session.message_count
-    _save_message(db, sid, "user", message, seq)
-    voice_session.message_count = seq + 1
+    # Load conversation history BEFORE the agent loop
+    # to avoid including the current message in the history
+    history: list[LLMMessage] = []
+    if session_id:
+        history = _load_history(db, sid)
+        logger.info("Loaded %d history messages for session %s", len(history), sid)
 
-    # Run agent loop
+    # Run agent loop — the runtime adds the user message to its state
     logger.info("Chat start (session=%s, provider=%s)", sid, resolved_provider)
     try:
-        result: AgentResult = await runtime.run(message)
+        result: AgentResult = await runtime.run(message, initial_messages=history)
     except Exception as e:
         logger.error("Agent loop failed: %s", e)
         raise ChatError(f"LLM provider error: {e}", status_code=502) from e
 
-    # Save assistant message
-    total_tokens = result.usage.get("total_tokens")
-    _save_message(db, sid, "assistant", result.response, seq + 1, token_count=total_tokens)
-    voice_session.message_count = seq + 2
+    # Save all new messages from runtime state.
+    # History messages are already persisted; save only the new ones
+    # (user message + assistant response + any intermediate tool messages)
+    seq = voice_session.message_count
+    new_start = len(history)
+    new_msgs = runtime.state.messages[new_start:]
+    for i, llm_msg in enumerate(new_msgs):
+        save_seq = seq + i
+        # Attach token count to the final assistant message
+        token_count: int | None = None
+        if i == len(new_msgs) - 1 and llm_msg.role == "assistant":
+            token_count = result.usage.get("total_tokens")
+        _save_message(
+            db,
+            sid,
+            llm_msg.role,
+            llm_msg.content,
+            save_seq,
+            token_count=token_count,
+            llm_data={
+                "role": llm_msg.role,
+                "content": llm_msg.content,
+                "tool_calls": llm_msg.tool_calls,
+                "tool_call_id": llm_msg.tool_call_id,
+                "name": llm_msg.name,
+            },
+        )
+    voice_session.message_count = seq + len(new_msgs)
 
     # Save tool calls
     for tc_dict in result.tool_calls:

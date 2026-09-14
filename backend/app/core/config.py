@@ -45,6 +45,7 @@ class Settings(BaseSettings):
 
     # --- Agent Runtime ---
     max_agent_iterations: int = 5
+    max_conversation_messages: int = 50
 
     @property
     def cors_origin_list(self) -> list[str]:

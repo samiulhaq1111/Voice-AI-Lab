@@ -113,7 +113,9 @@ class AgentRuntime:
         result = await self.run(text)
         return result.response
 
-    async def run(self, text: str) -> AgentResult:
+    async def run(
+        self, text: str, *, initial_messages: list[LLMMessage] | None = None
+    ) -> AgentResult:
         """Process user text and return a structured AgentResult.
 
         This is the preferred entry point — it returns the full result
@@ -121,11 +123,17 @@ class AgentRuntime:
 
         Args:
             text: The user's text input.
+            initial_messages: Optional prior conversation messages to seed
+                the agent state with (loaded from history).
 
         Returns:
             AgentResult with response, tool_calls, usage, iterations.
         """
         logger.info("Agent start (input=%s...)", text[:80])
+
+        # Seed state with prior conversation history if provided
+        if initial_messages:
+            self._state.messages.extend(initial_messages)
 
         # Add user message to history
         self._state.messages.append(LLMMessage(role="user", content=text))
