@@ -19,6 +19,9 @@ def setup_logging() -> None:
 
     # Reduce noise from third-party loggers
     logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+    logging.getLogger("httpcore.connection").setLevel(logging.WARNING)
+    logging.getLogger("httpcore.http11").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     sa_level = logging.WARNING if not settings.app_debug else logging.INFO
     logging.getLogger("sqlalchemy.engine").setLevel(sa_level)
 

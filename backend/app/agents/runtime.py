@@ -8,6 +8,7 @@ and the ToolExecutor — NOT on concrete providers.
 """
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -48,6 +49,11 @@ class AgentResult:
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     usage: dict[str, int] = field(default_factory=dict)
     iterations: int = 0
+
+
+# Type alias for tool-call event callbacks used by voice/external observers.
+# Called with (tool_call_dict, tool_result_dict) after each tool execution.
+ToolCallCallback = Callable[[dict[str, Any], dict[str, Any]], Any]
 
 
 class AgentRuntime:
@@ -114,7 +120,11 @@ class AgentRuntime:
         return result.response
 
     async def run(
-        self, text: str, *, initial_messages: list[LLMMessage] | None = None
+        self,
+        text: str,
+        *,
+        initial_messages: list[LLMMessage] | None = None,
+        on_tool_call: ToolCallCallback | None = None,
     ) -> AgentResult:
         """Process user text and return a structured AgentResult.
 
@@ -125,6 +135,9 @@ class AgentRuntime:
             text: The user's text input.
             initial_messages: Optional prior conversation messages to seed
                 the agent state with (loaded from history).
+            on_tool_call: Optional callback invoked after each tool execution
+                with (tool_call_dict, result_dict). Used by voice gateway
+                to emit real-time tool events.
 
         Returns:
             AgentResult with response, tool_calls, usage, iterations.
@@ -139,7 +152,7 @@ class AgentRuntime:
         self._state.messages.append(LLMMessage(role="user", content=text))
 
         # Run the LLM with tool-call loop
-        result = await self._run_agent_loop()
+        result = await self._run_agent_loop(on_tool_call=on_tool_call)
 
         # Add assistant response to history
         self._state.messages.append(LLMMessage(role="assistant", content=result.response))
@@ -151,7 +164,7 @@ class AgentRuntime:
         )
         return result
 
-    async def _run_agent_loop(self) -> AgentResult:
+    async def _run_agent_loop(self, *, on_tool_call: ToolCallCallback | None = None) -> AgentResult:
         """Run the LLM call loop, handling tool calls until a final text response.
 
         Returns:
@@ -167,8 +180,8 @@ class AgentRuntime:
             messages = self._build_messages()
 
             logger.info(
-                "LLM request (round=%d, messages=%d, tools=%d)",
-                round_num + 1,
+                "[AGENT] Iteration started iteration=%d messages=%d tools=%d",
+                iterations,
                 len(messages),
                 len(tool_schemas),
             )
@@ -186,10 +199,10 @@ class AgentRuntime:
                 total_usage[key] = total_usage.get(key, 0) + val
 
             logger.info(
-                "LLM response (finish=%s, tokens=%s, tool_calls=%d)",
-                response.finish_reason,
-                response.usage.get("total_tokens", 0),
+                "[AGENT] LLM response received has_content=%s tool_calls=%d finish=%s",
+                bool(response.content),
                 len(response.tool_calls or []),
+                response.finish_reason,
             )
 
             # If no tool calls, return the text response
@@ -203,9 +216,9 @@ class AgentRuntime:
 
             # Handle tool calls
             logger.info(
-                "LLM requested %d tool call(s) in round %d",
+                "[AGENT] Tool calls requested count=%d iteration=%d",
                 len(response.tool_calls),
-                round_num + 1,
+                iterations,
             )
 
             # Add assistant message with tool calls to history
@@ -220,18 +233,39 @@ class AgentRuntime:
             # Execute each tool call and add results
             for tool_call in response.tool_calls:
                 all_tool_calls.append(tool_call)
-                result = await self._execute_tool_call(tool_call)
+                tool_name = tool_call.get("function", {}).get("name", "")
+                logger.info("[AGENT] Tool call requested name=%s", tool_name)
+                raw_result = await self._execute_tool_call(tool_call)
+                logger.info("[AGENT] Tool call completed name=%s", tool_name)
+                result_dict: dict[str, Any] = {
+                    "name": tool_call.get("function", {}).get("name", ""),
+                    "success": not (isinstance(raw_result, dict) and "error" in raw_result),
+                    "output": raw_result,
+                }
+                if on_tool_call:
+                    import inspect
+
+                    maybe_coro = on_tool_call(tool_call, result_dict)
+                    if inspect.iscoroutine(maybe_coro):
+                        await maybe_coro
                 self._state.messages.append(
                     LLMMessage(
                         role="tool",
-                        content=json.dumps(result) if not isinstance(result, str) else result,
+                        content=(
+                            json.dumps(raw_result)
+                            if not isinstance(raw_result, str)
+                            else raw_result
+                        ),
                         tool_call_id=tool_call.get("id", ""),
                         name=tool_call.get("function", {}).get("name", ""),
                     )
                 )
 
         # Safety: max rounds exceeded
-        logger.warning("Agent loop exceeded max tool rounds (%d)", self._config.max_tool_rounds)
+        logger.warning(
+            "[AGENT] Maximum iterations reached max_iterations=%d",
+            self._config.max_tool_rounds,
+        )
         msg = "I apologize, but I was unable to complete the request within the allowed steps."
         return AgentResult(
             response=msg,

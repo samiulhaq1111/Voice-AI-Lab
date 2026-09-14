@@ -150,7 +150,9 @@ def get_available_providers() -> dict:
         "tts": [
             {
                 "provider": "elevenlabs",
-                "models": ["eleven_monolingual_v1", "eleven_multilingual_v2"],
+                "default_model": settings.default_tts_model or "eleven_flash_v2_5",
+                "default_voice": settings.default_tts_voice or "JBFqnCBsd6RMkjVDRZzb",
+                "models": ["eleven_flash_v2_5", "eleven_multilingual_v2", "eleven_v3"],
                 "configured": settings.is_provider_configured("elevenlabs"),
             },
         ],

@@ -87,6 +87,7 @@ export interface ProviderOption {
   models: string[];
   configured: boolean;
   default_model?: string;
+  default_voice?: string;
 }
 
 // --- Tool Types ---
@@ -105,3 +106,74 @@ export interface HealthStatus {
   version: string;
   timestamp: string;
 }
+
+// --- Voice WebSocket Events ---
+
+export type VoiceEventType =
+  | 'session_started'
+  | 'processing'
+  | 'transcript'
+  | 'agent_response'
+  | 'tool_call'
+  | 'tool_result'
+  | 'audio'
+  | 'completed'
+  | 'error';
+
+export interface VoiceEventBase {
+  type: VoiceEventType;
+}
+
+export interface VoiceSessionStarted extends VoiceEventBase {
+  type: 'session_started';
+  session_id: string;
+}
+
+export interface VoiceProcessing extends VoiceEventBase {
+  type: 'processing';
+}
+
+export interface VoiceTranscript extends VoiceEventBase {
+  type: 'transcript';
+  text: string;
+  final: boolean;
+}
+
+export interface VoiceAgentResponse extends VoiceEventBase {
+  type: 'agent_response';
+  text: string;
+}
+
+export interface VoiceToolCall extends VoiceEventBase {
+  type: 'tool_call';
+  name: string;
+  arguments: Record<string, unknown>;
+}
+
+export interface VoiceAudio extends VoiceEventBase {
+  type: 'audio';
+  format: string;
+  data: string; // base64
+}
+
+export interface VoiceCompleted extends VoiceEventBase {
+  type: 'completed';
+}
+
+export interface VoiceError extends VoiceEventBase {
+  type: 'error';
+  message: string;
+}
+
+export type VoiceEvent =
+  | VoiceSessionStarted
+  | VoiceProcessing
+  | VoiceTranscript
+  | VoiceAgentResponse
+  | VoiceToolCall
+  | VoiceAudio
+  | VoiceCompleted
+  | VoiceError;
+
+export type RecordingState = 'idle' | 'recording' | 'processing' | 'playing';
+export type ConnectionState = 'disconnected' | 'connecting' | 'connected';

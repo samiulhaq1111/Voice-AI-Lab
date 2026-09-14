@@ -13,7 +13,7 @@ def adapter() -> ElevenLabsAdapter:
     return ElevenLabsAdapter(
         api_key="test-key",
         default_voice="test-voice-id",
-        default_model="eleven_monolingual_v1",
+        default_model="eleven_flash_v2_5",
     )
 
 
@@ -79,6 +79,19 @@ class TestElevenLabsAdapter:
                 await adapter.synthesize("Hello")
 
     @pytest.mark.asyncio
+    async def test_synthesize_payment_required_402(self, adapter: ElevenLabsAdapter) -> None:
+        """HTTP 402 should raise payment required error."""
+        mock_response = httpx.Response(
+            402,
+            json={"detail": {"message": "Insufficient credits", "status": "payment_required"}},
+            request=httpx.Request("POST", "https://api.elevenlabs.io/v1/text-to-speech/test-voice-id"),
+        )
+
+        with patch.object(adapter._client, "post", new_callable=AsyncMock, return_value=mock_response):
+            with pytest.raises(RuntimeError, match="billing/entitlement"):
+                await adapter.synthesize("Hello")
+
+    @pytest.mark.asyncio
     async def test_synthesize_invalid_input(self, adapter: ElevenLabsAdapter) -> None:
         mock_response = httpx.Response(
             422,
@@ -113,7 +126,97 @@ class TestElevenLabsAdapter:
                 await adapter.synthesize("Hello")
 
     @pytest.mark.asyncio
+    async def test_synthesize_bad_request_400(self, adapter: ElevenLabsAdapter) -> None:
+        """HTTP 400 should log error detail and raise RuntimeError."""
+        mock_response = httpx.Response(
+            400,
+            json={"detail": {"message": "Invalid model", "status": "invalid_model"}},
+            request=httpx.Request("POST", "https://api.elevenlabs.io/v1/text-to-speech/test-voice-id"),
+        )
+
+        with patch.object(adapter._client, "post", new_callable=AsyncMock, return_value=mock_response):
+            with pytest.raises(RuntimeError, match="HTTP 400"):
+                await adapter.synthesize("Hello")
+
+    @pytest.mark.asyncio
+    async def test_synthesize_forbidden_403(self, adapter: ElevenLabsAdapter) -> None:
+        """HTTP 403 should raise authorization error."""
+        mock_response = httpx.Response(
+            403,
+            json={"detail": "Forbidden"},
+            request=httpx.Request("POST", "https://api.elevenlabs.io/v1/text-to-speech/test-voice-id"),
+        )
+
+        with patch.object(adapter._client, "post", new_callable=AsyncMock, return_value=mock_response):
+            with pytest.raises(RuntimeError, match="authorization failed"):
+                await adapter.synthesize("Hello")
+
+    @pytest.mark.asyncio
+    async def test_synthesize_rate_limit_429(self, adapter: ElevenLabsAdapter) -> None:
+        """HTTP 429 should raise rate limit error."""
+        mock_response = httpx.Response(
+            429,
+            json={"detail": "Rate limit exceeded"},
+            request=httpx.Request("POST", "https://api.elevenlabs.io/v1/text-to-speech/test-voice-id"),
+        )
+
+        with patch.object(adapter._client, "post", new_callable=AsyncMock, return_value=mock_response):
+            with pytest.raises(RuntimeError, match="rate limit"):
+                await adapter.synthesize("Hello")
+
+    @pytest.mark.asyncio
+    async def test_synthesize_model_override(self, adapter: ElevenLabsAdapter) -> None:
+        """Model override should be used in request payload."""
+        mock_response = httpx.Response(
+            200,
+            content=b"audio",
+            headers={"content-type": "audio/mpeg"},
+            request=httpx.Request("POST", "https://api.elevenlabs.io/v1/text-to-speech/test-voice-id"),
+        )
+
+        with patch.object(adapter._client, "post", new_callable=AsyncMock, return_value=mock_response) as mock_post:
+            await adapter.synthesize("Test", model="eleven_multilingual_v2")
+
+        call_payload = mock_post.call_args.kwargs["json"]
+        assert call_payload["model_id"] == "eleven_multilingual_v2"
+
+    @pytest.mark.asyncio
+    async def test_synthesize_voice_override(self, adapter: ElevenLabsAdapter) -> None:
+        """Voice override should appear in URL."""
+        mock_response = httpx.Response(
+            200,
+            content=b"audio",
+            headers={"content-type": "audio/mpeg"},
+            request=httpx.Request("POST", "https://api.elevenlabs.io/v1/text-to-speech/override-voice"),
+        )
+
+        with patch.object(adapter._client, "post", new_callable=AsyncMock, return_value=mock_response) as mock_post:
+            result = await adapter.synthesize("Test", voice="override-voice")
+
+        call_url = mock_post.call_args.args[0]
+        assert "override-voice" in call_url
+        assert result.metadata["voice"] == "override-voice"
+
+    @pytest.mark.asyncio
     async def test_close(self, adapter: ElevenLabsAdapter) -> None:
         with patch.object(adapter._client, "aclose", new_callable=AsyncMock) as mock_close:
             await adapter.close()
         mock_close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_output_format_sent_as_query_param(self, adapter: ElevenLabsAdapter) -> None:
+        """output_format must be a query parameter, not in the JSON body."""
+        mock_response = httpx.Response(
+            200,
+            content=b"audio",
+            headers={"content-type": "audio/mpeg"},
+            request=httpx.Request("POST", "https://api.elevenlabs.io/v1/text-to-speech/test-voice-id"),
+        )
+
+        with patch.object(adapter._client, "post", new_callable=AsyncMock, return_value=mock_response) as mock_post:
+            await adapter.synthesize("Test")
+
+        # Verify output_format is in query params, NOT in JSON body
+        call_kwargs = mock_post.call_args.kwargs
+        assert call_kwargs["params"]["output_format"] == "mp3_44100_128"
+        assert "output_format" not in call_kwargs["json"]

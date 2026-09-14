@@ -4,8 +4,9 @@ import { useEffect, useState } from 'react';
 import type { HealthStatus } from './types';
 import { getHealth } from './services/api';
 import TextChat from './features/TextChat';
+import VoiceTest from './features/VoiceTest';
 
-type Tab = 'status' | 'chat';
+type Tab = 'status' | 'chat' | 'voice';
 
 function App() {
   const [health, setHealth] = useState<HealthStatus | null>(null);
@@ -24,7 +25,7 @@ function App() {
         <div>
           <h1 className="text-xl font-bold text-white">Voice AI Lab</h1>
           <p className="text-xs text-gray-500">
-            {health ? `Backend: ${health.status} (v${health.version})` : 'Phase 3 — Text Agent Loop'}
+            {health ? `Backend: ${health.status} (v${health.version})` : 'Phase 4 — Browser Voice MVP'}
           </p>
         </div>
         <nav className="flex gap-1">
@@ -37,6 +38,16 @@ function App() {
             }`}
           >
             Chat
+          </button>
+          <button
+            onClick={() => setTab('voice')}
+            className={`px-3 py-1.5 rounded text-sm ${
+              tab === 'voice'
+                ? 'bg-blue-600 text-white'
+                : 'bg-gray-800 text-gray-400 hover:text-gray-200'
+            }`}
+          >
+            Voice
           </button>
           <button
             onClick={() => setTab('status')}
@@ -53,6 +64,7 @@ function App() {
 
       <main className="flex-1 flex flex-col">
         {tab === 'chat' && <TextChat />}
+        {tab === 'voice' && <VoiceTest />}
 
         {tab === 'status' && (
           <div className="max-w-4xl mx-auto px-6 py-12 w-full">
@@ -92,7 +104,7 @@ function App() {
       </main>
 
       <footer className="border-t border-gray-800 px-6 py-2 text-center text-xs text-gray-600">
-        Voice AI Lab v0.1.0 &mdash; Phase 3: Text Agent Loop & Tool Calling
+        Voice AI Lab v0.2.0 &mdash; Phase 4: Browser Voice MVP
       </footer>
     </div>
   );

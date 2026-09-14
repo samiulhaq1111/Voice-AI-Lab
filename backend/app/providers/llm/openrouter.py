@@ -1,5 +1,6 @@
 """OpenRouter LLM adapter implementing LLMInterface."""
 
+import time
 from collections.abc import AsyncIterator
 
 import httpx
@@ -69,38 +70,69 @@ class OpenRouterAdapter(LLMInterface):
         )
 
         logger.info(
-            "OpenRouter chat request (model=%s, messages=%d)",
+            "[OPENROUTER] Request started model=%s message_count=%d "
+            "tool_count=%d api_key_configured=%s",
             resolved_model,
             len(messages),
+            len(tools) if tools else 0,
+            bool(self._api_key),
         )
 
+        request_start = time.monotonic()
         try:
             response = await self._client.post(_OPENROUTER_CHAT_URL, json=payload)
+            duration_ms = (time.monotonic() - request_start) * 1000
+            logger.info(
+                "[OPENROUTER] Response received status=%d duration_ms=%.0f",
+                response.status_code,
+                duration_ms,
+            )
             response.raise_for_status()
 
         except httpx.HTTPStatusError as e:
             status = e.response.status_code
+            duration_ms = (time.monotonic() - request_start) * 1000
             try:
                 error_body = e.response.json()
                 detail = error_body.get("error", {}).get("message", "")
             except Exception:
                 detail = e.response.text[:200]
             if status == 401:
-                logger.error("OpenRouter authentication failed")
+                logger.error(
+                    "[OPENROUTER] Authentication failed status=401 duration_ms=%.0f",
+                    duration_ms,
+                )
                 raise RuntimeError("OpenRouter authentication failed") from e
-            logger.error("OpenRouter API error: HTTP %d — %s", status, detail)
+            logger.error(
+                "[OPENROUTER] Request failed status=%d duration_ms=%.0f detail=%s",
+                status,
+                duration_ms,
+                detail[:200],
+            )
             raise RuntimeError(f"OpenRouter API error: HTTP {status} — {detail}") from e
 
         except httpx.TimeoutException:
-            logger.error("OpenRouter request timed out after %.1fs", self._timeout)
+            duration_ms = (time.monotonic() - request_start) * 1000
+            logger.error(
+                "[OPENROUTER] Request timed out after %.1fs duration_ms=%.0f",
+                self._timeout,
+                duration_ms,
+            )
             raise RuntimeError("OpenRouter request timed out")
 
         except httpx.HTTPError as e:
-            logger.error("OpenRouter HTTP error: %s", e)
+            logger.error("[OPENROUTER] HTTP error type=%s", type(e).__name__)
             raise RuntimeError(f"OpenRouter HTTP error: {e}") from e
 
         data = response.json()
-        return self._parse_response(data)
+        result = self._parse_response(data)
+        logger.info(
+            "[OPENROUTER] Response parsed has_content=%s tool_calls=%s finish=%s",
+            bool(result.content),
+            bool(result.tool_calls),
+            result.finish_reason,
+        )
+        return result
 
     async def stream_chat(
         self,

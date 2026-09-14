@@ -55,3 +55,31 @@ async def test_providers_endpoint(client: AsyncClient) -> None:
     assert data["stt"][0]["provider"] == "deepgram"
     assert data["llm"][0]["provider"] == "openrouter"
     assert data["tts"][0]["provider"] == "elevenlabs"
+
+
+@pytest.mark.asyncio
+async def test_providers_diagnostics_endpoint(client: AsyncClient) -> None:
+    """Test the diagnostics endpoint returns safe configuration status."""
+    response = await client.get("/api/v1/providers/diagnostics")
+    assert response.status_code == 200
+    data = response.json()
+
+    # Structure check
+    assert "stt" in data
+    assert "llm" in data
+    assert "tts" in data
+    assert "deepgram" in data["stt"]
+    assert "openrouter" in data["llm"]
+    assert "elevenlabs" in data["tts"]
+
+    # Deepgram diagnostic fields
+    dg = data["stt"]["deepgram"]
+    assert "configured" in dg
+    assert "default_model" in dg
+    assert dg["configured"] is True  # conftest sets a fake key
+
+    # No API keys must ever appear in the response
+    response_text = response.text
+    assert "test-deepgram-key" not in response_text
+    assert "test-openrouter-key" not in response_text
+    assert "test-elevenlabs-key" not in response_text
