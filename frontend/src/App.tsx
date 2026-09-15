@@ -5,8 +5,9 @@ import type { HealthStatus } from './types';
 import { getHealth } from './services/api';
 import TextChat from './features/TextChat';
 import VoiceTest from './features/VoiceTest';
+import Benchmark from './features/Benchmark';
 
-type Tab = 'status' | 'chat' | 'voice';
+type Tab = 'status' | 'chat' | 'voice' | 'benchmark';
 
 function App() {
   const [health, setHealth] = useState<HealthStatus | null>(null);
@@ -50,6 +51,16 @@ function App() {
             Voice
           </button>
           <button
+            onClick={() => setTab('benchmark')}
+            className={`px-3 py-1.5 rounded text-sm ${
+              tab === 'benchmark'
+                ? 'bg-blue-600 text-white'
+                : 'bg-gray-800 text-gray-400 hover:text-gray-200'
+            }`}
+          >
+            Benchmark
+          </button>
+          <button
             onClick={() => setTab('status')}
             className={`px-3 py-1.5 rounded text-sm ${
               tab === 'status'
@@ -65,6 +76,7 @@ function App() {
       <main className="flex-1 flex flex-col">
         {tab === 'chat' && <TextChat />}
         {tab === 'voice' && <VoiceTest />}
+        {tab === 'benchmark' && <Benchmark />}
 
         {tab === 'status' && (
           <div className="max-w-4xl mx-auto px-6 py-12 w-full">

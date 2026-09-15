@@ -235,12 +235,13 @@ class AgentRuntime:
                 all_tool_calls.append(tool_call)
                 tool_name = tool_call.get("function", {}).get("name", "")
                 logger.info("[AGENT] Tool call requested name=%s", tool_name)
-                raw_result = await self._execute_tool_call(tool_call)
+                raw_result, duration_ms = await self._execute_tool_call(tool_call)
                 logger.info("[AGENT] Tool call completed name=%s", tool_name)
                 result_dict: dict[str, Any] = {
                     "name": tool_call.get("function", {}).get("name", ""),
                     "success": not (isinstance(raw_result, dict) and "error" in raw_result),
                     "output": raw_result,
+                    "duration_ms": duration_ms,
                 }
                 if on_tool_call:
                     import inspect
@@ -274,8 +275,12 @@ class AgentRuntime:
             iterations=iterations,
         )
 
-    async def _execute_tool_call(self, tool_call: dict[str, Any]) -> Any:
-        """Execute a single tool call from the LLM response."""
+    async def _execute_tool_call(self, tool_call: dict[str, Any]) -> tuple[Any, float | None]:
+        """Execute a single tool call from the LLM response.
+
+        Returns:
+            Tuple of (output_or_error, duration_ms).
+        """
         function_data = tool_call.get("function", {})
         tool_name = function_data.get("name", "")
         arguments_str = function_data.get("arguments", "{}")
@@ -285,8 +290,8 @@ class AgentRuntime:
         result = await self._tool_executor.execute_from_json(tool_name, arguments_str)
 
         if result.success:
-            return result.output
-        return {"error": result.error}
+            return result.output, result.duration_ms
+        return {"error": result.error}, result.duration_ms
 
     async def close(self) -> None:
         """Release all provider resources."""

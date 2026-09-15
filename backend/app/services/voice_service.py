@@ -30,6 +30,13 @@ from app.providers.factory import (
 )
 from app.providers.types import STTResult, TTSResult
 from app.services.chat_service import _load_history
+from app.services.metrics_service import (
+    ERROR_STAGE_LLM,
+    ERROR_STAGE_STT,
+    ERROR_STAGE_TTS,
+    VoiceTurnMetrics,
+    persist_metrics,
+)
 from app.services.tool_service import get_tool_registry
 from app.tools.executor import ToolExecutor
 
@@ -74,6 +81,7 @@ class VoiceEvents:
     on_agent_response: Callable[[str], Any] | None = None
     on_tool_call: Callable[[dict[str, Any], dict[str, Any]], Any] | None = None
     on_audio: Callable[[bytes, str], Any] | None = None  # (audio_bytes, content_type)
+    on_metrics: Callable[[dict[str, Any]], Any] | None = None  # benchmark payload
     on_completed: Callable[[], Any] | None = None
     on_error: Callable[[str], Any] | None = None
 
@@ -244,11 +252,18 @@ async def process_voice_turn(
     """
     start_time = time.monotonic()
     sid = session.id
-    logger.info("[VOICE] Turn processing started session_id=%s", sid)
+    metrics = VoiceTurnMetrics(session_id=sid)
+    logger.info("[VOICE] Turn processing started session_id=%s turn_id=%s", sid, metrics.turn_id)
 
     # --- STT ---
     stt_start = time.monotonic()
     logger.info("[VOICE] STT started provider=%s model=%s", cfg.stt_provider, cfg.stt_model)
+    metrics.start_stt(
+        provider=cfg.stt_provider,
+        model=cfg.stt_model,
+        audio_bytes=len(audio_data),
+        audio_format=audio_content_type,
+    )
     try:
         stt = get_stt_provider(cfg.stt_provider, model=cfg.stt_model)
         stt_result: STTResult = await stt.transcribe(
@@ -263,6 +278,8 @@ async def process_voice_turn(
             type(e).__name__,
             str(e),
         )
+        metrics.fail(ERROR_STAGE_STT, str(e))
+        persist_metrics(db, metrics)
         if events.on_error:
             await events.on_error(f"STT error: {e}")
         raise VoiceError(f"STT failed: {e}") from e
@@ -271,6 +288,10 @@ async def process_voice_turn(
 
     stt_duration = time.monotonic() - stt_start
     transcript = stt_result.text.strip()
+    metrics.finish_stt(
+        transcript_length=len(transcript),
+        audio_duration_seconds=stt_result.duration_seconds,
+    )
     logger.info(
         "[VOICE] STT completed transcript_length=%d duration_seconds=%.2f",
         len(transcript),
@@ -284,8 +305,12 @@ async def process_voice_turn(
             len(audio_data),
             cfg.stt_provider,
         )
+        metrics.complete()
+        persist_metrics(db, metrics)
         if events.on_transcript:
             await events.on_transcript("", True)
+        if events.on_metrics:
+            await events.on_metrics(metrics.to_event_payload())
         if events.on_completed:
             await events.on_completed()
         return {
@@ -293,6 +318,8 @@ async def process_voice_turn(
             "response": "",
             "session_id": sid,
             "tool_calls": [],
+            "turn_id": metrics.turn_id,
+            "metrics": metrics.to_event_payload(),
         }
 
     # Emit transcript
@@ -307,10 +334,13 @@ async def process_voice_turn(
         await events.on_processing()
 
     logger.info("[VOICE] Agent started provider=%s model=%s", cfg.llm_provider, cfg.llm_model)
+    metrics.start_llm(provider=cfg.llm_provider, model=cfg.llm_model)
 
     try:
         llm = get_llm_provider(cfg.llm_provider, model=cfg.llm_model)
     except (ProviderError, ValueError) as e:
+        metrics.fail(ERROR_STAGE_LLM, str(e))
+        persist_metrics(db, metrics)
         raise VoiceError(str(e)) from e
 
     # Load conversation history
@@ -330,8 +360,12 @@ async def process_voice_turn(
         config=config,
     )
 
-    # Tool call callback → emit events
+    # Tool call callback → emit events and record tool metrics
     async def _on_tool_call(tc: dict[str, Any], result: dict[str, Any]) -> None:
+        metrics.record_tool_call(
+            success=bool(result.get("success")),
+            duration_ms=result.get("duration_ms"),
+        )
         if events.on_tool_call:
             await events.on_tool_call(tc, result)
 
@@ -347,11 +381,15 @@ async def process_voice_turn(
             type(e).__name__,
             str(e),
         )
+        metrics.fail(ERROR_STAGE_LLM, str(e))
+        persist_metrics(db, metrics)
         if events.on_error:
             await events.on_error(f"Agent error: {e}")
         raise VoiceError(f"Agent failed: {e}") from e
 
     response_text = agent_result.response
+    metrics.finish_llm(usage=agent_result.usage, iterations=agent_result.iterations)
+    metrics.log_tools()
     logger.info(
         "[VOICE] Agent completed iterations=%d tool_calls=%d",
         agent_result.iterations,
@@ -406,6 +444,12 @@ async def process_voice_turn(
 
     if response_text:
         logger.info("[VOICE] TTS started provider=%s model=%s", cfg.tts_provider, cfg.tts_model)
+        metrics.start_tts(
+            provider=cfg.tts_provider,
+            model=cfg.tts_model,
+            voice=cfg.tts_voice or None,
+            characters=len(response_text),
+        )
         try:
             tts = get_tts_provider(
                 cfg.tts_provider,
@@ -419,6 +463,7 @@ async def process_voice_turn(
             )
             audio_bytes = tts_result.audio_data
             audio_ct = tts_result.content_type
+            metrics.finish_tts(audio_bytes=len(audio_bytes))
             logger.info(
                 "[VOICE] TTS completed audio_bytes=%d",
                 len(audio_bytes),
@@ -430,6 +475,7 @@ async def process_voice_turn(
                 type(e).__name__,
                 str(e),
             )
+            metrics.fail(ERROR_STAGE_TTS, str(e))
             if events.on_error:
                 await events.on_error(f"TTS error: {e}")
         finally:
@@ -447,6 +493,17 @@ async def process_voice_turn(
     # Save TTS usage
     _save_usage(db, sid, "tts", cfg.tts_provider, cfg.tts_model, duration_seconds=tts_duration)
 
+    # Finalize metrics (best-effort persistence — never breaks the turn)
+    if not tts_failed:
+        metrics.complete()
+    persist_metrics(db, metrics)
+
+    if events.on_metrics:
+        try:
+            await events.on_metrics(metrics.to_event_payload())
+        except Exception as e:
+            logger.error("[VOICE:BENCH] metrics event failed error_type=%s", type(e).__name__)
+
     # --- Complete (only if TTS did not fail) ---
     if not tts_failed:
         if events.on_completed:
@@ -454,9 +511,10 @@ async def process_voice_turn(
 
     latency_ms = (time.monotonic() - start_time) * 1000
     logger.info(
-        "[VOICE] Voice turn completed session_id=%s latency_ms=%.0f "
+        "[VOICE] Voice turn completed session_id=%s turn_id=%s latency_ms=%.0f "
         "transcript_length=%d response_length=%d",
         sid,
+        metrics.turn_id,
         latency_ms,
         len(transcript),
         len(response_text),
@@ -468,4 +526,6 @@ async def process_voice_turn(
         "session_id": sid,
         "tool_calls": agent_result.tool_calls,
         "latency_ms": round(latency_ms, 2),
+        "turn_id": metrics.turn_id,
+        "metrics": metrics.to_event_payload(),
     }

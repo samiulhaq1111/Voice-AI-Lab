@@ -37,3 +37,15 @@ def _ensure_test_tables() -> None:
     Base.metadata.drop_all(bind=engine)
     Base.metadata.create_all(bind=engine)
     yield
+
+
+@pytest.fixture
+def db_session():
+    """Provide a database session for tests that persist records directly."""
+    from app.core.database import SessionLocal
+
+    session = SessionLocal()
+    try:
+        yield session
+    finally:
+        session.close()

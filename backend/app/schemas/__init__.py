@@ -1,6 +1,10 @@
 """Pydantic schemas for API validation."""
 
 from app.schemas.api import (
+    BenchmarkBatchResponse,
+    BenchmarkRunRequest,
+    BenchmarkRunResponse,
+    BenchmarkScenarioResponse,
     ChatRequest,
     ChatResponse,
     HealthResponse,
@@ -12,6 +16,10 @@ from app.schemas.api import (
 )
 
 __all__ = [
+    "BenchmarkBatchResponse",
+    "BenchmarkRunRequest",
+    "BenchmarkRunResponse",
+    "BenchmarkScenarioResponse",
     "ChatRequest",
     "ChatResponse",
     "HealthResponse",

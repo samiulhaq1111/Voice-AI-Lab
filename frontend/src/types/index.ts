@@ -117,6 +117,7 @@ export type VoiceEventType =
   | 'tool_call'
   | 'tool_result'
   | 'audio'
+  | 'metrics'
   | 'completed'
   | 'error';
 
@@ -160,6 +161,54 @@ export interface VoiceCompleted extends VoiceEventBase {
   type: 'completed';
 }
 
+/** Server-side benchmark metrics for one voice turn (Phase 5A). */
+export interface VoiceTurnMetrics {
+  turn_id: string;
+  session_id: string | null;
+  stt_provider: string | null;
+  stt_model: string | null;
+  stt_latency_ms: number | null;
+  stt_audio_bytes: number | null;
+  stt_audio_duration_seconds: number | null;
+  transcript_length: number | null;
+  llm_provider: string | null;
+  llm_model: string | null;
+  llm_latency_ms: number | null;
+  prompt_tokens: number | null;
+  completion_tokens: number | null;
+  total_tokens: number | null;
+  llm_iterations: number | null;
+  tool_count: number;
+  tool_success_count: number;
+  tool_execution_ms: number | null;
+  tts_provider: string | null;
+  tts_model: string | null;
+  tts_voice: string | null;
+  tts_output_format: string | null;
+  tts_latency_ms: number | null;
+  tts_audio_bytes: number | null;
+  tts_characters: number | null;
+  total_processing_ms: number | null;
+  success: boolean;
+  error_stage: string | null;
+  error_message: string | null;
+}
+
+export interface VoiceMetrics extends VoiceEventBase {
+  type: 'metrics';
+  data: VoiceTurnMetrics;
+}
+
+/** Client-side timings measured with performance.now(). */
+export interface BrowserTurnTimings {
+  recording_duration_ms: number | null;
+  audio_upload_ms: number | null;
+  server_processing_ms: number | null;
+  audio_receive_ms: number | null;
+  playback_start_latency_ms: number | null;
+  total_turn_duration_ms: number | null;
+}
+
 export interface VoiceError extends VoiceEventBase {
   type: 'error';
   message: string;
@@ -172,8 +221,67 @@ export type VoiceEvent =
   | VoiceAgentResponse
   | VoiceToolCall
   | VoiceAudio
+  | VoiceMetrics
   | VoiceCompleted
   | VoiceError;
 
 export type RecordingState = 'idle' | 'recording' | 'processing' | 'playing';
 export type ConnectionState = 'disconnected' | 'connecting' | 'connected';
+
+// --- Benchmark Types (Phase 5B) ---
+
+export interface BenchmarkScenario {
+  scenario_id: string;
+  name: string;
+  description: string;
+  category: string;
+  expected_tool_calls: number;
+  include_tts: boolean;
+}
+
+export interface BenchmarkRunRequest {
+  scenario_id: string;
+  repetitions?: number;
+}
+
+export interface BenchmarkRunResult {
+  run_id: string;
+  scenario_id: string;
+  success: boolean;
+  benchmark_mode: string;
+  response_text: string;
+  tool_calls: Array<{ function: { name: string; arguments: string } }>;
+  usage: Record<string, number>;
+  iterations: number;
+  llm_latency_ms: number | null;
+  tts_latency_ms: number | null;
+  total_processing_ms: number | null;
+  tool_execution_ms: number | null;
+  tts_audio_bytes: number | null;
+  tts_characters: number | null;
+  expected_tool_calls: number;
+  actual_tool_calls: number;
+  tool_call_match: boolean;
+  validation_errors: string[];
+  llm_provider: string | null;
+  llm_model: string | null;
+  tts_provider: string | null;
+  tts_model: string | null;
+  benchmark_result_id: string | null;
+}
+
+export interface BenchmarkAggregation {
+  scenario_id: string;
+  count: number;
+  success_count: number;
+  failure_count: number;
+  success_rate: number;
+  llm_latency_ms: { avg: number | null; median: number | null; min: number | null; max: number | null };
+  tts_latency_ms: { avg: number | null; median: number | null; min: number | null; max: number | null };
+  total_processing_ms: { avg: number | null; median: number | null; min: number | null; max: number | null };
+}
+
+export interface BenchmarkBatchResult {
+  runs: BenchmarkRunResult[];
+  aggregation: BenchmarkAggregation | null;
+}

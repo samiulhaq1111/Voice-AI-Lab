@@ -225,7 +225,26 @@ class TestVoiceWebSocket:
         assert "transcript" in event_types
         assert "agent_response" in event_types
         assert "audio" in event_types
+        assert "metrics" in event_types
         assert "completed" in event_types
+
+        # Phase 5A: metrics must arrive BEFORE completed
+        assert event_types.index("metrics") < event_types.index("completed")
+        # And after audio
+        assert event_types.index("audio") < event_types.index("metrics")
+
+        # Verify metrics payload shape
+        metrics_event = next(e for e in events if e["type"] == "metrics")
+        data = metrics_event["data"]
+        assert data["turn_id"]
+        assert data["session_id"] == session_id
+        assert data["success"] is True
+        assert data["stt_latency_ms"] is not None
+        assert data["llm_latency_ms"] is not None
+        assert data["tts_latency_ms"] is not None
+        assert data["total_processing_ms"] is not None
+        assert data["tts_audio_bytes"] == len(b"fake-mp3-audio-bytes")
+        assert data["error_stage"] is None
 
         # Verify transcript
         transcript_events = [e for e in events if e["type"] == "transcript"]
@@ -314,6 +333,61 @@ class TestVoiceWebSocket:
         error_events = [e for e in events if e["type"] == "error"]
         assert len(error_events) >= 1
         assert "TTS" in error_events[0]["message"]
+
+    def test_ws_metrics_captured_on_tts_failure(self) -> None:
+        """A failed turn must still report metrics with error_stage=tts."""
+        client = self._get_client()
+
+        with (
+            patch("app.services.voice_service.get_stt_provider") as mock_stt_factory,
+            patch("app.services.voice_service.get_llm_provider") as mock_llm_factory,
+            patch("app.services.voice_service.get_tts_provider") as mock_tts_factory,
+        ):
+            mock_stt = AsyncMock()
+            mock_stt.transcribe = AsyncMock(return_value=_fake_stt_result("Hello"))
+            mock_stt.close = AsyncMock()
+            mock_stt_factory.return_value = mock_stt
+
+            mock_llm = AsyncMock()
+            mock_llm.chat = AsyncMock(return_value=_mock_llm_response(content="Hi there"))
+            mock_llm.close = AsyncMock()
+            mock_llm_factory.return_value = mock_llm
+
+            mock_tts = AsyncMock()
+            mock_tts.synthesize = AsyncMock(side_effect=RuntimeError("TTS boom"))
+            mock_tts.close = AsyncMock()
+            mock_tts_factory.return_value = mock_tts
+
+            with client.websocket_connect("/api/v1/voice/ws") as ws:
+                ws.send_json({"type": "start", "session_id": None, "configuration": {}})
+                json.loads(ws.receive_text())  # session_started
+                ws.send_bytes(b"fake-webm-audio-data")
+                ws.send_json({"type": "stop"})
+
+                events = []
+                for _ in range(15):
+                    try:
+                        data = json.loads(ws.receive_text())
+                        events.append(data)
+                        # error is the terminal event for a failed TTS turn,
+                        # but metrics arrives after it — stop once we have both.
+                        if data["type"] == "metrics":
+                            break
+                    except Exception:
+                        break
+
+        metrics_events = [e for e in events if e["type"] == "metrics"]
+        assert len(metrics_events) == 1
+        data = metrics_events[0]["data"]
+        assert data["success"] is False
+        assert data["error_stage"] == "tts"
+        # STT and LLM succeeded independently of TTS
+        assert data["stt_latency_ms"] is not None
+        assert data["llm_latency_ms"] is not None
+        assert data["transcript_length"] == len("Hello")
+
+        # completed must still be absent
+        assert "completed" not in [e["type"] for e in events]
 
     def test_ws_session_reuse(self) -> None:
         """Second START with session_id should reuse the session."""

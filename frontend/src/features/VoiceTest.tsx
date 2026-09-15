@@ -2,11 +2,13 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type {
+  BrowserTurnTimings,
   ConnectionState,
   ProviderAvailability,
   RecordingState,
   VoiceEvent,
   VoiceToolCall,
+  VoiceTurnMetrics,
 } from '../types';
 import { getProviders } from '../services/api';
 
@@ -36,6 +38,10 @@ export default function VoiceTest() {
   const [llmModel, setLlmModel] = useState('');
   const [ttsModel, setTtsModel] = useState('');
 
+  // Phase 5A benchmark metrics
+  const [serverMetrics, setServerMetrics] = useState<VoiceTurnMetrics | null>(null);
+  const [browserTimings, setBrowserTimings] = useState<BrowserTurnTimings | null>(null);
+
   const wsRef = useRef<WebSocket | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -43,6 +49,13 @@ export default function VoiceTest() {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const recordStartRef = useRef<number>(0);
   const processingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Browser timing marks (performance.now())
+  const turnStartRef = useRef<number>(0);
+  const recordingStartRef = useRef<number>(0);
+  const recordingStopRef = useRef<number>(0);
+  const audioSentRef = useRef<number>(0);
+  const audioReceivedRef = useRef<number>(0);
 
   // Load providers on mount
   useEffect(() => {
@@ -102,6 +115,7 @@ export default function VoiceTest() {
       }
       case 'audio': {
         // Decode base64 audio and play
+        audioReceivedRef.current = performance.now();
         const binary = atob(event.data);
         const bytes = new Uint8Array(binary.length);
         for (let i = 0; i < binary.length; i++) {
@@ -111,7 +125,8 @@ export default function VoiceTest() {
         const url = URL.createObjectURL(blob);
         setRecordingState('playing');
         console.log(
-          `[VOICE:UI] Audio received format=${event.format} size_bytes=${bytes.length}`,
+          `[VOICE:UI] Audio received format=${event.format} size_bytes=${bytes.length} ` +
+            `audio_receive_ms=${Math.round(audioReceivedRef.current - audioSentRef.current)}`,
         );
         if (audioRef.current) {
           audioRef.current.src = url;
@@ -120,15 +135,39 @@ export default function VoiceTest() {
             setRecordingState('idle');
             URL.revokeObjectURL(url);
           };
-          console.log('[VOICE:UI] Audio playback started');
+          const playbackStart = performance.now();
+          console.log(
+            `[VOICE:UI] Audio playback started playback_start_latency_ms=${Math.round(playbackStart - audioReceivedRef.current)}`,
+          );
           audioRef.current.play().catch((e) => {
             console.error(`[VOICE:UI] Voice error message=${e.message}`);
             setError(`Audio playback failed: ${e.message}`);
             setRecordingState('idle');
           });
+          // Record browser-side timings for this turn
+          setBrowserTimings({
+            recording_duration_ms: Math.round(
+              recordingStopRef.current - recordingStartRef.current,
+            ),
+            audio_upload_ms: Math.round(audioSentRef.current - recordingStopRef.current),
+            server_processing_ms: Math.round(audioReceivedRef.current - audioSentRef.current),
+            audio_receive_ms: Math.round(audioReceivedRef.current - audioSentRef.current),
+            playback_start_latency_ms: Math.round(playbackStart - audioReceivedRef.current),
+            total_turn_duration_ms: Math.round(playbackStart - turnStartRef.current),
+          });
         }
         break;
       }
+      case 'metrics':
+        setServerMetrics(event.data);
+        console.log(
+          `[VOICE:BENCH] metrics received turn_id=${event.data.turn_id} ` +
+            `stt_ms=${event.data.stt_latency_ms ?? 'N/A'} ` +
+            `llm_ms=${event.data.llm_latency_ms ?? 'N/A'} ` +
+            `tts_ms=${event.data.tts_latency_ms ?? 'N/A'} ` +
+            `total_ms=${event.data.total_processing_ms ?? 'N/A'}`,
+        );
+        break;
       case 'completed':
         console.log('[VOICE:UI] Voice turn completed');
         setRecordingState('idle');
@@ -159,11 +198,14 @@ export default function VoiceTest() {
 
   const startRecording = useCallback(async () => {
     console.log('[VOICE:UI] Start clicked');
+    turnStartRef.current = performance.now();
     setError(null);
     setTranscript('');
     setAssistantText('');
     setToolCalls([]);
     setDuration(0);
+    setServerMetrics(null);
+    setBrowserTimings(null);
 
     // Check browser support
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
@@ -236,7 +278,10 @@ export default function VoiceTest() {
         };
 
         recorder.onstop = () => {
-          console.log('[VOICE:UI] Recording stopped');
+          recordingStopRef.current = performance.now();
+          console.log(
+            `[VOICE:UI] Recording stopped recording_duration_ms=${Math.round(recordingStopRef.current - recordingStartRef.current)}`,
+          );
 
           if (!finalBlob || finalBlob.size === 0) {
             console.error('[VOICE:UI] Final audio blob is empty');
@@ -253,8 +298,10 @@ export default function VoiceTest() {
           finalBlob.arrayBuffer().then((buffer) => {
             if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
               wsRef.current.send(buffer);
+              audioSentRef.current = performance.now();
               console.log(
-                `[VOICE:UI] Audio sent size_bytes=${buffer.byteLength} type=${finalBlob.type || mimeType}`,
+                `[VOICE:UI] Audio sent size_bytes=${buffer.byteLength} type=${finalBlob.type || mimeType} ` +
+                  `audio_upload_ms=${Math.round(audioSentRef.current - recordingStopRef.current)}`,
               );
 
               // Send STOP only after audio is sent
@@ -270,6 +317,7 @@ export default function VoiceTest() {
         };
 
         recorder.start(); // No timeslice — single blob on stop
+        recordingStartRef.current = performance.now();
         setRecordingState('recording');
         console.log('[VOICE:UI] Recording started');
 
@@ -343,6 +391,11 @@ export default function VoiceTest() {
   const sttProv = providers?.stt[0];
   const ttsProv = providers?.tts[0];
 
+  const fmtMs = (v: number | null | undefined) => (v == null ? 'N/A' : `${Math.round(v)} ms`);
+  const fmtBytes = (v: number | null | undefined) =>
+    v == null ? 'N/A' : `${(v / 1024).toFixed(1)} KB`;
+  const fmtNum = (v: number | null | undefined) => (v == null ? 'N/A' : String(v));
+
   return (
     <div className="flex flex-col h-full max-w-3xl mx-auto">
       {/* Header */}
@@ -358,61 +411,82 @@ export default function VoiceTest() {
       </div>
 
       {/* Provider/Model Selection */}
-      <div className="flex items-center gap-3 px-4 py-2 border-b border-gray-800 bg-gray-900/50">
-        <label className="text-xs text-gray-400">STT:</label>
-        <span className="text-xs text-gray-300">
-          {sttProv?.provider || 'deepgram'} ({sttProv?.models[0] || 'nova-3'})
-        </span>
-        <span className="text-gray-700">|</span>
-        <label className="text-xs text-gray-400">LLM:</label>
-        <select
-          value={selectedLLMProvider}
-          onChange={(e) => setSelectedLLMProvider(e.target.value)}
-          className="text-xs bg-gray-800 text-gray-200 rounded px-2 py-1 border border-gray-700"
-        >
-          {providers?.llm.map((p) => (
-            <option key={p.provider} value={p.provider}>
-              {p.provider} {p.configured ? '(configured)' : '(not configured)'}
-            </option>
-          )) || <option value="openrouter">openrouter</option>}
-        </select>
-        <label className="text-xs text-gray-400">Model:</label>
-        <select
-          value={llmModel}
-          onChange={(e) => setLlmModel(e.target.value)}
-          className="text-xs bg-gray-800 text-gray-200 rounded px-2 py-1 border border-gray-700"
-        >
-          <option value="">
-            default ({providers?.llm.find((p) => p.provider === selectedLLMProvider)?.default_model || 'nvidia/nemotron-3.5-lightning:free'})
-          </option>
-          {providers?.llm
-            .find((p) => p.provider === selectedLLMProvider)
-            ?.models.map((m) => (
-              <option key={m} value={m}>
-                {m}
-              </option>
-            ))}
-        </select>
-        <span className="text-gray-700">|</span>
-        <label className="text-xs text-gray-400">TTS:</label>
-        <span className="text-xs text-gray-300">
-          {ttsProv?.provider || 'elevenlabs'}
-        </span>
-        <label className="text-xs text-gray-400">Model:</label>
-        <select
-          value={ttsModel}
-          onChange={(e) => setTtsModel(e.target.value)}
-          className="text-xs bg-gray-800 text-gray-200 rounded px-2 py-1 border border-gray-700"
-        >
-          <option value="">
-            default ({ttsProv?.default_model || 'eleven_flash_v2_5'})
-          </option>
-          {ttsProv?.models.map((m) => (
-            <option key={m} value={m}>
-              {m}
-            </option>
-          ))}
-        </select>
+      <div className="px-4 py-3 border-b border-gray-800 bg-gray-900/50">
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+          {/* STT Configuration */}
+          <div className="space-y-1">
+            <label className="text-xs text-gray-400 font-medium">STT</label>
+            <div className="text-xs text-gray-300">
+              {sttProv?.provider || 'deepgram'} ({sttProv?.models[0] || 'nova-3'})
+            </div>
+          </div>
+
+          {/* LLM Configuration */}
+          <div className="space-y-1">
+            <div className="flex gap-2">
+              <div className="flex-1 min-w-0">
+                <label className="text-xs text-gray-400 font-medium">LLM Provider</label>
+                <select
+                  value={selectedLLMProvider}
+                  onChange={(e) => setSelectedLLMProvider(e.target.value)}
+                  className="w-full text-xs bg-gray-800 text-gray-200 rounded px-2 py-1.5 border border-gray-700 min-w-0"
+                >
+                  {providers?.llm.map((p) => (
+                    <option key={p.provider} value={p.provider}>
+                      {p.provider} {p.configured ? '(configured)' : '(not configured)'}
+                    </option>
+                  )) || <option value="openrouter">openrouter</option>}
+                </select>
+              </div>
+            </div>
+            <div>
+              <label className="text-xs text-gray-400 font-medium">Model</label>
+              <select
+                value={llmModel}
+                onChange={(e) => setLlmModel(e.target.value)}
+                className="w-full text-xs bg-gray-800 text-gray-200 rounded px-2 py-1.5 border border-gray-700 min-w-0"
+              >
+                <option value="">
+                  default ({providers?.llm.find((p) => p.provider === selectedLLMProvider)?.default_model || 'nvidia/nemotron-3.5-lightning:free'})
+                </option>
+                {providers?.llm
+                  .find((p) => p.provider === selectedLLMProvider)
+                  ?.models.map((m) => (
+                    <option key={m} value={m}>
+                      {m}
+                    </option>
+                  ))}
+              </select>
+            </div>
+          </div>
+
+          {/* TTS Configuration */}
+          <div className="space-y-1">
+            <div>
+              <label className="text-xs text-gray-400 font-medium">TTS</label>
+              <div className="text-xs text-gray-300">
+                {ttsProv?.provider || 'elevenlabs'}
+              </div>
+            </div>
+            <div>
+              <label className="text-xs text-gray-400 font-medium">Model</label>
+              <select
+                value={ttsModel}
+                onChange={(e) => setTtsModel(e.target.value)}
+                className="w-full text-xs bg-gray-800 text-gray-200 rounded px-2 py-1.5 border border-gray-700 min-w-0"
+              >
+                <option value="">
+                  default ({ttsProv?.default_model || 'eleven_flash_v2_5'})
+                </option>
+                {ttsProv?.models.map((m) => (
+                  <option key={m} value={m}>
+                    {m}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+        </div>
       </div>
 
       {/* Controls */}
@@ -478,35 +552,97 @@ export default function VoiceTest() {
       </div>
 
       {/* Content */}
-      <div className="flex-1 overflow-y-auto px-4 py-4 space-y-4">
+      <div className="flex-1 overflow-y-auto px-4 py-4 space-y-4 max-w-full">
         {/* Transcript */}
         {transcript && (
-          <div className="bg-gray-800 border border-gray-700 rounded-lg px-4 py-2">
+          <div className="bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 max-w-full">
             <div className="text-xs text-gray-500 mb-1 font-medium uppercase">Transcript</div>
-            <div className="text-sm text-gray-200">{transcript}</div>
+            <div className="text-sm text-gray-200 break-words">{transcript}</div>
           </div>
         )}
 
         {/* Assistant */}
         {assistantText && (
-          <div className="bg-blue-900/30 border border-blue-800 rounded-lg px-4 py-2">
+          <div className="bg-blue-900/30 border border-blue-800 rounded-lg px-4 py-2 max-w-full">
             <div className="text-xs text-blue-400 mb-1 font-medium uppercase">Assistant</div>
-            <div className="text-sm text-blue-100">{assistantText}</div>
+            <div className="text-sm text-blue-100 break-words">{assistantText}</div>
           </div>
         )}
 
         {/* Tool Calls */}
         {toolCalls.length > 0 && (
-          <div className="space-y-1">
+          <div className="space-y-1 max-w-full">
             <div className="text-xs text-gray-500 font-medium uppercase">Tool Calls</div>
             {toolCalls.map((tc, i) => (
               <div
                 key={i}
-                className="text-xs bg-orange-900/20 border border-orange-800/50 rounded px-2 py-1 text-orange-300 font-mono"
+                className="text-xs bg-orange-900/20 border border-orange-800/50 rounded px-2 py-1 text-orange-300 font-mono break-all"
               >
                 {tc.name}({JSON.stringify(tc.args)})
               </div>
             ))}
+          </div>
+        )}
+
+        {/* Benchmark metrics (Phase 5A) */}
+        {serverMetrics && (
+          <div className="bg-gray-900 border border-gray-700 rounded-lg px-4 py-3">
+            <div className="text-xs text-gray-500 mb-2 font-medium uppercase">Benchmark</div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs font-mono">
+              <div className="flex justify-between">
+                <span className="text-gray-500">STT</span>
+                <span className="text-gray-200">{fmtMs(serverMetrics.stt_latency_ms)}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-gray-500">Tools</span>
+                <span className="text-gray-200">{fmtNum(serverMetrics.tool_count)}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-gray-500">LLM</span>
+                <span className="text-gray-200">{fmtMs(serverMetrics.llm_latency_ms)}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-gray-500">Tokens</span>
+                <span className="text-gray-200">{fmtNum(serverMetrics.total_tokens)}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-gray-500">TTS</span>
+                <span className="text-gray-200">{fmtMs(serverMetrics.tts_latency_ms)}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-gray-500">Audio</span>
+                <span className="text-gray-200">{fmtBytes(serverMetrics.tts_audio_bytes)}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-gray-500">Server</span>
+                <span className="text-gray-200">{fmtMs(serverMetrics.total_processing_ms)}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-gray-500">Status</span>
+                <span className={serverMetrics.success ? 'text-green-400' : 'text-red-400'}>
+                  {serverMetrics.success ? 'Success' : `Failed (${serverMetrics.error_stage})`}
+                </span>
+              </div>
+              {browserTimings && (
+                <>
+                  <div className="flex justify-between">
+                    <span className="text-gray-500">Recording</span>
+                    <span className="text-gray-200">
+                      {fmtMs(browserTimings.recording_duration_ms)}
+                    </span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-gray-500">Total</span>
+                    <span className="text-blue-300">
+                      {fmtMs(browserTimings.total_turn_duration_ms)}
+                    </span>
+                  </div>
+                </>
+              )}
+            </div>
+            <div className="mt-2 pt-2 border-t border-gray-800 text-xs text-gray-600 font-mono break-all">
+              turn_id={serverMetrics.turn_id.slice(0, 8)}...
+            </div>
           </div>
         )}
 

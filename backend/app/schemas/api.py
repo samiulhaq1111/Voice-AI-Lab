@@ -95,3 +95,57 @@ class ProviderInfoResponse(BaseModel):
     provider_name: str
     display_name: str
     is_active: bool
+
+
+# --- Benchmark (Phase 5B) ---
+class BenchmarkScenarioResponse(BaseModel):
+    """Available benchmark scenario."""
+
+    scenario_id: str
+    name: str
+    description: str
+    category: str
+    expected_tool_calls: int
+    include_tts: bool
+
+
+class BenchmarkRunRequest(BaseModel):
+    """Request to execute a benchmark scenario."""
+
+    scenario_id: str = Field(..., min_length=1, max_length=100)
+    repetitions: int = Field(default=1, ge=1, le=50)
+
+
+class BenchmarkRunResponse(BaseModel):
+    """Result of a single benchmark run."""
+
+    run_id: str
+    scenario_id: str
+    success: bool
+    benchmark_mode: str
+    response_text: str = ""
+    tool_calls: list[dict[str, Any]] = Field(default_factory=list)
+    usage: dict[str, int] = Field(default_factory=dict)
+    iterations: int = 0
+    llm_latency_ms: float | None = None
+    tts_latency_ms: float | None = None
+    total_processing_ms: float | None = None
+    tool_execution_ms: float | None = None
+    tts_audio_bytes: int | None = None
+    tts_characters: int | None = None
+    expected_tool_calls: int = 0
+    actual_tool_calls: int = 0
+    tool_call_match: bool = True
+    validation_errors: list[str] = Field(default_factory=list)
+    llm_provider: str | None = None
+    llm_model: str | None = None
+    tts_provider: str | None = None
+    tts_model: str | None = None
+    benchmark_result_id: str | None = None
+
+
+class BenchmarkBatchResponse(BaseModel):
+    """Result of running a scenario N times with aggregation."""
+
+    runs: list[BenchmarkRunResponse]
+    aggregation: dict[str, Any] | None = None

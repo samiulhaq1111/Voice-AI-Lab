@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.benchmarks import router as benchmarks_router
 from app.api.chat import router as chat_router
 from app.api.health import router as health_router
 from app.api.providers import router as providers_router
@@ -94,6 +95,7 @@ def create_app() -> FastAPI:
     app.include_router(tools_router, prefix="/api/v1")
     app.include_router(providers_router, prefix="/api/v1")
     app.include_router(chat_router, prefix="/api/v1")
+    app.include_router(benchmarks_router, prefix="/api/v1")
     app.include_router(voice_router)
 
     return app

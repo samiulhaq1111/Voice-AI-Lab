@@ -142,6 +142,9 @@ async def _handle_voice_session(ws: WebSocket) -> None:
                             }
                         )
 
+                    async def _on_metrics(data: dict):
+                        await ws.send_json({"type": "metrics", "data": data})
+
                     async def _on_completed():
                         await ws.send_json({"type": "completed"})
 
@@ -154,6 +157,7 @@ async def _handle_voice_session(ws: WebSocket) -> None:
                         on_agent_response=_on_agent_response,
                         on_tool_call=_on_tool_call,
                         on_audio=_on_audio,
+                        on_metrics=_on_metrics,
                         on_completed=_on_completed,
                         on_error=_on_error,
                     )
@@ -232,6 +236,7 @@ async def voice_websocket(ws: WebSocket) -> None:
             {"type": "agent_response", "text": "..."}
             {"type": "tool_call", "name": "...", "arguments": {...}}
             {"type": "audio", "format": "audio/mpeg", "data": "<base64>"}
+            {"type": "metrics", "data": {...}}
             {"type": "completed"}
             {"type": "error", "message": "..."}
     """
