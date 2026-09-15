@@ -2,6 +2,9 @@
 
 from app.schemas.api import (
     BenchmarkBatchResponse,
+    BenchmarkComparisonRequest,
+    BenchmarkComparisonResponse,
+    BenchmarkConfigurationResponse,
     BenchmarkCostBreakdown,
     BenchmarkCostSummary,
     BenchmarkOverallSummary,
@@ -13,6 +16,7 @@ from app.schemas.api import (
     BenchmarkScenarioSummary,
     ChatRequest,
     ChatResponse,
+    ComparisonConfigurationResult,
     HealthResponse,
     LatencyStatsResponse,
     ProviderInfoResponse,
@@ -24,6 +28,9 @@ from app.schemas.api import (
 
 __all__ = [
     "BenchmarkBatchResponse",
+    "BenchmarkComparisonRequest",
+    "BenchmarkComparisonResponse",
+    "BenchmarkConfigurationResponse",
     "BenchmarkCostBreakdown",
     "BenchmarkCostSummary",
     "BenchmarkOverallSummary",
@@ -35,6 +42,7 @@ __all__ = [
     "BenchmarkScenarioSummary",
     "ChatRequest",
     "ChatResponse",
+    "ComparisonConfigurationResult",
     "HealthResponse",
     "LatencyStatsResponse",
     "ProviderInfoResponse",

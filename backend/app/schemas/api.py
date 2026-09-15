@@ -114,6 +114,13 @@ class BenchmarkRunRequest(BaseModel):
 
     scenario_id: str = Field(..., min_length=1, max_length=100)
     repetitions: int = Field(default=1, ge=1, le=50)
+    configuration_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=100,
+        description="Configuration ID from the catalog. "
+        "If provided, provider/model settings are loaded from it.",
+    )
 
 
 class BenchmarkRunResponse(BaseModel):
@@ -142,6 +149,7 @@ class BenchmarkRunResponse(BaseModel):
     tts_provider: str | None = None
     tts_model: str | None = None
     benchmark_result_id: str | None = None
+    configuration_id: str | None = None
 
 
 class BenchmarkBatchResponse(BaseModel):
@@ -242,6 +250,8 @@ class BenchmarkRecentResult(BaseModel):
     tts_provider: str | None
     tts_model: str | None
     total_cost: float | None = None
+    error_message: str | None = None
+    configuration_id: str | None = None
 
 
 # --- Benchmark Cost (Phase 5D) ---
@@ -282,3 +292,66 @@ class BenchmarkCostSummary(BaseModel):
     max_cost: float | None = None
     currency: str
     pricing_version: str
+
+
+# --- Benchmark Comparison (Phase 5E) ---
+
+
+class BenchmarkConfigurationResponse(BaseModel):
+    """Available benchmark configuration."""
+
+    configuration_id: str
+    name: str
+    description: str
+    llm_provider: str
+    llm_model: str
+    tts_provider: str
+    tts_model: str
+    pricing_type: str
+    production_eligible: bool
+
+
+class BenchmarkComparisonRequest(BaseModel):
+    """Request to run a comparison across configurations."""
+
+    scenario_id: str = Field(..., min_length=1, max_length=100)
+    configuration_ids: list[str] = Field(..., min_length=1, max_length=10)
+    repetitions: int = Field(default=1, ge=1, le=10)
+
+
+class ComparisonConfigurationResult(BaseModel):
+    """Results for a single configuration within a comparison."""
+
+    configuration_id: str
+    configuration_name: str
+    pricing_type: str
+    production_eligible: bool
+    run_count: int
+    successful_runs: int
+    failed_runs: int
+    success_rate: float
+    avg_total_latency_ms: float | None = None
+    median_total_latency_ms: float | None = None
+    min_total_latency_ms: float | None = None
+    max_total_latency_ms: float | None = None
+    avg_llm_latency_ms: float | None = None
+    avg_tts_latency_ms: float | None = None
+    avg_prompt_tokens: float | None = None
+    avg_completion_tokens: float | None = None
+    avg_total_tokens: float | None = None
+    avg_tts_characters: float | None = None
+    avg_cost: float | None = None
+    total_cost: float | None = None
+    cost_available: bool = True
+    cost_note: str | None = None
+    runs: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class BenchmarkComparisonResponse(BaseModel):
+    """Result of a comparison across configurations."""
+
+    comparison_id: str
+    scenario_id: str
+    repetitions: int
+    configurations: list[ComparisonConfigurationResult]
+    validation_errors: list[str] = Field(default_factory=list)

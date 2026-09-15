@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import inspect, text
 
 from app.api.benchmarks import router as benchmarks_router
 from app.api.chat import router as chat_router
@@ -16,6 +17,28 @@ from app.core.config import settings
 from app.core.database import Base, engine
 from app.core.logging import logger, setup_logging
 from app.services.tool_service import get_tool_registry
+
+
+def _migrate_benchmark_columns(eng) -> None:
+    """Add Phase 5E comparison columns to benchmark_results if missing.
+
+    SQLite does not support ALTER TABLE ADD COLUMN via SQLAlchemy ORM,
+    so we use raw SQL with existence checks.
+    """
+    inspector = inspect(eng)
+    existing_columns = {col["name"] for col in inspector.get_columns("benchmark_results")}
+
+    columns_to_add = {
+        "comparison_id": "VARCHAR(36)",
+        "configuration_id": "VARCHAR(100)",
+    }
+
+    for col_name, col_type in columns_to_add.items():
+        if col_name not in existing_columns:
+            with eng.begin() as conn:
+                sql = f"ALTER TABLE benchmark_results ADD COLUMN {col_name} {col_type}"
+                conn.execute(text(sql))
+            logger.info("[MIGRATION] Added column benchmark_results.%s", col_name)
 
 
 @asynccontextmanager
@@ -60,6 +83,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # Create database tables
     Base.metadata.create_all(bind=engine)
+
+    # Phase 5E migration: add comparison columns if missing
+    _migrate_benchmark_columns(engine)
+
     logger.info("Database tables created")
 
     # Initialize tool registry

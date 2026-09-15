@@ -30,6 +30,10 @@ class BenchmarkResult(UUIDMixin, TimestampMixin, Base):
     run_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     benchmark_mode: Mapped[str | None] = mapped_column(String(50), nullable=True)
 
+    # Phase 5E comparison metadata
+    comparison_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    configuration_id: Mapped[str | None] = mapped_column(String(100), nullable=True, index=True)
+
     # Provider/model info
     stt_provider: Mapped[str | None] = mapped_column(String(50), nullable=True)
     stt_model: Mapped[str | None] = mapped_column(String(100), nullable=True)

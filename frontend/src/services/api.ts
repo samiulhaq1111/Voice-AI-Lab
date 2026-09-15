@@ -2,6 +2,8 @@
 
 import type {
   BenchmarkBatchResult,
+  BenchmarkComparisonResult,
+  BenchmarkConfiguration,
   BenchmarkCostBreakdown,
   BenchmarkCostSummary,
   BenchmarkOverallSummary,
@@ -154,4 +156,31 @@ export async function getBenchmarkCostSummary(params?: {
   return fetchJson<BenchmarkCostSummary>(
     `/api/v1/benchmarks/cost/summary${query ? `?${query}` : ''}`,
   );
+}
+
+// --- Benchmark Comparison API (Phase 5E) ---
+
+/** List available benchmark configurations. */
+export async function getBenchmarkConfigurations(): Promise<BenchmarkConfiguration[]> {
+  return fetchJson<BenchmarkConfiguration[]>('/api/v1/benchmarks/configurations');
+}
+
+/** Run a comparison across multiple configurations. */
+export async function runBenchmarkComparison(request: {
+  scenario_id: string;
+  configuration_ids: string[];
+  repetitions: number;
+}): Promise<BenchmarkComparisonResult> {
+  return fetchJson<BenchmarkComparisonResult>('/api/v1/benchmarks/compare', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(request),
+  });
+}
+
+/** Delete all persisted benchmark results (development aid). */
+export async function resetBenchmarkData(): Promise<{ deleted: number; status: string }> {
+  return fetchJson<{ deleted: number; status: string }>('/api/v1/benchmarks/results', {
+    method: 'DELETE',
+  });
 }

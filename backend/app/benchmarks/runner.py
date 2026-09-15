@@ -21,7 +21,7 @@ from app.benchmarks.scenarios import BenchmarkScenario, get_scenario
 from app.core.config import settings
 from app.core.logging import logger
 from app.providers.factory import ProviderError, get_llm_provider, get_tts_provider
-from app.services.metrics_service import VoiceTurnMetrics, persist_metrics
+from app.services.metrics_service import VoiceTurnMetrics
 from app.tools.executor import ToolExecutor
 from app.tools.registry import ToolRegistry
 
@@ -69,6 +69,9 @@ class BenchmarkRunResult:
     tts_provider: str | None = None
     tts_model: str | None = None
 
+    # Configuration tracking
+    configuration_id: str | None = None
+
     # Persistence
     benchmark_result_id: str | None = None
 
@@ -97,6 +100,7 @@ class BenchmarkRunResult:
             "llm_model": self.llm_model,
             "tts_provider": self.tts_provider,
             "tts_model": self.tts_model,
+            "configuration_id": self.configuration_id,
             "benchmark_result_id": self.benchmark_result_id,
         }
 
@@ -193,7 +197,6 @@ async def run_scenario(
     except (ProviderError, ValueError) as e:
         result.validation_errors.append(f"LLM provider error: {e}")
         metrics.fail("llm", str(e))
-        persist_metrics(db, metrics)
         _persist_benchmark(db, metrics, result, scenario)
         return result
 
@@ -236,7 +239,6 @@ async def run_scenario(
         logger.error("[BENCH] agent failed run_id=%s error=%s", run_id, e)
         result.validation_errors.append(f"Agent error: {e}")
         metrics.fail("llm", str(e))
-        persist_metrics(db, metrics)
         _persist_benchmark(db, metrics, result, scenario)
         return result
 
@@ -308,7 +310,6 @@ async def run_scenario(
     result.total_processing_ms = metrics.total_processing_ms
 
     # Persist
-    persist_metrics(db, metrics)
     _persist_benchmark(db, metrics, result, scenario)
 
     logger.info(
@@ -412,6 +413,7 @@ def _persist_benchmark(
         br.scenario_id = scenario.scenario_id
         br.run_id = result.run_id
         br.benchmark_mode = BENCHMARK_MODE
+        br.configuration_id = result.configuration_id
         # Override conversation_success with the final validation result.
         # metrics.complete() may have set success=True before validation ran,
         # so the persisted value must reflect the actual outcome.

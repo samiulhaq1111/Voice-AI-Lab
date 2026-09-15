@@ -242,6 +242,7 @@ export interface BenchmarkScenario {
 export interface BenchmarkRunRequest {
   scenario_id: string;
   repetitions?: number;
+  configuration_id?: string;
 }
 
 export interface BenchmarkRunResult {
@@ -268,6 +269,7 @@ export interface BenchmarkRunResult {
   tts_provider: string | null;
   tts_model: string | null;
   benchmark_result_id: string | null;
+  configuration_id: string | null;
 }
 
 export interface BenchmarkAggregation {
@@ -366,6 +368,8 @@ export interface BenchmarkRecentResult {
   tts_provider: string | null;
   tts_model: string | null;
   total_cost: number | null;
+  error_message: string | null;
+  configuration_id: string | null;
 }
 
 // --- Benchmark Cost Types (Phase 5D) ---
@@ -401,4 +405,52 @@ export interface BenchmarkCostSummary {
   max_cost: number | null;
   currency: string;
   pricing_version: string;
+}
+
+// --- Benchmark Comparison Types (Phase 5E) ---
+
+export interface BenchmarkConfiguration {
+  configuration_id: string;
+  name: string;
+  description: string;
+  llm_provider: string;
+  llm_model: string;
+  tts_provider: string;
+  tts_model: string;
+  pricing_type: string;
+  production_eligible: boolean;
+}
+
+export interface ComparisonConfigurationResult {
+  configuration_id: string;
+  configuration_name: string;
+  pricing_type: string;
+  production_eligible: boolean;
+  run_count: number;
+  successful_runs: number;
+  failed_runs: number;
+  success_rate: number;
+  avg_total_latency_ms: number | null;
+  median_total_latency_ms: number | null;
+  min_total_latency_ms: number | null;
+  max_total_latency_ms: number | null;
+  avg_llm_latency_ms: number | null;
+  avg_tts_latency_ms: number | null;
+  avg_prompt_tokens: number | null;
+  avg_completion_tokens: number | null;
+  avg_total_tokens: number | null;
+  avg_tts_characters: number | null;
+  avg_cost: number | null;
+  total_cost: number | null;
+  cost_available: boolean;
+  cost_note: string | null;
+  runs: Array<Record<string, unknown>>;
+}
+
+export interface BenchmarkComparisonResult {
+  comparison_id: string;
+  scenario_id: string;
+  repetitions: number;
+  configurations: ComparisonConfigurationResult[];
+  validation_errors: string[];
 }

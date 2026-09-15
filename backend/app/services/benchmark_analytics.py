@@ -178,6 +178,8 @@ class RecentResult:
     tts_provider: str | None
     tts_model: str | None
     total_cost: float | None = None
+    error_message: str | None = None
+    configuration_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -202,6 +204,8 @@ class RecentResult:
             "tts_provider": self.tts_provider,
             "tts_model": self.tts_model,
             "total_cost": self.total_cost,
+            "error_message": self.error_message,
+            "configuration_id": self.configuration_id,
         }
 
 
@@ -281,21 +285,34 @@ class BenchmarkAnalyticsService:
         successful = sum(1 for r in records if _is_success(r))
         failed = total - successful
 
+        # Latency stats from SUCCESSFUL runs only (failed runs don't reflect AI perf)
+        ok = [r for r in records if _is_success(r)]
+        _total_ms = [r.total_processing_ms for r in ok]
+        _stt_ms = [r.stt_latency_ms for r in ok]
+        _llm_ms = [r.llm_latency_ms for r in ok]
+        _tts_ms = [r.tts_latency_ms for r in ok]
+        _tool_ms = [r.tool_execution_ms for r in ok]
+        _prompt = [r.prompt_tokens for r in ok]
+        _compl = [r.completion_tokens for r in ok]
+        _tokens = [r.token_usage for r in ok]
+        _chars = [r.tts_characters for r in ok]
+        _audio = [r.tts_audio_bytes for r in ok]
+
         summary = OverallSummary(
             total_runs=total,
             successful_runs=successful,
             failed_runs=failed,
             success_rate=successful / total if total > 0 else 0.0,
-            latency=_compute_latency_stats([r.total_processing_ms for r in records]),
-            stt_latency=_compute_latency_stats([r.stt_latency_ms for r in records]),
-            llm_latency=_compute_latency_stats([r.llm_latency_ms for r in records]),
-            tts_latency=_compute_latency_stats([r.tts_latency_ms for r in records]),
-            tool_execution=_compute_latency_stats([r.tool_execution_ms for r in records]),
-            avg_prompt_tokens=_avg_int([r.prompt_tokens for r in records]),
-            avg_completion_tokens=_avg_int([r.completion_tokens for r in records]),
-            avg_total_tokens=_avg_int([r.token_usage for r in records]),
-            avg_tts_characters=_avg_int([r.tts_characters for r in records]),
-            avg_tts_audio_bytes=_avg_int([r.tts_audio_bytes for r in records]),
+            latency=_compute_latency_stats(_total_ms),
+            stt_latency=_compute_latency_stats(_stt_ms),
+            llm_latency=_compute_latency_stats(_llm_ms),
+            tts_latency=_compute_latency_stats(_tts_ms),
+            tool_execution=_compute_latency_stats(_tool_ms),
+            avg_prompt_tokens=_avg_int(_prompt),
+            avg_completion_tokens=_avg_int(_compl),
+            avg_total_tokens=_avg_int(_tokens),
+            avg_tts_characters=_avg_int(_chars),
+            avg_tts_audio_bytes=_avg_int(_audio),
         )
 
         logger.info(
@@ -337,6 +354,7 @@ class BenchmarkAnalyticsService:
         for scenario_id, group in sorted(grouped.items()):
             total = len(group)
             successful = sum(1 for r in group if _is_success(r))
+            ok = [r for r in group if _is_success(r)]
             summaries.append(
                 ScenarioSummary(
                     scenario_id=scenario_id,
@@ -344,15 +362,33 @@ class BenchmarkAnalyticsService:
                     successful_runs=successful,
                     failed_runs=total - successful,
                     success_rate=successful / total if total > 0 else 0.0,
-                    latency=_compute_latency_stats([r.total_processing_ms for r in group]),
-                    stt_latency=_compute_latency_stats([r.stt_latency_ms for r in group]),
-                    llm_latency=_compute_latency_stats([r.llm_latency_ms for r in group]),
-                    tts_latency=_compute_latency_stats([r.tts_latency_ms for r in group]),
-                    tool_execution=_compute_latency_stats([r.tool_execution_ms for r in group]),
-                    avg_prompt_tokens=_avg_int([r.prompt_tokens for r in group]),
-                    avg_completion_tokens=_avg_int([r.completion_tokens for r in group]),
-                    avg_total_tokens=_avg_int([r.token_usage for r in group]),
-                    avg_tts_characters=_avg_int([r.tts_characters for r in group]),
+                    latency=_compute_latency_stats(
+                        [r.total_processing_ms for r in ok],
+                    ),
+                    stt_latency=_compute_latency_stats(
+                        [r.stt_latency_ms for r in ok],
+                    ),
+                    llm_latency=_compute_latency_stats(
+                        [r.llm_latency_ms for r in ok],
+                    ),
+                    tts_latency=_compute_latency_stats(
+                        [r.tts_latency_ms for r in ok],
+                    ),
+                    tool_execution=_compute_latency_stats(
+                        [r.tool_execution_ms for r in ok],
+                    ),
+                    avg_prompt_tokens=_avg_int(
+                        [r.prompt_tokens for r in ok],
+                    ),
+                    avg_completion_tokens=_avg_int(
+                        [r.completion_tokens for r in ok],
+                    ),
+                    avg_total_tokens=_avg_int(
+                        [r.token_usage for r in ok],
+                    ),
+                    avg_tts_characters=_avg_int(
+                        [r.tts_characters for r in ok],
+                    ),
                 )
             )
 
@@ -401,6 +437,7 @@ class BenchmarkAnalyticsService:
         for (provider, model), group in sorted(stt_groups.items()):
             total = len(group)
             successful = sum(1 for r in group if _is_success(r))
+            ok = [r for r in group if _is_success(r)]
             summaries.append(
                 ProviderSummary(
                     provider=provider,
@@ -409,13 +446,16 @@ class BenchmarkAnalyticsService:
                     run_count=total,
                     successful_runs=successful,
                     success_rate=successful / total if total > 0 else 0.0,
-                    latency=_compute_latency_stats([r.stt_latency_ms for r in group]),
+                    latency=_compute_latency_stats(
+                        [r.stt_latency_ms for r in ok],
+                    ),
                 )
             )
 
         for (provider, model), group in sorted(llm_groups.items()):
             total = len(group)
             successful = sum(1 for r in group if _is_success(r))
+            ok = [r for r in group if _is_success(r)]
             summaries.append(
                 ProviderSummary(
                     provider=provider,
@@ -424,16 +464,25 @@ class BenchmarkAnalyticsService:
                     run_count=total,
                     successful_runs=successful,
                     success_rate=successful / total if total > 0 else 0.0,
-                    latency=_compute_latency_stats([r.llm_latency_ms for r in group]),
-                    avg_prompt_tokens=_avg_int([r.prompt_tokens for r in group]),
-                    avg_completion_tokens=_avg_int([r.completion_tokens for r in group]),
-                    avg_total_tokens=_avg_int([r.token_usage for r in group]),
+                    latency=_compute_latency_stats(
+                        [r.llm_latency_ms for r in ok],
+                    ),
+                    avg_prompt_tokens=_avg_int(
+                        [r.prompt_tokens for r in ok],
+                    ),
+                    avg_completion_tokens=_avg_int(
+                        [r.completion_tokens for r in ok],
+                    ),
+                    avg_total_tokens=_avg_int(
+                        [r.token_usage for r in ok],
+                    ),
                 )
             )
 
         for (provider, model), group in sorted(tts_groups.items()):
             total = len(group)
             successful = sum(1 for r in group if _is_success(r))
+            ok = [r for r in group if _is_success(r)]
             summaries.append(
                 ProviderSummary(
                     provider=provider,
@@ -442,9 +491,15 @@ class BenchmarkAnalyticsService:
                     run_count=total,
                     successful_runs=successful,
                     success_rate=successful / total if total > 0 else 0.0,
-                    latency=_compute_latency_stats([r.tts_latency_ms for r in group]),
-                    avg_tts_characters=_avg_int([r.tts_characters for r in group]),
-                    avg_tts_audio_bytes=_avg_int([r.tts_audio_bytes for r in group]),
+                    latency=_compute_latency_stats(
+                        [r.tts_latency_ms for r in ok],
+                    ),
+                    avg_tts_characters=_avg_int(
+                        [r.tts_characters for r in ok],
+                    ),
+                    avg_tts_audio_bytes=_avg_int(
+                        [r.tts_audio_bytes for r in ok],
+                    ),
                 )
             )
 
@@ -501,6 +556,8 @@ class BenchmarkAnalyticsService:
                     tts_provider=r.tts_provider,
                     tts_model=r.tts_model,
                     total_cost=total_cost,
+                    error_message=r.error_message,
+                    configuration_id=r.configuration_id,
                 )
             )
 

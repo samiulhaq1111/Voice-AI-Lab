@@ -26,7 +26,7 @@ function App() {
         <div>
           <h1 className="text-xl font-bold text-white">Voice AI Lab</h1>
           <p className="text-xs text-gray-500">
-            {health ? `Backend: ${health.status} (v${health.version})` : 'Phase 4 — Browser Voice MVP'}
+            {health ? `Backend: ${health.status} (v${health.version})` : 'Phase 5E — Controlled Provider/Model Comparison'}
           </p>
         </div>
         <nav className="flex gap-1">
@@ -116,7 +116,7 @@ function App() {
       </main>
 
       <footer className="border-t border-gray-800 px-6 py-2 text-center text-xs text-gray-600">
-        Voice AI Lab v0.2.0 &mdash; Phase 4: Browser Voice MVP
+        Voice AI Lab v0.2.0 &mdash; Phase 5E: Controlled Provider/Model Comparison
       </footer>
     </div>
   );

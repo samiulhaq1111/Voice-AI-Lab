@@ -1,10 +1,12 @@
-"""Benchmark API endpoints (Phase 5B + 5C analytics + 5D cost)."""
+"""Benchmark API endpoints (Phase 5B + 5C analytics + 5D cost + 5E comparison)."""
 
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
+from app.benchmarks.comparison import run_comparison
+from app.benchmarks.configurations import get_configuration, list_configurations
 from app.benchmarks.runner import (
     aggregate_results,
     run_scenario,
@@ -16,6 +18,9 @@ from app.core.logging import logger
 from app.models.benchmark_result import BenchmarkResult
 from app.schemas import (
     BenchmarkBatchResponse,
+    BenchmarkComparisonRequest,
+    BenchmarkComparisonResponse,
+    BenchmarkConfigurationResponse,
     BenchmarkCostBreakdown,
     BenchmarkCostSummary,
     BenchmarkOverallSummary,
@@ -55,21 +60,56 @@ async def execute_benchmark(
 ) -> BenchmarkRunResponse:
     """Execute a benchmark scenario once.
 
-    Returns the run result with metrics and validation.
+    If configuration_id is provided, the provider/model settings are
+    loaded from the configuration catalog.
     """
     scenario = get_scenario(request.scenario_id)
     if scenario is None:
-        raise HTTPException(status_code=404, detail=f"Scenario '{request.scenario_id}' not found")
+        raise HTTPException(
+            status_code=404,
+            detail=f"Scenario '{request.scenario_id}' not found",
+        )
 
-    logger.info("[BENCH] API run request scenario=%s", request.scenario_id)
+    # Resolve configuration if provided
+    config = None
+    if request.configuration_id:
+        config = get_configuration(request.configuration_id)
+        if config is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Unknown configuration_id: "
+                    f"'{request.configuration_id}'"
+                ),
+            )
+
+    logger.info(
+        "[BENCH] API run request scenario=%s config=%s",
+        request.scenario_id,
+        request.configuration_id or "(default)",
+    )
 
     try:
-        result = await run_scenario(db, request.scenario_id)
+        result = await run_scenario(
+            db,
+            request.scenario_id,
+            llm_provider=config.llm_provider if config else None,
+            llm_model=config.llm_model if config else None,
+            tts_provider=config.tts_provider if config else None,
+            tts_model=config.tts_model if config else None,
+            tts_voice=config.tts_voice if config else None,
+        )
+        # Tag the result with the configuration_id
+        if config:
+            result.configuration_id = config.configuration_id
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
         logger.error("[BENCH] API run failed error=%s", e)
-        raise HTTPException(status_code=500, detail=f"Benchmark execution failed: {e}") from e
+        raise HTTPException(
+            status_code=500,
+            detail=f"Benchmark execution failed: {e}",
+        ) from e
 
     return BenchmarkRunResponse(**result.to_api_dict())
 
@@ -244,3 +284,91 @@ async def get_cost_summary(
     results = query.all()
     summary = calculate_cost_summary(results)
     return BenchmarkCostSummary(**summary)
+
+
+# ---------------------------------------------------------------------------
+# Comparison endpoints (Phase 5E)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/configurations", response_model=list[BenchmarkConfigurationResponse])
+async def get_configurations() -> list[BenchmarkConfigurationResponse]:
+    """List all available benchmark configurations."""
+    return [
+        BenchmarkConfigurationResponse(
+            configuration_id=c.configuration_id,
+            name=c.name,
+            description=c.description,
+            llm_provider=c.llm_provider,
+            llm_model=c.llm_model,
+            tts_provider=c.tts_provider,
+            tts_model=c.tts_model,
+            pricing_type=c.pricing_type,
+            production_eligible=c.production_eligible,
+        )
+        for c in list_configurations()
+    ]
+
+
+@router.post("/compare", response_model=BenchmarkComparisonResponse)
+async def execute_comparison(
+    request: BenchmarkComparisonRequest,
+    db: Session = Depends(get_db),
+) -> BenchmarkComparisonResponse:
+    """Run a comparison across multiple configurations.
+
+    Executes the same scenario with identical inputs against each
+    selected configuration. Only provider/model settings change.
+    """
+    scenario = get_scenario(request.scenario_id)
+    if scenario is None:
+        raise HTTPException(status_code=404, detail=f"Scenario '{request.scenario_id}' not found")
+
+    # Validate configuration IDs
+    for config_id in request.configuration_ids:
+        config = get_configuration(config_id)
+        if config is None:
+            raise HTTPException(status_code=400, detail=f"Unknown configuration: '{config_id}'")
+
+    logger.info(
+        "[BENCH] API compare scenario=%s configs=%s reps=%d",
+        request.scenario_id,
+        request.configuration_ids,
+        request.repetitions,
+    )
+
+    try:
+        result = await run_comparison(
+            db,
+            request.scenario_id,
+            request.configuration_ids,
+            repetitions=request.repetitions,
+        )
+    except Exception as e:
+        logger.error("[BENCH] API compare failed error=%s", e)
+        raise HTTPException(status_code=500, detail=f"Comparison failed: {e}") from e
+
+    return BenchmarkComparisonResponse(**result.to_api_dict())
+
+
+# ---------------------------------------------------------------------------
+# Reset endpoint (development aid)
+# ---------------------------------------------------------------------------
+
+
+@router.delete("/results")
+async def reset_benchmark_data(
+    db: Session = Depends(get_db),
+) -> dict[str, int | str]:
+    """Delete all persisted benchmark results.
+
+    Development aid to clear experimental data. Does NOT affect:
+    - benchmark scenario definitions
+    - provider/model configurations
+    - application settings
+    - voice sessions or chat messages
+    """
+    count = db.query(BenchmarkResult).delete()
+    db.commit()
+    logger.info("[BENCH] Reset: deleted %d benchmark results", count)
+    return {"deleted": count, "status": "ok"}
