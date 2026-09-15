@@ -285,3 +285,84 @@ export interface BenchmarkBatchResult {
   runs: BenchmarkRunResult[];
   aggregation: BenchmarkAggregation | null;
 }
+
+// --- Benchmark Analytics Types (Phase 5C) ---
+
+export interface LatencyStats {
+  avg_ms: number | null;
+  median_ms: number | null;
+  min_ms: number | null;
+  max_ms: number | null;
+}
+
+export interface BenchmarkOverallSummary {
+  total_runs: number;
+  successful_runs: number;
+  failed_runs: number;
+  success_rate: number;
+  latency: LatencyStats;
+  stt_latency: LatencyStats;
+  llm_latency: LatencyStats;
+  tts_latency: LatencyStats;
+  tool_execution: LatencyStats;
+  avg_prompt_tokens: number | null;
+  avg_completion_tokens: number | null;
+  avg_total_tokens: number | null;
+  avg_tts_characters: number | null;
+  avg_tts_audio_bytes: number | null;
+}
+
+export interface BenchmarkScenarioSummary {
+  scenario_id: string;
+  run_count: number;
+  successful_runs: number;
+  failed_runs: number;
+  success_rate: number;
+  latency: LatencyStats;
+  stt_latency: LatencyStats;
+  llm_latency: LatencyStats;
+  tts_latency: LatencyStats;
+  tool_execution: LatencyStats;
+  avg_prompt_tokens: number | null;
+  avg_completion_tokens: number | null;
+  avg_total_tokens: number | null;
+  avg_tts_characters: number | null;
+}
+
+export interface BenchmarkProviderSummary {
+  provider: string | null;
+  model: string | null;
+  stage: string;
+  run_count: number;
+  successful_runs: number;
+  success_rate: number;
+  latency: LatencyStats;
+  avg_prompt_tokens: number | null;
+  avg_completion_tokens: number | null;
+  avg_total_tokens: number | null;
+  avg_tts_characters: number | null;
+  avg_tts_audio_bytes: number | null;
+}
+
+export interface BenchmarkRecentResult {
+  id: string;
+  run_id: string | null;
+  scenario_id: string | null;
+  benchmark_mode: string | null;
+  success: boolean;
+  created_at: string;
+  total_processing_ms: number | null;
+  stt_latency_ms: number | null;
+  llm_latency_ms: number | null;
+  tts_latency_ms: number | null;
+  tool_execution_ms: number | null;
+  prompt_tokens: number | null;
+  completion_tokens: number | null;
+  token_usage: number | null;
+  tts_characters: number | null;
+  tts_audio_bytes: number | null;
+  llm_provider: string | null;
+  llm_model: string | null;
+  tts_provider: string | null;
+  tts_model: string | null;
+}

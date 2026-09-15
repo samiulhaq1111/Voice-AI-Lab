@@ -1,6 +1,7 @@
 """Tests for Phase 5B benchmark system."""
 
 import pytest
+from sqlalchemy.orm import Session
 
 from app.benchmarks.deterministic_tools import (
     bench_get_employee_handler,
@@ -288,3 +289,142 @@ class TestToolExecutionTiming:
         m.record_tool_call(success=True)
         assert m.tool_count == 1
         assert m.tool_execution_ms == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Persistence correctness regression tests
+# ---------------------------------------------------------------------------
+
+class TestPersistenceCorrectness:
+    """Regression tests: conversation_success must match result.success."""
+
+    @pytest.fixture
+    def db_session(self) -> Session:
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+
+        from app.core.database import Base
+
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        session_factory = sessionmaker(bind=engine)
+        session = session_factory()
+        yield session
+        session.close()
+
+    def _make_metrics_completed(self):
+        """Create metrics that have been marked complete (success=True)."""
+        from app.services.metrics_service import VoiceTurnMetrics
+
+        m = VoiceTurnMetrics()
+        m.llm_provider = "test"
+        m.llm_model = "test-model"
+        m.complete()  # sets success=True
+        return m
+
+    def test_successful_benchmark_persists_true(self, db_session: Session) -> None:
+        """Successful benchmark: result.success=True -> conversation_success='true'."""
+        from app.benchmarks.runner import _persist_benchmark
+        from app.benchmarks.scenarios import get_scenario
+        from app.models.benchmark_result import BenchmarkResult
+
+        metrics = self._make_metrics_completed()
+        result = BenchmarkRunResult(
+            run_id="run-ok",
+            scenario_id="single_tool",
+            success=True,
+        )
+        scenario = get_scenario("single_tool")
+        _persist_benchmark(db_session, metrics, result, scenario)
+
+        br = db_session.query(BenchmarkResult).filter_by(run_id="run-ok").first()
+        assert br is not None
+        assert br.conversation_success == "true"
+
+    def test_validation_failure_persists_false(self, db_session: Session) -> None:
+        """Validation failure: result.success=False -> conversation_success='false'."""
+        from app.benchmarks.runner import _persist_benchmark
+        from app.benchmarks.scenarios import get_scenario
+        from app.models.benchmark_result import BenchmarkResult
+
+        # Simulate: metrics.complete() was called (success=True) but validation failed
+        metrics = self._make_metrics_completed()
+        assert metrics.success is True  # metrics thinks it succeeded
+
+        result = BenchmarkRunResult(
+            run_id="run-fail",
+            scenario_id="multi_tool",
+            success=False,  # validation failed
+            validation_errors=["Expected 2 tool call(s), got 1"],
+        )
+        scenario = get_scenario("multi_tool")
+        _persist_benchmark(db_session, metrics, result, scenario)
+
+        br = db_session.query(BenchmarkResult).filter_by(run_id="run-fail").first()
+        assert br is not None
+        assert br.conversation_success == "false"
+
+    def test_tool_count_mismatch_persists_false(self, db_session: Session) -> None:
+        """Tool mismatch: expected 2, got 1 -> conversation_success='false'."""
+        from app.benchmarks.runner import _persist_benchmark, _validate
+        from app.benchmarks.scenarios import get_scenario
+        from app.models.benchmark_result import BenchmarkResult
+
+        metrics = self._make_metrics_completed()
+        result = BenchmarkRunResult(
+            run_id="run-mismatch",
+            scenario_id="multi_tool",
+            success=False,
+            expected_tool_calls=2,
+            actual_tool_calls=1,
+        )
+        scenario = get_scenario("multi_tool")
+
+        # Run validation (should add error)
+        _validate(result, scenario)
+        assert result.tool_call_match is False
+        assert len(result.validation_errors) == 1
+
+        result.success = len(result.validation_errors) == 0
+        assert result.success is False
+
+        _persist_benchmark(db_session, metrics, result, scenario)
+
+        br = db_session.query(BenchmarkResult).filter_by(run_id="run-mismatch").first()
+        assert br is not None
+        assert br.conversation_success == "false"
+
+    def test_analytics_reflects_persisted_success(self, db_session: Session) -> None:
+        """Analytics service must see the correct success/failure from persisted data."""
+        from app.benchmarks.runner import _persist_benchmark
+        from app.benchmarks.scenarios import get_scenario
+        from app.services.benchmark_analytics import BenchmarkAnalyticsService
+
+        scenario = get_scenario("single_tool")
+
+        # 2 successful runs
+        for i in range(2):
+            m = self._make_metrics_completed()
+            r = BenchmarkRunResult(
+                run_id=f"ok-{i}",
+                scenario_id="single_tool",
+                success=True,
+            )
+            _persist_benchmark(db_session, m, r, scenario)
+
+        # 1 validation failure (metrics.success=True but result.success=False)
+        m = self._make_metrics_completed()
+        r = BenchmarkRunResult(
+            run_id="fail-0",
+            scenario_id="single_tool",
+            success=False,
+            validation_errors=["Expected 1 tool call(s), got 0"],
+        )
+        _persist_benchmark(db_session, m, r, scenario)
+
+        svc = BenchmarkAnalyticsService(db_session)
+        summary = svc.get_overall_summary()
+        assert summary.total_runs == 3
+        assert summary.successful_runs == 2
+        assert summary.failed_runs == 1
+        assert summary.success_rate == pytest.approx(2 / 3, abs=0.01)

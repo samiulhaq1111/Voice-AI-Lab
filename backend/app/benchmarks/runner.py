@@ -412,6 +412,10 @@ def _persist_benchmark(
         br.scenario_id = scenario.scenario_id
         br.run_id = result.run_id
         br.benchmark_mode = BENCHMARK_MODE
+        # Override conversation_success with the final validation result.
+        # metrics.complete() may have set success=True before validation ran,
+        # so the persisted value must reflect the actual outcome.
+        br.conversation_success = "true" if result.success else "false"
         db.add(br)
         db.commit()
         db.refresh(br)

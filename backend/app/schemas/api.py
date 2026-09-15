@@ -149,3 +149,95 @@ class BenchmarkBatchResponse(BaseModel):
 
     runs: list[BenchmarkRunResponse]
     aggregation: dict[str, Any] | None = None
+
+
+# --- Benchmark Analytics (Phase 5C) ---
+
+
+class LatencyStatsResponse(BaseModel):
+    """Aggregated latency statistics."""
+
+    avg_ms: float | None = None
+    median_ms: float | None = None
+    min_ms: float | None = None
+    max_ms: float | None = None
+
+
+class BenchmarkOverallSummary(BaseModel):
+    """Overall summary across all benchmark runs."""
+
+    total_runs: int
+    successful_runs: int
+    failed_runs: int
+    success_rate: float
+    latency: LatencyStatsResponse
+    stt_latency: LatencyStatsResponse
+    llm_latency: LatencyStatsResponse
+    tts_latency: LatencyStatsResponse
+    tool_execution: LatencyStatsResponse
+    avg_prompt_tokens: float | None = None
+    avg_completion_tokens: float | None = None
+    avg_total_tokens: float | None = None
+    avg_tts_characters: float | None = None
+    avg_tts_audio_bytes: float | None = None
+
+
+class BenchmarkScenarioSummary(BaseModel):
+    """Summary for a single benchmark scenario."""
+
+    scenario_id: str
+    run_count: int
+    successful_runs: int
+    failed_runs: int
+    success_rate: float
+    latency: LatencyStatsResponse
+    stt_latency: LatencyStatsResponse
+    llm_latency: LatencyStatsResponse
+    tts_latency: LatencyStatsResponse
+    tool_execution: LatencyStatsResponse
+    avg_prompt_tokens: float | None = None
+    avg_completion_tokens: float | None = None
+    avg_total_tokens: float | None = None
+    avg_tts_characters: float | None = None
+
+
+class BenchmarkProviderSummary(BaseModel):
+    """Summary grouped by provider + model for a given stage."""
+
+    provider: str | None
+    model: str | None
+    stage: str
+    run_count: int
+    successful_runs: int
+    success_rate: float
+    latency: LatencyStatsResponse
+    avg_prompt_tokens: float | None = None
+    avg_completion_tokens: float | None = None
+    avg_total_tokens: float | None = None
+    avg_tts_characters: float | None = None
+    avg_tts_audio_bytes: float | None = None
+
+
+class BenchmarkRecentResult(BaseModel):
+    """Lightweight representation of a recent benchmark run."""
+
+    id: str
+    run_id: str | None
+    scenario_id: str | None
+    benchmark_mode: str | None
+    success: bool
+    created_at: str
+    total_processing_ms: float | None
+    stt_latency_ms: float | None
+    llm_latency_ms: float | None
+    tts_latency_ms: float | None
+    tool_execution_ms: float | None
+    prompt_tokens: int | None
+    completion_tokens: int | None
+    token_usage: int | None
+    tts_characters: int | None
+    tts_audio_bytes: int | None
+    llm_provider: str | None
+    llm_model: str | None
+    tts_provider: str | None
+    tts_model: str | None

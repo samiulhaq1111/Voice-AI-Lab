@@ -1,6 +1,8 @@
-"""Benchmark API endpoints (Phase 5B)."""
+"""Benchmark API endpoints (Phase 5B + 5C analytics)."""
 
-from fastapi import APIRouter, Depends, HTTPException
+from datetime import datetime
+
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.benchmarks.runner import (
@@ -13,10 +15,15 @@ from app.core.database import get_db
 from app.core.logging import logger
 from app.schemas import (
     BenchmarkBatchResponse,
+    BenchmarkOverallSummary,
+    BenchmarkProviderSummary,
+    BenchmarkRecentResult,
     BenchmarkRunRequest,
     BenchmarkRunResponse,
     BenchmarkScenarioResponse,
+    BenchmarkScenarioSummary,
 )
+from app.services.benchmark_analytics import BenchmarkAnalyticsService
 
 router = APIRouter(prefix="/benchmarks", tags=["benchmarks"])
 
@@ -98,3 +105,82 @@ async def execute_benchmark_batch(
         runs=[BenchmarkRunResponse(**r.to_api_dict()) for r in results],
         aggregation=aggregation.to_api_dict() if aggregation else None,
     )
+
+
+# ---------------------------------------------------------------------------
+# Analytics endpoints (Phase 5C)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/summary", response_model=BenchmarkOverallSummary)
+async def get_overall_summary(
+    scenario_id: str | None = Query(None, description="Filter by scenario"),
+    benchmark_mode: str | None = Query(None, description="Filter by benchmark mode"),
+    date_from: datetime | None = Query(None, description="Start date (ISO 8601)"),
+    date_to: datetime | None = Query(None, description="End date (ISO 8601)"),
+    db: Session = Depends(get_db),
+) -> BenchmarkOverallSummary:
+    """Overall summary across all benchmark runs."""
+    svc = BenchmarkAnalyticsService(db)
+    summary = svc.get_overall_summary(
+        scenario_id=scenario_id,
+        benchmark_mode=benchmark_mode,
+        date_from=date_from,
+        date_to=date_to,
+    )
+    return BenchmarkOverallSummary(**summary.to_dict())
+
+
+@router.get("/scenarios/summary", response_model=list[BenchmarkScenarioSummary])
+async def get_scenario_summaries(
+    benchmark_mode: str | None = Query(None, description="Filter by benchmark mode"),
+    date_from: datetime | None = Query(None, description="Start date (ISO 8601)"),
+    date_to: datetime | None = Query(None, description="End date (ISO 8601)"),
+    db: Session = Depends(get_db),
+) -> list[BenchmarkScenarioSummary]:
+    """Summary for each benchmark scenario."""
+    svc = BenchmarkAnalyticsService(db)
+    summaries = svc.get_scenario_summaries(
+        benchmark_mode=benchmark_mode,
+        date_from=date_from,
+        date_to=date_to,
+    )
+    return [BenchmarkScenarioSummary(**s.to_dict()) for s in summaries]
+
+
+@router.get("/providers/summary", response_model=list[BenchmarkProviderSummary])
+async def get_provider_summaries(
+    benchmark_mode: str | None = Query(None, description="Filter by benchmark mode"),
+    date_from: datetime | None = Query(None, description="Start date (ISO 8601)"),
+    date_to: datetime | None = Query(None, description="End date (ISO 8601)"),
+    db: Session = Depends(get_db),
+) -> list[BenchmarkProviderSummary]:
+    """Summaries grouped by provider + model for each stage."""
+    svc = BenchmarkAnalyticsService(db)
+    summaries = svc.get_provider_summaries(
+        benchmark_mode=benchmark_mode,
+        date_from=date_from,
+        date_to=date_to,
+    )
+    return [BenchmarkProviderSummary(**s.to_dict()) for s in summaries]
+
+
+@router.get("/results", response_model=list[BenchmarkRecentResult])
+async def get_recent_results(
+    limit: int = Query(20, ge=1, le=100, description="Max results to return"),
+    scenario_id: str | None = Query(None, description="Filter by scenario"),
+    benchmark_mode: str | None = Query(None, description="Filter by benchmark mode"),
+    date_from: datetime | None = Query(None, description="Start date (ISO 8601)"),
+    date_to: datetime | None = Query(None, description="End date (ISO 8601)"),
+    db: Session = Depends(get_db),
+) -> list[BenchmarkRecentResult]:
+    """Recent benchmark results with key metrics."""
+    svc = BenchmarkAnalyticsService(db)
+    results = svc.get_recent_results(
+        limit=limit,
+        scenario_id=scenario_id,
+        benchmark_mode=benchmark_mode,
+        date_from=date_from,
+        date_to=date_to,
+    )
+    return [BenchmarkRecentResult(**r.to_dict()) for r in results]

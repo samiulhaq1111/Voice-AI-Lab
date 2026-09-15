@@ -2,9 +2,13 @@
 
 import type {
   BenchmarkBatchResult,
+  BenchmarkOverallSummary,
+  BenchmarkProviderSummary,
+  BenchmarkRecentResult,
   BenchmarkRunRequest,
   BenchmarkRunResult,
   BenchmarkScenario,
+  BenchmarkScenarioSummary,
   ChatRequest,
   ChatResponse,
   HealthStatus,
@@ -71,4 +75,60 @@ export async function runBenchmarkBatch(request: BenchmarkRunRequest): Promise<B
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(request),
   });
+}
+
+// --- Benchmark Analytics API (Phase 5C) ---
+
+/** Get overall benchmark summary. */
+export async function getBenchmarkSummary(params?: {
+  scenario_id?: string;
+  benchmark_mode?: string;
+}): Promise<BenchmarkOverallSummary> {
+  const qs = new URLSearchParams();
+  if (params?.scenario_id) qs.set('scenario_id', params.scenario_id);
+  if (params?.benchmark_mode) qs.set('benchmark_mode', params.benchmark_mode);
+  const query = qs.toString();
+  return fetchJson<BenchmarkOverallSummary>(
+    `/api/v1/benchmarks/summary${query ? `?${query}` : ''}`,
+  );
+}
+
+/** Get per-scenario summaries. */
+export async function getBenchmarkScenarioSummaries(params?: {
+  benchmark_mode?: string;
+}): Promise<BenchmarkScenarioSummary[]> {
+  const qs = new URLSearchParams();
+  if (params?.benchmark_mode) qs.set('benchmark_mode', params.benchmark_mode);
+  const query = qs.toString();
+  return fetchJson<BenchmarkScenarioSummary[]>(
+    `/api/v1/benchmarks/scenarios/summary${query ? `?${query}` : ''}`,
+  );
+}
+
+/** Get per-provider/model summaries. */
+export async function getBenchmarkProviderSummaries(params?: {
+  benchmark_mode?: string;
+}): Promise<BenchmarkProviderSummary[]> {
+  const qs = new URLSearchParams();
+  if (params?.benchmark_mode) qs.set('benchmark_mode', params.benchmark_mode);
+  const query = qs.toString();
+  return fetchJson<BenchmarkProviderSummary[]>(
+    `/api/v1/benchmarks/providers/summary${query ? `?${query}` : ''}`,
+  );
+}
+
+/** Get recent benchmark results. */
+export async function getBenchmarkRecentResults(params?: {
+  limit?: number;
+  scenario_id?: string;
+  benchmark_mode?: string;
+}): Promise<BenchmarkRecentResult[]> {
+  const qs = new URLSearchParams();
+  if (params?.limit != null) qs.set('limit', String(params.limit));
+  if (params?.scenario_id) qs.set('scenario_id', params.scenario_id);
+  if (params?.benchmark_mode) qs.set('benchmark_mode', params.benchmark_mode);
+  const query = qs.toString();
+  return fetchJson<BenchmarkRecentResult[]>(
+    `/api/v1/benchmarks/results${query ? `?${query}` : ''}`,
+  );
 }
