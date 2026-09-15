@@ -1,4 +1,4 @@
-"""Benchmark API endpoints (Phase 5B + 5C analytics)."""
+"""Benchmark API endpoints (Phase 5B + 5C analytics + 5D cost)."""
 
 from datetime import datetime
 
@@ -13,8 +13,11 @@ from app.benchmarks.runner import (
 from app.benchmarks.scenarios import get_scenario, list_scenarios
 from app.core.database import get_db
 from app.core.logging import logger
+from app.models.benchmark_result import BenchmarkResult
 from app.schemas import (
     BenchmarkBatchResponse,
+    BenchmarkCostBreakdown,
+    BenchmarkCostSummary,
     BenchmarkOverallSummary,
     BenchmarkProviderSummary,
     BenchmarkRecentResult,
@@ -24,6 +27,7 @@ from app.schemas import (
     BenchmarkScenarioSummary,
 )
 from app.services.benchmark_analytics import BenchmarkAnalyticsService
+from app.services.cost_service import calculate_benchmark_cost, calculate_cost_summary
 
 router = APIRouter(prefix="/benchmarks", tags=["benchmarks"])
 
@@ -184,3 +188,59 @@ async def get_recent_results(
         date_to=date_to,
     )
     return [BenchmarkRecentResult(**r.to_dict()) for r in results]
+
+
+# ---------------------------------------------------------------------------
+# Cost endpoints (Phase 5D)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/{run_id}/cost", response_model=BenchmarkCostBreakdown)
+async def get_run_cost(
+    run_id: str,
+    db: Session = Depends(get_db),
+) -> BenchmarkCostBreakdown:
+    """Get cost breakdown for a specific benchmark run.
+
+    Calculates cost from measured usage data and the pricing catalog.
+    Returns NULL for costs where usage was not measured (e.g., STT in text_input).
+    """
+    # Find benchmark result by run_id
+    result = (
+        db.query(BenchmarkResult)
+        .filter(BenchmarkResult.run_id == run_id)
+        .first()
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"Benchmark run '{run_id}' not found")
+
+    breakdown = calculate_benchmark_cost(result)
+    return BenchmarkCostBreakdown(**breakdown.to_dict())
+
+
+@router.get("/cost/summary", response_model=BenchmarkCostSummary)
+async def get_cost_summary(
+    scenario_id: str | None = Query(None, description="Filter by scenario"),
+    benchmark_mode: str | None = Query(None, description="Filter by benchmark mode"),
+    date_from: datetime | None = Query(None, description="Start date (ISO 8601)"),
+    date_to: datetime | None = Query(None, description="End date (ISO 8601)"),
+    db: Session = Depends(get_db),
+) -> BenchmarkCostSummary:
+    """Aggregate cost summary across benchmark runs.
+
+    Supports filtering by scenario, benchmark mode, and date range.
+    """
+    query = db.query(BenchmarkResult)
+
+    if scenario_id:
+        query = query.filter(BenchmarkResult.scenario_id == scenario_id)
+    if benchmark_mode:
+        query = query.filter(BenchmarkResult.benchmark_mode == benchmark_mode)
+    if date_from:
+        query = query.filter(BenchmarkResult.created_at >= date_from)
+    if date_to:
+        query = query.filter(BenchmarkResult.created_at <= date_to)
+
+    results = query.all()
+    summary = calculate_cost_summary(results)
+    return BenchmarkCostSummary(**summary)

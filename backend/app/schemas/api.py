@@ -241,3 +241,44 @@ class BenchmarkRecentResult(BaseModel):
     llm_model: str | None
     tts_provider: str | None
     tts_model: str | None
+    total_cost: float | None = None
+
+
+# --- Benchmark Cost (Phase 5D) ---
+
+
+class BenchmarkCostBreakdown(BaseModel):
+    """Cost breakdown for a single benchmark run."""
+
+    run_id: str | None
+    scenario_id: str | None
+    benchmark_mode: str | None
+    stt_cost: float | None = None
+    llm_input_cost: float | None = None
+    llm_output_cost: float | None = None
+    llm_total_cost: float | None = None
+    tts_cost: float | None = None
+    total_cost: float | None = None
+    currency: str
+    pricing_version: str
+    pricing_available: bool
+    stt_pricing_source: str | None = None
+    llm_pricing_source: str | None = None
+    tts_pricing_source: str | None = None
+    stt_audio_duration_seconds: float | None = None
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    tts_characters: int | None = None
+
+
+class BenchmarkCostSummary(BaseModel):
+    """Aggregate cost summary across multiple benchmark runs."""
+
+    total_runs: int
+    runs_with_cost: int
+    total_cost: float | None = None
+    avg_cost: float | None = None
+    min_cost: float | None = None
+    max_cost: float | None = None
+    currency: str
+    pricing_version: str

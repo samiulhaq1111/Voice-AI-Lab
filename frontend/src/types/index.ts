@@ -365,4 +365,40 @@ export interface BenchmarkRecentResult {
   llm_model: string | null;
   tts_provider: string | null;
   tts_model: string | null;
+  total_cost: number | null;
+}
+
+// --- Benchmark Cost Types (Phase 5D) ---
+
+export interface BenchmarkCostBreakdown {
+  run_id: string | null;
+  scenario_id: string | null;
+  benchmark_mode: string | null;
+  stt_cost: number | null;
+  llm_input_cost: number | null;
+  llm_output_cost: number | null;
+  llm_total_cost: number | null;
+  tts_cost: number | null;
+  total_cost: number | null;
+  currency: string;
+  pricing_version: string;
+  pricing_available: boolean;
+  stt_pricing_source: string | null;
+  llm_pricing_source: string | null;
+  tts_pricing_source: string | null;
+  stt_audio_duration_seconds: number | null;
+  prompt_tokens: number | null;
+  completion_tokens: number | null;
+  tts_characters: number | null;
+}
+
+export interface BenchmarkCostSummary {
+  total_runs: number;
+  runs_with_cost: number;
+  total_cost: number | null;
+  avg_cost: number | null;
+  min_cost: number | null;
+  max_cost: number | null;
+  currency: string;
+  pricing_version: string;
 }

@@ -1,7 +1,9 @@
-/** Benchmark — Phase 5B runner + Phase 5C analytics UI. */
+/** Benchmark — Phase 5B runner + Phase 5C analytics + Phase 5D cost UI. */
 
 import { useCallback, useEffect, useState } from 'react';
 import type {
+  BenchmarkCostBreakdown,
+  BenchmarkCostSummary,
   BenchmarkOverallSummary,
   BenchmarkProviderSummary,
   BenchmarkRecentResult,
@@ -11,7 +13,9 @@ import type {
   LatencyStats,
 } from '../types';
 import {
+  getBenchmarkCostSummary,
   getBenchmarkRecentResults,
+  getBenchmarkRunCost,
   getBenchmarkScenarioSummaries,
   getBenchmarkScenarios,
   getBenchmarkSummary,
@@ -30,6 +34,8 @@ export default function Benchmark() {
   const [scenarioSummaries, setScenarioSummaries] = useState<BenchmarkScenarioSummary[]>([]);
   const [providerSummaries, setProviderSummaries] = useState<BenchmarkProviderSummary[]>([]);
   const [recentResults, setRecentResults] = useState<BenchmarkRecentResult[]>([]);
+  const [costSummary, setCostSummary] = useState<BenchmarkCostSummary | null>(null);
+  const [runCost, setRunCost] = useState<BenchmarkCostBreakdown | null>(null);
 
   useEffect(() => {
     getBenchmarkScenarios().then(setScenarios).catch(() => {});
@@ -41,15 +47,21 @@ export default function Benchmark() {
     getBenchmarkScenarioSummaries().then(setScenarioSummaries).catch(() => {});
     getBenchmarkProviderSummaries().then(setProviderSummaries).catch(() => {});
     getBenchmarkRecentResults({ limit: 20 }).then(setRecentResults).catch(() => {});
+    getBenchmarkCostSummary().then(setCostSummary).catch(() => {});
   }, []);
 
   const handleRun = useCallback(async (scenarioId: string) => {
     setRunning(scenarioId);
     setResult(null);
     setError(null);
+    setRunCost(null);
     try {
       const res = await runBenchmark({ scenario_id: scenarioId });
       setResult(res);
+      // Fetch cost breakdown for this run
+      if (res.run_id) {
+        getBenchmarkRunCost(res.run_id).then(setRunCost).catch(() => {});
+      }
       // Refresh analytics after run
       loadAnalytics();
     } catch (e: unknown) {
@@ -63,6 +75,13 @@ export default function Benchmark() {
   const fmtMs = (v: number | null) => (v == null ? 'N/A' : `${Math.round(v)} ms`);
   const fmtBytes = (v: number | null) => (v == null ? 'N/A' : `${(v / 1024).toFixed(1)} KB`);
   const fmtPct = (v: number) => `${(v * 100).toFixed(1)}%`;
+  const fmtCost = (v: number | null) => {
+    if (v == null) return 'N/A';
+    if (v === 0) return '$0.00';
+    if (v < 0.001) return `$${v.toFixed(6)}`;
+    if (v < 0.01) return `$${v.toFixed(5)}`;
+    return `$${v.toFixed(4)}`;
+  };
 
   const categoryColor = (cat: string) => {
     switch (cat) {
@@ -98,7 +117,7 @@ export default function Benchmark() {
         <div>
           <h2 className="text-lg font-semibold text-white">Benchmark</h2>
           <p className="text-xs text-gray-500">
-            Phase 5C — Analytics &amp; Results
+            Phase 5D — Analytics, Cost &amp; Results
           </p>
         </div>
         <button
@@ -156,6 +175,34 @@ export default function Benchmark() {
                 <div className="text-gray-500 mb-1">Tools</div>
                 {renderLatency(overall.tool_execution)}
               </div>
+            </div>
+          </section>
+        )}
+
+        {/* Cost Summary */}
+        {costSummary && costSummary.runs_with_cost > 0 && (
+          <section>
+            <h3 className="text-sm font-semibold text-gray-300 mb-2">Cost Summary</h3>
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+              <div className="bg-gray-800 rounded px-3 py-2">
+                <div className="text-xs text-gray-500">Total Cost</div>
+                <div className="text-lg font-mono text-white">{fmtCost(costSummary.total_cost)}</div>
+              </div>
+              <div className="bg-gray-800 rounded px-3 py-2">
+                <div className="text-xs text-gray-500">Avg Cost</div>
+                <div className="text-lg font-mono text-white">{fmtCost(costSummary.avg_cost)}</div>
+              </div>
+              <div className="bg-gray-800 rounded px-3 py-2">
+                <div className="text-xs text-gray-500">Min Cost</div>
+                <div className="text-lg font-mono text-gray-300">{fmtCost(costSummary.min_cost)}</div>
+              </div>
+              <div className="bg-gray-800 rounded px-3 py-2">
+                <div className="text-xs text-gray-500">Max Cost</div>
+                <div className="text-lg font-mono text-gray-300">{fmtCost(costSummary.max_cost)}</div>
+              </div>
+            </div>
+            <div className="text-xs text-gray-600 mt-1">
+              {costSummary.runs_with_cost} of {costSummary.total_runs} runs have cost data • v{costSummary.pricing_version}
             </div>
           </section>
         )}
@@ -290,6 +337,37 @@ export default function Benchmark() {
                   ))}
                 </div>
               )}
+              {/* Cost Breakdown */}
+              {runCost && (
+                <div className="border-t border-gray-700 pt-3 mt-3">
+                  <div className="text-xs text-gray-400 mb-2">Cost Breakdown</div>
+                  <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 text-xs font-mono">
+                    <div className="flex justify-between">
+                      <span className="text-gray-500">STT</span>
+                      <span className="text-gray-200">{fmtCost(runCost.stt_cost)}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-gray-500">LLM In</span>
+                      <span className="text-gray-200">{fmtCost(runCost.llm_input_cost)}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-gray-500">LLM Out</span>
+                      <span className="text-gray-200">{fmtCost(runCost.llm_output_cost)}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-gray-500">TTS</span>
+                      <span className="text-gray-200">{fmtCost(runCost.tts_cost)}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-gray-400">Total</span>
+                      <span className="text-green-400">{fmtCost(runCost.total_cost)}</span>
+                    </div>
+                  </div>
+                  {!runCost.pricing_available && (
+                    <div className="text-xs text-yellow-500 mt-1">Some pricing unavailable</div>
+                  )}
+                </div>
+              )}
             </div>
           )}
         </section>
@@ -307,6 +385,7 @@ export default function Benchmark() {
                     <th className="text-right py-1 px-2">Total ms</th>
                     <th className="text-right py-1 px-2">LLM ms</th>
                     <th className="text-right py-1 px-2">Tokens</th>
+                    <th className="text-right py-1 px-2">Cost</th>
                     <th className="text-right py-1 px-2">Run ID</th>
                   </tr>
                 </thead>
@@ -320,6 +399,7 @@ export default function Benchmark() {
                       <td className="py-1.5 px-2 text-right font-mono text-gray-300">{fmtMs(r.total_processing_ms)}</td>
                       <td className="py-1.5 px-2 text-right font-mono text-gray-300">{fmtMs(r.llm_latency_ms)}</td>
                       <td className="py-1.5 px-2 text-right font-mono text-gray-300">{r.token_usage ?? 'N/A'}</td>
+                      <td className="py-1.5 px-2 text-right font-mono text-gray-300">{fmtCost(r.total_cost)}</td>
                       <td className="py-1.5 px-2 text-right font-mono text-gray-500">{r.run_id ? r.run_id.slice(0, 8) : '—'}</td>
                     </tr>
                   ))}

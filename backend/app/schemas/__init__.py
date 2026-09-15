@@ -2,6 +2,8 @@
 
 from app.schemas.api import (
     BenchmarkBatchResponse,
+    BenchmarkCostBreakdown,
+    BenchmarkCostSummary,
     BenchmarkOverallSummary,
     BenchmarkProviderSummary,
     BenchmarkRecentResult,
@@ -22,6 +24,8 @@ from app.schemas.api import (
 
 __all__ = [
     "BenchmarkBatchResponse",
+    "BenchmarkCostBreakdown",
+    "BenchmarkCostSummary",
     "BenchmarkOverallSummary",
     "BenchmarkProviderSummary",
     "BenchmarkRecentResult",

@@ -2,6 +2,8 @@
 
 import type {
   BenchmarkBatchResult,
+  BenchmarkCostBreakdown,
+  BenchmarkCostSummary,
   BenchmarkOverallSummary,
   BenchmarkProviderSummary,
   BenchmarkRecentResult,
@@ -130,5 +132,26 @@ export async function getBenchmarkRecentResults(params?: {
   const query = qs.toString();
   return fetchJson<BenchmarkRecentResult[]>(
     `/api/v1/benchmarks/results${query ? `?${query}` : ''}`,
+  );
+}
+
+// --- Benchmark Cost API (Phase 5D) ---
+
+/** Get cost breakdown for a specific benchmark run. */
+export async function getBenchmarkRunCost(runId: string): Promise<BenchmarkCostBreakdown> {
+  return fetchJson<BenchmarkCostBreakdown>(`/api/v1/benchmarks/${runId}/cost`);
+}
+
+/** Get aggregate cost summary across benchmark runs. */
+export async function getBenchmarkCostSummary(params?: {
+  scenario_id?: string;
+  benchmark_mode?: string;
+}): Promise<BenchmarkCostSummary> {
+  const qs = new URLSearchParams();
+  if (params?.scenario_id) qs.set('scenario_id', params.scenario_id);
+  if (params?.benchmark_mode) qs.set('benchmark_mode', params.benchmark_mode);
+  const query = qs.toString();
+  return fetchJson<BenchmarkCostSummary>(
+    `/api/v1/benchmarks/cost/summary${query ? `?${query}` : ''}`,
   );
 }

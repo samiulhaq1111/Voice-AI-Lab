@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 
 from app.core.logging import logger
 from app.models.benchmark_result import BenchmarkResult
+from app.services.cost_service import calculate_benchmark_cost
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -176,6 +177,7 @@ class RecentResult:
     llm_model: str | None
     tts_provider: str | None
     tts_model: str | None
+    total_cost: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -199,6 +201,7 @@ class RecentResult:
             "llm_model": self.llm_model,
             "tts_provider": self.tts_provider,
             "tts_model": self.tts_model,
+            "total_cost": self.total_cost,
         }
 
 
@@ -471,6 +474,10 @@ class BenchmarkAnalyticsService:
 
         results = []
         for r in records:
+            # Calculate cost for this result
+            breakdown = calculate_benchmark_cost(r)
+            total_cost = float(breakdown.total_cost) if breakdown.total_cost is not None else None
+
             results.append(
                 RecentResult(
                     id=r.id,
@@ -493,6 +500,7 @@ class BenchmarkAnalyticsService:
                     llm_model=r.llm_model,
                     tts_provider=r.tts_provider,
                     tts_model=r.tts_model,
+                    total_cost=total_cost,
                 )
             )
 
