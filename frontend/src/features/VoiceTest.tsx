@@ -11,6 +11,7 @@ import type {
   VoiceTurnMetrics,
 } from '../types';
 import { getProviders } from '../services/api';
+import RealtimeStt from './RealtimeStt';
 
 const WS_BASE = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000').replace(
   'http',
@@ -390,6 +391,10 @@ export default function VoiceTest() {
 
   const sttProv = providers?.stt[0];
   const ttsProv = providers?.tts[0];
+  // Split the shared catalogue into free and paid groups for the dropdown.
+  const llmProv = providers?.llm.find((p) => p.provider === selectedLLMProvider);
+  const paidModels = llmProv?.paid_models ?? [];
+  const freeModels = (llmProv?.models ?? []).filter((m) => !paidModels.includes(m));
 
   const fmtMs = (v: number | null | undefined) => (v == null ? 'N/A' : `${Math.round(v)} ms`);
   const fmtBytes = (v: number | null | undefined) =>
@@ -447,15 +452,26 @@ export default function VoiceTest() {
                 className="w-full text-xs bg-gray-800 text-gray-200 rounded px-2 py-1.5 border border-gray-700 min-w-0"
               >
                 <option value="">
-                  default ({providers?.llm.find((p) => p.provider === selectedLLMProvider)?.default_model || 'nvidia/nemotron-3.5-lightning:free'})
+                  default ({llmProv?.default_model || 'nvidia/nemotron-3.5-lightning:free'})
                 </option>
-                {providers?.llm
-                  .find((p) => p.provider === selectedLLMProvider)
-                  ?.models.map((m) => (
-                    <option key={m} value={m}>
-                      {m}
-                    </option>
-                  ))}
+                {freeModels.length > 0 && (
+                  <optgroup label="FREE / EXPERIMENTAL">
+                    {freeModels.map((m) => (
+                      <option key={m} value={m}>
+                        {m}
+                      </option>
+                    ))}
+                  </optgroup>
+                )}
+                {paidModels.length > 0 && (
+                  <optgroup label="PAID / PAYG">
+                    {paidModels.map((m) => (
+                      <option key={m} value={m}>
+                        {m}
+                      </option>
+                    ))}
+                  </optgroup>
+                )}
               </select>
             </div>
           </div>
@@ -667,6 +683,9 @@ export default function VoiceTest() {
           {error}
         </div>
       )}
+
+      {/* Realtime STT test (Phase 6A) — independent of the turn-based flow above */}
+      <RealtimeStt />
 
       {/* Hidden audio element */}
       <audio ref={audioRef} className="hidden" />

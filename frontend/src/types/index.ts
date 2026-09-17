@@ -85,6 +85,8 @@ export interface ProviderAvailability {
 export interface ProviderOption {
   provider: string;
   models: string[];
+  /** Model IDs that are paid/PAYG; the rest of `models` are free/experimental. */
+  paid_models?: string[];
   configured: boolean;
   default_model?: string;
   default_voice?: string;
@@ -227,6 +229,116 @@ export type VoiceEvent =
 
 export type RecordingState = 'idle' | 'recording' | 'processing' | 'playing';
 export type ConnectionState = 'disconnected' | 'connecting' | 'connected';
+
+// --- Realtime Voice Events (Phase 6B) ---
+// Protocol for WS /api/v1/voice/realtime/ws (streaming STT + AgentRuntime).
+
+export type RealtimeEventType =
+  | 'session_started'
+  | 'transcript_partial'
+  | 'transcript_final'
+  | 'utterance_end'
+  | 'agent_processing'
+  | 'agent_response'
+  | 'completed'
+  | 'error';
+
+export interface RealtimeSessionStarted {
+  type: 'session_started';
+  session_id: string;
+  provider: string;
+  model: string;
+  sample_rate: number;
+  encoding: string;
+}
+
+export interface RealtimeTranscriptPartial {
+  type: 'transcript_partial';
+  text: string;
+  confidence?: number;
+}
+
+export interface RealtimeTranscriptFinal {
+  type: 'transcript_final';
+  text: string;
+  confidence?: number;
+}
+
+export interface RealtimeUtteranceEnd {
+  type: 'utterance_end';
+}
+
+export interface RealtimeAgentProcessing {
+  type: 'agent_processing';
+}
+
+export interface RealtimeAgentResponse {
+  type: 'agent_response';
+  text: string;
+  tool_calls: number;
+  iterations: number;
+}
+
+/** Server-side diagnostic timings for one realtime session. */
+export interface RealtimeTimings {
+  session_start_ms: number | null;
+  first_audio_ms: number | null;
+  first_partial_ms: number | null;
+  first_final_ms: number | null;
+  first_utterance_end_ms: number | null;
+  session_duration_ms: number | null;
+  audio_bytes: number;
+  audio_chunks: number;
+  partial_count: number;
+  final_count: number;
+  utterance_end_count: number;
+  agent_response_count: number;
+}
+
+export interface RealtimeCompleted {
+  type: 'completed';
+  timings: RealtimeTimings;
+}
+
+export interface RealtimeError {
+  type: 'error';
+  message: string;
+  /** Pipeline stage that failed (e.g. 'stt', 'agent'). Absent for protocol errors. */
+  stage?: string;
+}
+
+export type RealtimeEvent =
+  | RealtimeSessionStarted
+  | RealtimeTranscriptPartial
+  | RealtimeTranscriptFinal
+  | RealtimeUtteranceEnd
+  | RealtimeAgentProcessing
+  | RealtimeAgentResponse
+  | RealtimeCompleted
+  | RealtimeError;
+
+/** START message sent by the client (then binary PCM chunks, then stop). */
+export interface RealtimeStartMessage {
+  type: 'start';
+  sample_rate: number;
+  channels: number;
+  encoding: 'linear16';
+  language: string;
+  model?: string;
+  /** LLM provider override (optional). */
+  llm_provider?: string;
+  /** LLM model override (optional). */
+  llm_model?: string;
+}
+
+export type RealtimeConnectionState = 'disconnected' | 'connecting' | 'connected';
+
+/** One entry in the realtime event log UI. */
+export interface RealtimeLogEntry {
+  time: string;
+  type: RealtimeEventType | 'mic' | 'ws';
+  detail: string;
+}
 
 // --- Benchmark Types (Phase 5B) ---
 

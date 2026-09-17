@@ -81,6 +81,11 @@ export default function TextChat() {
     setError(null);
   };
 
+  // Split the shared catalogue into free and paid groups for the dropdown.
+  const llmProv = providers?.llm.find((p) => p.provider === selectedProvider);
+  const paidModels = llmProv?.paid_models ?? [];
+  const freeModels = (llmProv?.models ?? []).filter((m) => !paidModels.includes(m));
+
   return (
     <div className="flex flex-col h-full max-w-3xl mx-auto">
       {/* Header */}
@@ -122,15 +127,26 @@ export default function TextChat() {
           className="text-xs bg-gray-800 text-gray-200 rounded px-2 py-1 border border-gray-700"
         >
           <option value="">
-            default ({providers?.llm.find((p) => p.provider === selectedProvider)?.default_model || 'nvidia/nemotron-3.5-lightning:free'})
+            default ({llmProv?.default_model || 'nvidia/nemotron-3.5-lightning:free'})
           </option>
-          {providers?.llm
-            .find((p) => p.provider === selectedProvider)
-            ?.models.map((m) => (
-              <option key={m} value={m}>
-                {m}
-              </option>
-            ))}
+          {freeModels.length > 0 && (
+            <optgroup label="FREE / EXPERIMENTAL">
+              {freeModels.map((m) => (
+                <option key={m} value={m}>
+                  {m}
+                </option>
+              ))}
+            </optgroup>
+          )}
+          {paidModels.length > 0 && (
+            <optgroup label="PAID / PAYG">
+              {paidModels.map((m) => (
+                <option key={m} value={m}>
+                  {m}
+                </option>
+              ))}
+            </optgroup>
+          )}
         </select>
       </div>
 

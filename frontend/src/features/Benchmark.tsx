@@ -128,6 +128,50 @@ export default function Benchmark() {
   const [costSummary, setCostSummary] = useState<BenchmarkCostSummary | null>(null);
   const [runCost, setRunCost] = useState<BenchmarkCostBreakdown | null>(null);
 
+  // Recent Runs cost breakdown state (lazy-loaded, cached per run_id)
+  const [openCostRunId, setOpenCostRunId] = useState<string | null>(null);
+  const [costBreakdowns, setCostBreakdowns] = useState<Map<string, BenchmarkCostBreakdown>>(new Map());
+  const [loadingCostRunId, setLoadingCostRunId] = useState<string | null>(null);
+
+  // Close cost breakdown when clicking outside
+  useEffect(() => {
+    if (!openCostRunId) return;
+    const handleClickOutside = (e: MouseEvent) => {
+      const target = e.target as HTMLElement;
+      if (!target.closest('[data-cost-breakdown]')) {
+        setOpenCostRunId(null);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, [openCostRunId]);
+
+  // Handle cost cell click: toggle breakdown, lazy-fetch if needed
+  const handleCostCellClick = useCallback(async (runId: string | null | undefined) => {
+    if (!runId) return;
+    
+    // Toggle: if already open, close it
+    if (openCostRunId === runId) {
+      setOpenCostRunId(null);
+      return;
+    }
+    
+    setOpenCostRunId(runId);
+    
+    // Fetch if not cached
+    if (!costBreakdowns.has(runId)) {
+      setLoadingCostRunId(runId);
+      try {
+        const breakdown = await getBenchmarkRunCost(runId);
+        setCostBreakdowns((prev) => new Map(prev).set(runId, breakdown));
+      } catch {
+        // Silently fail — cell will show "Failed to load"
+      } finally {
+        setLoadingCostRunId(null);
+      }
+    }
+  }, [openCostRunId, costBreakdowns]);
+
   // Refresh state
   const [refreshing, setRefreshing] = useState(false);
   const [refreshError, setRefreshError] = useState<string | null>(null);
@@ -917,31 +961,113 @@ export default function Benchmark() {
                 <tbody>
                   {recentResults.map((r) => {
                     const errInfo = !r.success ? classifyError(r.error_message) : null;
+                    const configName = r.configuration_id && configMap.get(r.configuration_id)
+                      ? configMap.get(r.configuration_id)!.name
+                      : r.llm_provider
+                        ? `${r.llm_provider}/${r.llm_model ?? '?'}`
+                        : '—';
+                    const isOpen = openCostRunId === r.run_id;
+                    const breakdown = costBreakdowns.get(r.run_id ?? '');
+                    const isLoading = loadingCostRunId === r.run_id;
+                    
                     return (
-                      <tr key={r.id} className="border-b border-gray-800">
-                        <td className="py-1.5 pr-2 text-white">{r.scenario_id ?? '—'}</td>
-                        <td className="py-1.5 px-2 text-gray-400 text-[11px]">
-                          {r.configuration_id && configMap.get(r.configuration_id)
-                            ? configMap.get(r.configuration_id)!.name
-                            : r.llm_provider
-                              ? `${r.llm_provider}/${r.llm_model ?? '?'}`
-                              : '—'}
-                        </td>
-                        <td className="py-1.5 px-2 text-center">
-                          {r.success ? (
-                            <span className="inline-block w-2 h-2 rounded-full bg-green-400" />
-                          ) : (
-                            <span className={`text-[10px] font-medium ${errInfo?.color ?? 'text-red-400'}`}>
-                              {errInfo?.label ?? 'Failed'}
-                            </span>
-                          )}
-                        </td>
-                        <td className="py-1.5 px-2 text-right font-mono text-gray-300">{fmtDuration(r.total_processing_ms)}</td>
-                        <td className="py-1.5 px-2 text-right font-mono text-gray-300">{fmtDuration(r.llm_latency_ms)}</td>
-                        <td className="py-1.5 px-2 text-right font-mono text-gray-300">{r.token_usage ?? 'No data'}</td>
-                        <td className="py-1.5 px-2 text-right font-mono text-gray-300">{fmtCost(r.total_cost)}</td>
-                        <td className="py-1.5 px-2 text-right font-mono text-gray-500">{r.run_id ? r.run_id.slice(0, 8) : '—'}</td>
-                      </tr>
+                      <>
+                        <tr key={r.id} className="border-b border-gray-800">
+                          <td className="py-1.5 pr-2 text-white">{r.scenario_id ?? '—'}</td>
+                          <td className="py-1.5 px-2 text-gray-400 text-[11px]">{configName}</td>
+                          <td className="py-1.5 px-2 text-center">
+                            {r.success ? (
+                              <span className="inline-block w-2 h-2 rounded-full bg-green-400" />
+                            ) : (
+                              <span className={`text-[10px] font-medium ${errInfo?.color ?? 'text-red-400'}`}>
+                                {errInfo?.label ?? 'Failed'}
+                              </span>
+                            )}
+                          </td>
+                          <td className="py-1.5 px-2 text-right font-mono text-gray-300">{fmtDuration(r.total_processing_ms)}</td>
+                          <td className="py-1.5 px-2 text-right font-mono text-gray-300">{fmtDuration(r.llm_latency_ms)}</td>
+                          <td className="py-1.5 px-2 text-right font-mono text-gray-300">{r.token_usage ?? 'No data'}</td>
+                          <td className="py-1.5 px-2 text-right">
+                            {r.run_id ? (
+                              <button
+                                type="button"
+                                onClick={() => handleCostCellClick(r.run_id)}
+                                aria-label={`View cost breakdown for ${configName}`}
+                                aria-expanded={isOpen}
+                                className="font-mono text-gray-300 hover:text-white focus:outline-none focus:ring-1 focus:ring-blue-500 rounded px-1 py-0.5 inline-flex items-center gap-1"
+                              >
+                                {fmtCost(r.total_cost)}
+                                <span className="text-[10px] text-gray-500">{isOpen ? '▼' : '◀'}</span>
+                              </button>
+                            ) : (
+                              <span className="font-mono text-gray-300">{fmtCost(r.total_cost)}</span>
+                            )}
+                          </td>
+                          <td className="py-1.5 px-2 text-right font-mono text-gray-500">{r.run_id ? r.run_id.slice(0, 8) : '—'}</td>
+                        </tr>
+                        {isOpen && r.run_id && (
+                          <tr data-cost-breakdown>
+                            <td colSpan={8} className="py-2 px-4 bg-gray-900/50">
+                              {isLoading ? (
+                                <div className="text-xs text-gray-500">Loading...</div>
+                              ) : breakdown ? (
+                                <div className="text-xs space-y-1">
+                                  <div className="font-semibold text-gray-300 mb-1">Cost Breakdown</div>
+                                  <div className="grid grid-cols-4 gap-2 text-[11px]">
+                                    <div>
+                                      <div className="text-gray-500">STT</div>
+                                      <div className="font-mono text-gray-300">
+                                        {breakdown.stt_cost != null ? fmtCost(breakdown.stt_cost) : 'N/A'}
+                                      </div>
+                                      {breakdown.stt_audio_duration_seconds != null && (
+                                        <div className="text-[10px] text-gray-600">
+                                          {breakdown.stt_audio_duration_seconds.toFixed(2)}s
+                                        </div>
+                                      )}
+                                    </div>
+                                    <div>
+                                      <div className="text-gray-500">LLM</div>
+                                      <div className="font-mono text-gray-300">
+                                        {breakdown.llm_total_cost != null ? fmtCost(breakdown.llm_total_cost) : 'N/A'}
+                                      </div>
+                                      {(breakdown.prompt_tokens != null || breakdown.completion_tokens != null) && (
+                                        <div className="text-[10px] text-gray-600">
+                                          {breakdown.prompt_tokens ?? 0} in / {breakdown.completion_tokens ?? 0} out
+                                        </div>
+                                      )}
+                                      {breakdown.llm_input_cost != null && breakdown.llm_output_cost != null && (
+                                        <div className="text-[10px] text-gray-600 mt-0.5">
+                                          <span className="text-gray-500">Input:</span> {fmtCost(breakdown.llm_input_cost)}
+                                          <span className="text-gray-500 ml-2">Output:</span> {fmtCost(breakdown.llm_output_cost)}
+                                        </div>
+                                      )}
+                                    </div>
+                                    <div>
+                                      <div className="text-gray-500">TTS</div>
+                                      <div className="font-mono text-gray-300">
+                                        {breakdown.tts_cost != null ? fmtCost(breakdown.tts_cost) : 'N/A'}
+                                      </div>
+                                      {breakdown.tts_characters != null && (
+                                        <div className="text-[10px] text-gray-600">
+                                          {breakdown.tts_characters} chars
+                                        </div>
+                                      )}
+                                    </div>
+                                    <div>
+                                      <div className="text-gray-500">Total</div>
+                                      <div className="font-mono text-gray-300 font-semibold">
+                                        {breakdown.total_cost != null ? fmtCost(breakdown.total_cost) : 'N/A'}
+                                      </div>
+                                    </div>
+                                  </div>
+                                </div>
+                              ) : (
+                                <div className="text-xs text-gray-500">Failed to load breakdown</div>
+                              )}
+                            </td>
+                          </tr>
+                        )}
+                      </>
                     );
                   })}
                 </tbody>

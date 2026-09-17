@@ -188,9 +188,131 @@ LLM_PRICING: dict[str, dict[str, ModelPricing]] = {
             price_per_unit=Decimal("0.60"),
         ),
     },
+    # --- Validated paid models (Benchmark catalogue update) ---
+    # Pricing fetched from OpenRouter's public models API on 2026-09-11.
+    # NOTE: the anthropic/claude-3.5-sonnet entry below is intentionally
+    # RETAINED so historical benchmark records keep their computed costs,
+    # even though it is no longer a selectable configuration.
+
+    # OpenAI GPT-4.1 Mini via OpenRouter
+    # Pricing: $0.40/1M input tokens, $1.60/1M output tokens
+    # Source: https://openrouter.ai/openai/gpt-4.1-mini
+    "openrouter:openai/gpt-4.1-mini": {
+        "input": ModelPricing(
+            provider="openrouter",
+            model="openai/gpt-4.1-mini",
+            service="llm_input",
+            unit="1m_tokens",
+            price_per_unit=Decimal("0.40"),
+        ),
+        "output": ModelPricing(
+            provider="openrouter",
+            model="openai/gpt-4.1-mini",
+            service="llm_output",
+            unit="1m_tokens",
+            price_per_unit=Decimal("1.60"),
+        ),
+    },
+    # OpenAI GPT-5 Mini via OpenRouter
+    # Pricing: $0.25/1M input tokens, $2.00/1M output tokens
+    # Source: https://openrouter.ai/openai/gpt-5-mini
+    "openrouter:openai/gpt-5-mini": {
+        "input": ModelPricing(
+            provider="openrouter",
+            model="openai/gpt-5-mini",
+            service="llm_input",
+            unit="1m_tokens",
+            price_per_unit=Decimal("0.25"),
+        ),
+        "output": ModelPricing(
+            provider="openrouter",
+            model="openai/gpt-5-mini",
+            service="llm_output",
+            unit="1m_tokens",
+            price_per_unit=Decimal("2.00"),
+        ),
+    },
+    # Google Gemini 2.5 Flash via OpenRouter
+    # Pricing: $0.30/1M input tokens, $2.50/1M output tokens
+    # Source: https://openrouter.ai/google/gemini-2.5-flash
+    "openrouter:google/gemini-2.5-flash": {
+        "input": ModelPricing(
+            provider="openrouter",
+            model="google/gemini-2.5-flash",
+            service="llm_input",
+            unit="1m_tokens",
+            price_per_unit=Decimal("0.30"),
+        ),
+        "output": ModelPricing(
+            provider="openrouter",
+            model="google/gemini-2.5-flash",
+            service="llm_output",
+            unit="1m_tokens",
+            price_per_unit=Decimal("2.50"),
+        ),
+    },
+    # Anthropic Claude Haiku 4.5 via OpenRouter
+    # Pricing: $1.00/1M input tokens, $5.00/1M output tokens
+    # Source: https://openrouter.ai/anthropic/claude-haiku-4.5
+    "openrouter:anthropic/claude-haiku-4.5": {
+        "input": ModelPricing(
+            provider="openrouter",
+            model="anthropic/claude-haiku-4.5",
+            service="llm_input",
+            unit="1m_tokens",
+            price_per_unit=Decimal("1.00"),
+        ),
+        "output": ModelPricing(
+            provider="openrouter",
+            model="anthropic/claude-haiku-4.5",
+            service="llm_output",
+            unit="1m_tokens",
+            price_per_unit=Decimal("5.00"),
+        ),
+    },
+    # Anthropic Claude Sonnet 4.6 via OpenRouter
+    # Pricing: $3.00/1M input tokens, $15.00/1M output tokens
+    # Source: https://openrouter.ai/anthropic/claude-sonnet-4.6
+    "openrouter:anthropic/claude-sonnet-4.6": {
+        "input": ModelPricing(
+            provider="openrouter",
+            model="anthropic/claude-sonnet-4.6",
+            service="llm_input",
+            unit="1m_tokens",
+            price_per_unit=Decimal("3.00"),
+        ),
+        "output": ModelPricing(
+            provider="openrouter",
+            model="anthropic/claude-sonnet-4.6",
+            service="llm_output",
+            unit="1m_tokens",
+            price_per_unit=Decimal("15.00"),
+        ),
+    },
+    # DeepSeek V3.1 via OpenRouter
+    # Pricing: $0.25/1M input tokens, $0.95/1M output tokens
+    # Source: https://openrouter.ai/deepseek/deepseek-chat-v3.1
+    "openrouter:deepseek/deepseek-chat-v3.1": {
+        "input": ModelPricing(
+            provider="openrouter",
+            model="deepseek/deepseek-chat-v3.1",
+            service="llm_input",
+            unit="1m_tokens",
+            price_per_unit=Decimal("0.25"),
+        ),
+        "output": ModelPricing(
+            provider="openrouter",
+            model="deepseek/deepseek-chat-v3.1",
+            service="llm_output",
+            unit="1m_tokens",
+            price_per_unit=Decimal("0.95"),
+        ),
+    },
     # Anthropic Claude 3.5 Sonnet via OpenRouter
     # Pricing: $3.00/1M input tokens, $15.00/1M output tokens
     # Source: https://openrouter.ai/anthropic/claude-3.5-sonnet
+    # RETAINED for historical benchmark cost re-computation only — no longer
+    # a selectable Chat/Voice model or Benchmark configuration.
     "openrouter:anthropic/claude-3.5-sonnet": {
         "input": ModelPricing(
             provider="openrouter",

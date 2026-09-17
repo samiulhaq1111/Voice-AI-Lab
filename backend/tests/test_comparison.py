@@ -86,6 +86,78 @@ class TestConfigurationCatalogue:
         assert len(payg) >= 1, "Need at least one PAYG configuration"
 
 
+class TestPaidCatalogueUpdate:
+    """Validated paid OpenRouter models added to the benchmark catalogue.
+
+    The stale claude_sonnet configuration was removed after manual
+    compatibility testing of the replacement paid models.
+    """
+
+    NEW_PAID_CONFIGS = {
+        "gpt41_mini": "openai/gpt-4.1-mini",
+        "gpt5_mini": "openai/gpt-5-mini",
+        "gemini_flash": "google/gemini-2.5-flash",
+        "claude_haiku": "anthropic/claude-haiku-4.5",
+        "claude_sonnet_46": "anthropic/claude-sonnet-4.6",
+        "deepseek_v31": "deepseek/deepseek-chat-v3.1",
+    }
+
+    def test_stale_claude_sonnet_configuration_removed(self) -> None:
+        assert get_configuration("claude_sonnet") is None
+        for c in ALL_CONFIGURATIONS:
+            assert c.llm_model != "anthropic/claude-3.5-sonnet", (
+                f"Stale claude-3.5-sonnet still in config {c.configuration_id}"
+            )
+
+    def test_new_paid_configurations_present(self) -> None:
+        for config_id, model in self.NEW_PAID_CONFIGS.items():
+            c = get_configuration(config_id)
+            assert c is not None, f"Missing configuration: {config_id}"
+            assert c.llm_model == model
+
+    def test_paid_configurations_share_same_voice_stack(self) -> None:
+        """Fair LLM comparison: every PAYG config uses the identical stack.
+
+        STT is not part of a configuration (runtime default Deepgram nova-3);
+        LLM provider and TTS must be identical across all paid configs.
+        """
+        payg = [c for c in ALL_CONFIGURATIONS if c.pricing_type == "payg"]
+        assert len(payg) >= 7
+        for c in payg:
+            assert c.llm_provider == "openrouter"
+            assert c.tts_provider == "elevenlabs"
+            assert c.tts_model == "eleven_flash_v2_5"
+
+    def test_free_configurations_unchanged(self) -> None:
+        for config_id in ("default", "gemma_free", "llama_free", "multilingual_tts"):
+            c = get_configuration(config_id)
+            assert c is not None, f"Free configuration dropped: {config_id}"
+            assert c.pricing_type == "free"
+            assert c.production_eligible is False
+
+    def test_new_paid_models_have_llm_pricing(self) -> None:
+        """Each new paid model must have pricing so cost comparison works."""
+        from decimal import Decimal
+
+        from app.services.pricing import get_llm_pricing
+
+        for model in self.NEW_PAID_CONFIGS.values():
+            pricing = get_llm_pricing("openrouter", model)
+            assert pricing is not None, f"Missing LLM pricing for {model}"
+            assert pricing["input"].price_per_unit is not None
+            assert pricing["input"].price_per_unit > Decimal("0")
+            assert pricing["output"].price_per_unit is not None
+            assert pricing["output"].price_per_unit > Decimal("0")
+
+    def test_historical_claude_sonnet_pricing_retained(self) -> None:
+        """Pricing stays so historical records keep computed costs."""
+        from app.services.pricing import get_llm_pricing
+
+        pricing = get_llm_pricing("openrouter", "anthropic/claude-3.5-sonnet")
+        assert pricing is not None
+        assert pricing["input"].price_per_unit is not None
+
+
 # ---------------------------------------------------------------------------
 # Configuration validation
 # ---------------------------------------------------------------------------

@@ -31,6 +31,12 @@ class BenchmarkConfiguration:
 # ---------------------------------------------------------------------------
 # Uses models already supported by the provider adapters.
 # Free models are clearly labelled and marked non-production.
+#
+# Paid configurations were manually validated through the Chat and Voice
+# flows (basic response, context, tool-calling, turn-based voice) before
+# being added here. All paid configurations share the SAME voice stack
+# (Deepgram nova-3 STT at runtime, ElevenLabs eleven_flash_v2_5 TTS) so
+# that only the LLM model varies — fair LLM comparison.
 
 CONFIG_DEFAULT = BenchmarkConfiguration(
     configuration_id="default",
@@ -80,15 +86,81 @@ CONFIG_LLAMA_FREE = BenchmarkConfiguration(
     production_eligible=False,
 )
 
-CONFIG_CLAUDE_SONNET = BenchmarkConfiguration(
-    configuration_id="claude_sonnet",
-    name="Claude 3.5 Sonnet + ElevenLabs",
+CONFIG_GPT41_MINI = BenchmarkConfiguration(
+    configuration_id="gpt41_mini",
+    name="GPT-4.1 Mini + ElevenLabs",
+    description="OpenAI GPT-4.1 Mini via OpenRouter with ElevenLabs Flash TTS. Production PAYG.",
+    llm_provider="openrouter",
+    llm_model="openai/gpt-4.1-mini",
+    tts_provider="elevenlabs",
+    tts_model="eleven_flash_v2_5",
+    pricing_type="payg",
+    production_eligible=True,
+)
+
+CONFIG_GPT5_MINI = BenchmarkConfiguration(
+    configuration_id="gpt5_mini",
+    name="GPT-5 Mini + ElevenLabs",
+    description="OpenAI GPT-5 Mini via OpenRouter with ElevenLabs Flash TTS. Production PAYG.",
+    llm_provider="openrouter",
+    llm_model="openai/gpt-5-mini",
+    tts_provider="elevenlabs",
+    tts_model="eleven_flash_v2_5",
+    pricing_type="payg",
+    production_eligible=True,
+)
+
+CONFIG_GEMINI_FLASH = BenchmarkConfiguration(
+    configuration_id="gemini_flash",
+    name="Gemini 2.5 Flash + ElevenLabs",
     description=(
-        "Anthropic Claude 3.5 Sonnet via OpenRouter with ElevenLabs Flash TTS. "
+        "Google Gemini 2.5 Flash via OpenRouter with ElevenLabs Flash TTS. "
         "Production PAYG."
     ),
     llm_provider="openrouter",
-    llm_model="anthropic/claude-3.5-sonnet",
+    llm_model="google/gemini-2.5-flash",
+    tts_provider="elevenlabs",
+    tts_model="eleven_flash_v2_5",
+    pricing_type="payg",
+    production_eligible=True,
+)
+
+CONFIG_CLAUDE_HAIKU = BenchmarkConfiguration(
+    configuration_id="claude_haiku",
+    name="Claude Haiku 4.5 + ElevenLabs",
+    description=(
+        "Anthropic Claude Haiku 4.5 via OpenRouter with ElevenLabs Flash TTS. "
+        "Production PAYG."
+    ),
+    llm_provider="openrouter",
+    llm_model="anthropic/claude-haiku-4.5",
+    tts_provider="elevenlabs",
+    tts_model="eleven_flash_v2_5",
+    pricing_type="payg",
+    production_eligible=True,
+)
+
+CONFIG_CLAUDE_SONNET_46 = BenchmarkConfiguration(
+    configuration_id="claude_sonnet_46",
+    name="Claude Sonnet 4.6 + ElevenLabs",
+    description=(
+        "Anthropic Claude Sonnet 4.6 via OpenRouter with ElevenLabs Flash TTS. "
+        "Production PAYG."
+    ),
+    llm_provider="openrouter",
+    llm_model="anthropic/claude-sonnet-4.6",
+    tts_provider="elevenlabs",
+    tts_model="eleven_flash_v2_5",
+    pricing_type="payg",
+    production_eligible=True,
+)
+
+CONFIG_DEEPSEEK_V31 = BenchmarkConfiguration(
+    configuration_id="deepseek_v31",
+    name="DeepSeek V3.1 + ElevenLabs",
+    description="DeepSeek V3.1 via OpenRouter with ElevenLabs Flash TTS. Production PAYG.",
+    llm_provider="openrouter",
+    llm_model="deepseek/deepseek-chat-v3.1",
     tts_provider="elevenlabs",
     tts_model="eleven_flash_v2_5",
     pricing_type="payg",
@@ -114,7 +186,12 @@ ALL_CONFIGURATIONS: list[BenchmarkConfiguration] = [
     CONFIG_GPT4O_MINI,
     CONFIG_GEMMA_FREE,
     CONFIG_LLAMA_FREE,
-    CONFIG_CLAUDE_SONNET,
+    CONFIG_GPT41_MINI,
+    CONFIG_GPT5_MINI,
+    CONFIG_GEMINI_FLASH,
+    CONFIG_CLAUDE_HAIKU,
+    CONFIG_CLAUDE_SONNET_46,
+    CONFIG_DEEPSEEK_V31,
     CONFIG_MULTILINGUAL_TTS,
 ]
 

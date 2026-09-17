@@ -14,6 +14,32 @@ SUPPORTED_STT_PROVIDERS = {"deepgram"}
 SUPPORTED_LLM_PROVIDERS = {"openrouter"}
 SUPPORTED_TTS_PROVIDERS = {"elevenlabs"}
 
+# Curated OpenRouter LLM model catalogue for the Chat and Voice UIs.
+# NOTE: Benchmark configurations are separate (app/benchmarks/configurations.py)
+# and are intentionally NOT coupled to this list.
+
+# Free / experimental models: zero cost, rate-limited, non-production.
+LLM_FREE_MODELS: tuple[str, ...] = (
+    "nvidia/nemotron-3.5-lightning:free",
+    "google/gemma-4-31b-it:free",
+    "meta-llama/llama-3.1-8b-instruct:free",
+    "microsoft/phi-3-medium-128k-instruct:free",
+    "google/gemini-2.0-flash-exp:free",
+)
+
+# Paid / PAYG models: current IDs for paid-account testing through the
+# Chat and Voice flows. The stale "anthropic/claude-3.5-sonnet" entry was
+# removed (provider errors; no longer a valid selectable model here).
+LLM_PAID_MODELS: tuple[str, ...] = (
+    "openai/gpt-4o-mini",
+    "openai/gpt-4.1-mini",
+    "openai/gpt-5-mini",
+    "google/gemini-2.5-flash",
+    "anthropic/claude-haiku-4.5",
+    "anthropic/claude-sonnet-4.6",
+    "deepseek/deepseek-chat-v3.1",
+)
+
 
 class ProviderError(Exception):
     """Raised when a provider cannot be instantiated."""
@@ -135,15 +161,8 @@ def get_available_providers() -> dict:
             {
                 "provider": "openrouter",
                 "default_model": settings.default_llm_model or "nvidia/nemotron-3.5-lightning:free",
-                "models": [
-                    "nvidia/nemotron-3.5-lightning:free",
-                    "google/gemma-4-31b-it:free",
-                    "meta-llama/llama-3.1-8b-instruct:free",
-                    "microsoft/phi-3-medium-128k-instruct:free",
-                    "openai/gpt-4o-mini",
-                    "anthropic/claude-3.5-sonnet",
-                    "google/gemini-2.0-flash-exp:free",
-                ],
+                "models": [*LLM_FREE_MODELS, *LLM_PAID_MODELS],
+                "paid_models": list(LLM_PAID_MODELS),
                 "configured": settings.is_provider_configured("openrouter"),
             },
         ],
