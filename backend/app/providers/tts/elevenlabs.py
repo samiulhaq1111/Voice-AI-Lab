@@ -1,6 +1,5 @@
 """ElevenLabs TTS adapter implementing TTSInterface."""
 
-import hashlib
 import time
 from collections.abc import AsyncIterator
 
@@ -14,11 +13,6 @@ from app.providers.types import TTSResult
 _ELEVENLABS_TTS_URL_TEMPLATE = "https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
 _DEFAULT_VOICE = "JBFqnCBsd6RMkjVDRZzb"  # API-compatible Free tier voice
 _DEFAULT_OUTPUT_FORMAT = "mp3_44100_128"  # Free-tier compatible
-
-
-def _safe_key_fingerprint(key: str) -> str:
-    """Return a short non-reversible hash fingerprint of an API key."""
-    return hashlib.sha256(key.encode()).hexdigest()[:12]
 
 
 class ElevenLabsAdapter(TTSInterface):
@@ -88,25 +82,20 @@ class ElevenLabsAdapter(TTSInterface):
         }
 
         logger.info(
-            "[VOICE:TTS] provider=elevenlabs endpoint=%s voice_id=%s "
-            "model_id=%s output_format=%s text_length=%d "
-            "api_key_configured=%s api_key_fingerprint=%s",
-            url,
-            resolved_voice[:8] + "...",
+            "[VOICE:TTS] synthesize start provider=elevenlabs "
+            "model=%s voice=%s text_length=%d",
             resolved_model,
-            _DEFAULT_OUTPUT_FORMAT,
+            resolved_voice[:8] + "...",
             len(text),
-            bool(self._api_key),
-            _safe_key_fingerprint(self._api_key),
         )
-        logger.info("[VOICE:TTS] request_started")
 
         request_start = time.monotonic()
         try:
             response = await self._client.post(url, json=payload, params=params)
             duration_ms = (time.monotonic() - request_start) * 1000
             logger.info(
-                "[VOICE:TTS] response_status=%d content_type=%s response_bytes=%d duration_ms=%.0f",
+                "[VOICE:TTS] response status=%d content_type=%s "
+                "response_bytes=%d duration_ms=%.0f",
                 response.status_code,
                 response.headers.get("content-type", "unknown"),
                 len(response.content),
@@ -117,92 +106,100 @@ class ElevenLabsAdapter(TTSInterface):
         except httpx.HTTPStatusError as e:
             status = e.response.status_code
             duration_ms = (time.monotonic() - request_start) * 1000
-            # Extract safe error detail from response body for diagnostics
+            # Extract structured ElevenLabs error details for diagnostics.
+            # ElevenLabs returns: {"detail": {"message": ..., "status": ...}}
+            # or {"detail": "string"} or other shapes.
             error_detail = ""
+            error_code = ""
+            request_id = ""
             try:
                 body = e.response.json()
-                # ElevenLabs returns {"detail": {"message": "...", "status": "..."}}
                 if isinstance(body, dict):
                     detail = body.get("detail", "")
                     if isinstance(detail, dict):
-                        error_detail = detail.get("message", str(detail))
+                        error_detail = detail.get("message", "")
+                        error_code = detail.get("status", detail.get("code", ""))
                     else:
                         error_detail = str(detail)
+                    # request_id may be at top level or in detail
+                    request_id = (
+                        body.get("request_id", "")
+                        or (detail.get("request_id", "") if isinstance(detail, dict) else "")
+                    )
                 else:
                     error_detail = str(body)[:200]
             except Exception:
                 error_detail = e.response.text[:200] if e.response.text else ""
 
-            if status == 400:
-                logger.error(
-                    "[VOICE:TTS] provider_error status=400 duration_ms=%.0f "
-                    "model=%s voice=%s text_length=%d error_detail=%s",
-                    duration_ms,
-                    resolved_model,
-                    resolved_voice[:8] + "...",
-                    len(text),
-                    error_detail,
-                )
-                raise RuntimeError(f"ElevenLabs API error: HTTP 400 — {error_detail}") from e
-            if status == 401:
-                logger.error(
-                    "[ELEVENLABS] Authentication failed status=401 duration_ms=%.0f",
-                    duration_ms,
-                )
-                raise RuntimeError("ElevenLabs authentication failed") from e
-            if status == 402:
-                logger.error(
-                    "[VOICE:TTS] provider_error status=402 duration_ms=%.0f error=%s",
-                    duration_ms,
-                    error_detail,
-                )
-                raise RuntimeError(f"ElevenLabs billing/entitlement error: {error_detail}") from e
-            if status == 403:
-                logger.error(
-                    "[ELEVENLABS] Authorization failed status=403 duration_ms=%.0f",
-                    duration_ms,
-                )
-                raise RuntimeError("ElevenLabs authorization failed") from e
-            if status == 422:
-                logger.error(
-                    "[ELEVENLABS] Invalid input status=422 duration_ms=%.0f error=%s",
-                    duration_ms,
-                    error_detail,
-                )
-                raise RuntimeError("ElevenLabs invalid input") from e
-            if status == 429:
-                logger.error(
-                    "[ELEVENLABS] Rate limit exceeded status=429 duration_ms=%.0f",
-                    duration_ms,
-                )
-                raise RuntimeError("ElevenLabs rate limit exceeded") from e
+            # Log full diagnostic breakdown for every non-2xx response
             logger.error(
-                "[ELEVENLABS] Request failed status=%d duration_ms=%.0f error=%s",
+                "[VOICE:TTS] failure status=%d code=%s request_id=%s "
+                "duration_ms=%.0f detail=%s",
                 status,
+                error_code or "(none)",
+                request_id or "(none)",
                 duration_ms,
-                error_detail,
+                error_detail[:200] if error_detail else "(empty)",
             )
-            raise RuntimeError(f"ElevenLabs API error: HTTP {status}") from e
+
+            if status == 401:
+                raise RuntimeError(
+                    f"ElevenLabs authentication failed (401): "
+                    f"{error_code or 'unknown'} — {error_detail or 'no detail'}"
+                ) from e
+            if status == 402:
+                raise RuntimeError(
+                    f"ElevenLabs billing/entitlement error (402): "
+                    f"{error_code or 'unknown'} — {error_detail or 'no detail'}"
+                ) from e
+            if status == 403:
+                raise RuntimeError(
+                    f"ElevenLabs authorization failed (403): "
+                    f"{error_code or 'unknown'} — {error_detail or 'no detail'}"
+                ) from e
+            if status == 422:
+                raise RuntimeError(
+                    f"ElevenLabs invalid input (422): "
+                    f"{error_code or 'unknown'} — {error_detail or 'no detail'}"
+                ) from e
+            if status == 429:
+                raise RuntimeError(
+                    f"ElevenLabs rate limit exceeded (429): "
+                    f"{error_code or 'unknown'} — {error_detail or 'no detail'}"
+                ) from e
+            if status >= 500:
+                raise RuntimeError(
+                    f"ElevenLabs server error ({status}): "
+                    f"{error_code or 'unknown'} — {error_detail or 'no detail'}"
+                ) from e
+            raise RuntimeError(
+                f"ElevenLabs API error ({status}): "
+                f"{error_code or 'unknown'} — {error_detail or 'no detail'}"
+            ) from e
 
         except httpx.TimeoutException:
             duration_ms = (time.monotonic() - request_start) * 1000
             logger.error(
-                "[ELEVENLABS] Request timed out after %.1fs duration_ms=%.0f",
+                "[VOICE:TTS] provider timeout after %.1fs duration_ms=%.0f",
                 self._timeout,
                 duration_ms,
             )
             raise RuntimeError("ElevenLabs request timed out")
 
         except httpx.HTTPError as e:
-            logger.error("[ELEVENLABS] HTTP error type=%s", type(e).__name__)
+            logger.error(
+                "[VOICE:TTS] provider network error type=%s",
+                type(e).__name__,
+            )
             raise RuntimeError(f"ElevenLabs HTTP error: {e}") from e
 
         audio_data = response.content
         content_type = response.headers.get("content-type", "audio/mpeg")
 
         logger.info(
-            "[ELEVENLABS] Synthesis complete audio_bytes=%d",
+            "[VOICE:TTS] synthesize success bytes=%d duration_ms=%.0f",
             len(audio_data),
+            (time.monotonic() - request_start) * 1000,
         )
 
         return TTSResult(

@@ -67,6 +67,7 @@ export default function RealtimeStt() {
   const [agentResponse, setAgentResponse] = useState<string | null>(null);
   const [agentToolCalls, setAgentToolCalls] = useState(0);
   const [agentIterations, setAgentIterations] = useState(0);
+  const [ttsProcessing, setTtsProcessing] = useState(false);
   const [log, setLog] = useState<RealtimeLogEntry[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [timings, setTimings] = useState<RealtimeTimings | null>(null);
@@ -83,6 +84,7 @@ export default function RealtimeStt() {
   const workletUrlRef = useRef<string | null>(null);
   const stopTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const closingRef = useRef(false);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
 
   // Load providers on mount
   useEffect(() => {
@@ -173,6 +175,42 @@ export default function RealtimeStt() {
             `text="${event.text.slice(0, 50)}${event.text.length > 50 ? '…' : ''}" tools=${event.tool_calls} iterations=${event.iterations}`,
           );
           break;
+        case 'tts_processing':
+          setTtsProcessing(true);
+          addLog('tts_processing', '');
+          break;
+        case 'audio': {
+          setTtsProcessing(false);
+          // Decode base64 audio and play
+          const binary = atob(event.data);
+          const bytes = new Uint8Array(binary.length);
+          for (let i = 0; i < binary.length; i++) {
+            bytes[i] = binary.charCodeAt(i);
+          }
+          const blob = new Blob([bytes], { type: event.format || 'audio/mpeg' });
+          const url = URL.createObjectURL(blob);
+          addLog('audio', `format=${event.format} size=${bytes.length}B`);
+
+          // Create or reuse audio element for playback
+          if (!audioRef.current) {
+            audioRef.current = new Audio();
+          }
+          const audioEl = audioRef.current;
+          // Clean up previous URL
+          if (audioEl.src) {
+            URL.revokeObjectURL(audioEl.src);
+          }
+          audioEl.src = url;
+          audioEl.onended = () => {
+            URL.revokeObjectURL(url);
+            addLog('audio', 'playback ended');
+          };
+          audioEl.play().catch((e) => {
+            console.error('[REALTIME] Audio playback failed:', e);
+            addLog('error', `Audio playback blocked: ${e.message}`);
+          });
+          break;
+        }
         case 'completed':
           setTimings(event.timings);
           addLog(
@@ -486,6 +524,11 @@ export default function RealtimeStt() {
               <div className="text-xs text-gray-500 mt-1">
                 {agentToolCalls > 0 && <span>tools: {agentToolCalls} </span>}
                 {agentIterations > 0 && <span>iterations: {agentIterations}</span>}
+              </div>
+            )}
+            {ttsProcessing && (
+              <div className="text-xs text-green-400 mt-1 animate-pulse">
+                Speaking…
               </div>
             )}
           </div>

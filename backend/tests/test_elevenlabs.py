@@ -1,8 +1,9 @@
 """Tests for the ElevenLabs TTS adapter with mocked HTTP."""
 
-import pytest
-import httpx
 from unittest.mock import AsyncMock, patch
+
+import httpx
+import pytest
 
 from app.providers.tts.elevenlabs import ElevenLabsAdapter
 from app.providers.types import TTSResult
@@ -75,7 +76,7 @@ class TestElevenLabsAdapter:
         )
 
         with patch.object(adapter._client, "post", new_callable=AsyncMock, return_value=mock_response):
-            with pytest.raises(RuntimeError, match="authentication failed"):
+            with pytest.raises(RuntimeError, match="authentication failed.*401"):
                 await adapter.synthesize("Hello")
 
     @pytest.mark.asyncio
@@ -122,7 +123,7 @@ class TestElevenLabsAdapter:
         )
 
         with patch.object(adapter._client, "post", new_callable=AsyncMock, return_value=mock_response):
-            with pytest.raises(RuntimeError, match="HTTP 500"):
+            with pytest.raises(RuntimeError, match="server error.*500"):
                 await adapter.synthesize("Hello")
 
     @pytest.mark.asyncio
@@ -135,7 +136,7 @@ class TestElevenLabsAdapter:
         )
 
         with patch.object(adapter._client, "post", new_callable=AsyncMock, return_value=mock_response):
-            with pytest.raises(RuntimeError, match="HTTP 400"):
+            with pytest.raises(RuntimeError, match="API error.*400"):
                 await adapter.synthesize("Hello")
 
     @pytest.mark.asyncio
@@ -220,3 +221,194 @@ class TestElevenLabsAdapter:
         call_kwargs = mock_post.call_args.kwargs
         assert call_kwargs["params"]["output_format"] == "mp3_44100_128"
         assert "output_format" not in call_kwargs["json"]
+
+
+class TestElevenLabsErrorDiagnostics:
+    """Focused tests for structured ElevenLabs error detail preservation."""
+
+    @pytest.mark.asyncio
+    async def test_401_structured_error_preserves_details(
+        self, adapter: ElevenLabsAdapter
+    ) -> None:
+        """A 401 with structured ElevenLabs error body preserves all fields."""
+        mock_response = httpx.Response(
+            401,
+            json={
+                "detail": {
+                    "message": "Invalid API key",
+                    "status": "invalid_api_key",
+                    "request_id": "req_abc123",
+                },
+                "request_id": "req_abc123",
+            },
+            request=httpx.Request(
+                "POST", "https://api.elevenlabs.io/v1/text-to-speech/test-voice-id"
+            ),
+        )
+
+        with patch.object(
+            adapter._client,
+            "post",
+            new_callable=AsyncMock,
+            return_value=mock_response,
+        ):
+            with pytest.raises(RuntimeError) as exc_info:
+                await adapter.synthesize("Hello")
+
+            error_msg = str(exc_info.value)
+            # Must contain status code
+            assert "401" in error_msg
+            # Must contain error code from detail.status
+            assert "invalid_api_key" in error_msg
+            # Must contain error message from detail.message
+            assert "Invalid API key" in error_msg
+            # Must indicate authentication category
+            assert "authentication failed" in error_msg
+
+    @pytest.mark.asyncio
+    async def test_402_not_reported_as_authentication(
+        self, adapter: ElevenLabsAdapter
+    ) -> None:
+        """A 402 must NOT be reported as authentication failure."""
+        mock_response = httpx.Response(
+            402,
+            json={
+                "detail": {
+                    "message": "Insufficient credits",
+                    "status": "payment_required",
+                }
+            },
+            request=httpx.Request(
+                "POST", "https://api.elevenlabs.io/v1/text-to-speech/test-voice-id"
+            ),
+        )
+
+        with patch.object(
+            adapter._client,
+            "post",
+            new_callable=AsyncMock,
+            return_value=mock_response,
+        ):
+            with pytest.raises(RuntimeError) as exc_info:
+                await adapter.synthesize("Hello")
+
+            error_msg = str(exc_info.value)
+            # Must indicate billing, NOT authentication
+            assert "billing" in error_msg or "entitlement" in error_msg
+            assert "402" in error_msg
+            assert "authentication" not in error_msg
+            assert "Insufficient credits" in error_msg
+
+    @pytest.mark.asyncio
+    async def test_429_not_reported_as_authentication(
+        self, adapter: ElevenLabsAdapter
+    ) -> None:
+        """A 429 must NOT be reported as authentication failure."""
+        mock_response = httpx.Response(
+            429,
+            json={
+                "detail": {
+                    "message": "Rate limit exceeded",
+                    "status": "rate_limit_error",
+                }
+            },
+            request=httpx.Request(
+                "POST", "https://api.elevenlabs.io/v1/text-to-speech/test-voice-id"
+            ),
+        )
+
+        with patch.object(
+            adapter._client,
+            "post",
+            new_callable=AsyncMock,
+            return_value=mock_response,
+        ):
+            with pytest.raises(RuntimeError) as exc_info:
+                await adapter.synthesize("Hello")
+
+            error_msg = str(exc_info.value)
+            # Must indicate rate limit, NOT authentication
+            assert "rate limit" in error_msg
+            assert "429" in error_msg
+            assert "authentication" not in error_msg
+
+    @pytest.mark.asyncio
+    async def test_401_with_string_detail(
+        self, adapter: ElevenLabsAdapter
+    ) -> None:
+        """A 401 with a plain string detail (not dict) is handled safely."""
+        mock_response = httpx.Response(
+            401,
+            json={"detail": "Unauthorized"},
+            request=httpx.Request(
+                "POST", "https://api.elevenlabs.io/v1/text-to-speech/test-voice-id"
+            ),
+        )
+
+        with patch.object(
+            adapter._client,
+            "post",
+            new_callable=AsyncMock,
+            return_value=mock_response,
+        ):
+            with pytest.raises(RuntimeError) as exc_info:
+                await adapter.synthesize("Hello")
+
+            error_msg = str(exc_info.value)
+            assert "401" in error_msg
+            assert "authentication failed" in error_msg
+            assert "Unauthorized" in error_msg
+
+    @pytest.mark.asyncio
+    async def test_401_with_non_json_body(
+        self, adapter: ElevenLabsAdapter
+    ) -> None:
+        """A 401 with non-JSON body is handled safely."""
+        mock_response = httpx.Response(
+            401,
+            text="<html>Unauthorized</html>",
+            headers={"content-type": "text/html"},
+            request=httpx.Request(
+                "POST", "https://api.elevenlabs.io/v1/text-to-speech/test-voice-id"
+            ),
+        )
+
+        with patch.object(
+            adapter._client,
+            "post",
+            new_callable=AsyncMock,
+            return_value=mock_response,
+        ):
+            with pytest.raises(RuntimeError) as exc_info:
+                await adapter.synthesize("Hello")
+
+            error_msg = str(exc_info.value)
+            assert "401" in error_msg
+            assert "authentication failed" in error_msg
+
+    @pytest.mark.asyncio
+    async def test_500_server_error_distinct(
+        self, adapter: ElevenLabsAdapter
+    ) -> None:
+        """A 500 must be reported as server error, not authentication."""
+        mock_response = httpx.Response(
+            500,
+            json={"detail": {"message": "Internal server error"}},
+            request=httpx.Request(
+                "POST", "https://api.elevenlabs.io/v1/text-to-speech/test-voice-id"
+            ),
+        )
+
+        with patch.object(
+            adapter._client,
+            "post",
+            new_callable=AsyncMock,
+            return_value=mock_response,
+        ):
+            with pytest.raises(RuntimeError) as exc_info:
+                await adapter.synthesize("Hello")
+
+            error_msg = str(exc_info.value)
+            assert "server error" in error_msg
+            assert "500" in error_msg
+            assert "authentication" not in error_msg

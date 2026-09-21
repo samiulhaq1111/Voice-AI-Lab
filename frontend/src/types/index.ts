@@ -240,6 +240,8 @@ export type RealtimeEventType =
   | 'utterance_end'
   | 'agent_processing'
   | 'agent_response'
+  | 'tts_processing'
+  | 'audio'
   | 'completed'
   | 'error';
 
@@ -279,6 +281,16 @@ export interface RealtimeAgentResponse {
   iterations: number;
 }
 
+export interface RealtimeTTSProcessing {
+  type: 'tts_processing';
+}
+
+export interface RealtimeAudio {
+  type: 'audio';
+  format: string;
+  data: string; // base64
+}
+
 /** Server-side diagnostic timings for one realtime session. */
 export interface RealtimeTimings {
   session_start_ms: number | null;
@@ -314,6 +326,8 @@ export type RealtimeEvent =
   | RealtimeUtteranceEnd
   | RealtimeAgentProcessing
   | RealtimeAgentResponse
+  | RealtimeTTSProcessing
+  | RealtimeAudio
   | RealtimeCompleted
   | RealtimeError;
 

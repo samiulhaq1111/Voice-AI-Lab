@@ -34,6 +34,7 @@ Server → Client protocol:
 """
 
 import asyncio
+import base64
 import json
 import time
 import uuid
@@ -44,13 +45,14 @@ from sqlalchemy.orm import Session
 
 from app.core.database import SessionLocal
 from app.core.logging import logger
-from app.providers.factory import get_llm_provider
+from app.providers.factory import get_llm_provider, get_tts_provider
 from app.providers.llm.interface import LLMInterface
 from app.providers.stt.streaming import (
     StreamConfig,
     StreamingSTTError,
     open_streaming_session,
 )
+from app.providers.tts.interface import TTSInterface
 from app.services.realtime_voice_service import (
     RealtimeVoiceError,
     create_realtime_session,
@@ -82,6 +84,9 @@ class RealtimeTimings:
     final_count: int = 0
     utterance_end_count: int = 0
     agent_response_count: int = 0
+    tts_response_count: int = 0
+    tts_audio_bytes: int = 0
+    tts_characters: int = 0
 
     def to_dict(self) -> dict[str, float | int | None]:
         """Serialize as millisecond offsets from the WebSocket accept time."""
@@ -103,6 +108,9 @@ class RealtimeTimings:
             "final_count": self.final_count,
             "utterance_end_count": self.utterance_end_count,
             "agent_response_count": self.agent_response_count,
+            "tts_response_count": self.tts_response_count,
+            "tts_audio_bytes": self.tts_audio_bytes,
+            "tts_characters": self.tts_characters,
         }
 
 
@@ -115,6 +123,7 @@ class RealtimeSessionState:
     llm_provider: str = ""
     llm_model: str | None = None
     llm: LLMInterface | None = None
+    tts: TTSInterface | None = None
     # Current utterance accumulation (pump writes, worker reads snapshot)
     current_utterance_text: str = ""
     utterance_finalized: bool = False  # True after final transcript received
@@ -395,6 +404,71 @@ async def _agent_worker(
             )
             logger.info("[REALTIME:WORKER] agent_response sent")
 
+            # --- TTS synthesis (Phase 6B.2) ---
+            response_text = result["response"]
+            if response_text and state.tts is not None:
+                try:
+                    await ws.send_json({"type": "tts_processing"})
+                    logger.info(
+                        "[REALTIME:WORKER] tts_processing event sent "
+                        "text_length=%d",
+                        len(response_text),
+                    )
+
+                    tts_start = time.monotonic()
+                    tts_result = await state.tts.synthesize(
+                        text=response_text,
+                    )
+                    tts_duration_ms = (time.monotonic() - tts_start) * 1000
+
+                    audio_b64 = base64.b64encode(
+                        tts_result.audio_data
+                    ).decode("ascii")
+
+                    await ws.send_json(
+                        {
+                            "type": "audio",
+                            "format": tts_result.content_type,
+                            "data": audio_b64,
+                        }
+                    )
+
+                    timings.tts_response_count += 1
+                    timings.tts_audio_bytes += len(tts_result.audio_data)
+                    timings.tts_characters += len(response_text)
+
+                    logger.info(
+                        "[REALTIME:WORKER] audio sent format=%s "
+                        "audio_bytes=%d characters=%d tts_latency_ms=%.0f",
+                        tts_result.content_type,
+                        len(tts_result.audio_data),
+                        len(response_text),
+                        tts_duration_ms,
+                    )
+
+                except Exception as e:
+                    logger.error(
+                        "[REALTIME:WORKER] TTS synthesis failed "
+                        "error_type=%s error=%s",
+                        type(e).__name__,
+                        str(e),
+                        exc_info=True,
+                    )
+                    try:
+                        await ws.send_json(
+                            {
+                                "type": "error",
+                                "stage": "tts",
+                                "message": f"TTS synthesis failed: {e}",
+                            }
+                        )
+                    except Exception:
+                        pass
+            elif response_text and state.tts is None:
+                logger.warning(
+                    "[REALTIME:WORKER] TTS skipped — no TTS provider"
+                )
+
         except RealtimeVoiceError as e:
             logger.error(
                 "[REALTIME:WORKER] utterance processing failed error=%s",
@@ -644,6 +718,20 @@ async def _handle_realtime_session(ws: WebSocket) -> None:
                                 "[VOICE:REALTIME] Failed to create LLM provider: %s",
                                 e,
                             )
+
+                    # Pre-create TTS provider for reuse (session-level)
+                    try:
+                        state.tts = get_tts_provider()
+                        logger.info(
+                            "[VOICE:REALTIME] TTS provider created "
+                            "provider=%s",
+                            state.tts.provider_name,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "[VOICE:REALTIME] Failed to create TTS provider: %s",
+                            e,
+                        )
                 except Exception as e:
                     logger.error(
                         "[VOICE:REALTIME] Failed to create voice session: %s",
@@ -810,6 +898,8 @@ async def _handle_realtime_session(ws: WebSocket) -> None:
             await session.close()
         if state.llm is not None:
             await state.llm.close()
+        if state.tts is not None:
+            await state.tts.close()
         if db is not None:
             db.close()
         logger.info(

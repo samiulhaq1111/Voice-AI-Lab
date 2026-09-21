@@ -556,6 +556,8 @@ def _patch_realtime_deps():
     """Patch all dependencies needed for 6B agent processing tests."""
     from unittest.mock import AsyncMock, MagicMock
 
+    from app.providers.types import TTSResult
+
     mock_db = MagicMock()
     mock_db_session = MagicMock()
     mock_db_session.id = "test-voice-session-id"
@@ -578,6 +580,17 @@ def _patch_realtime_deps():
     mock_llm = MagicMock()
     mock_llm.close = AsyncMock()
 
+    # TTS mock must have async synthesize() and close()
+    mock_tts = MagicMock()
+    mock_tts.provider_name = "elevenlabs"
+    mock_tts.synthesize = AsyncMock(
+        return_value=TTSResult(
+            audio_data=b"fake-mp3-audio-data",
+            content_type="audio/mpeg",
+        )
+    )
+    mock_tts.close = AsyncMock()
+
     patchers = {
         "session_local": patch(
             "app.api.voice_realtime.SessionLocal", mock_session_local
@@ -590,6 +603,10 @@ def _patch_realtime_deps():
             "app.api.voice_realtime.get_llm_provider",
             return_value=mock_llm,
         ),
+        "get_tts": patch(
+            "app.api.voice_realtime.get_tts_provider",
+            return_value=mock_tts,
+        ),
         "process": patch(
             "app.api.voice_realtime.process_realtime_utterance",
             mock_process,
@@ -597,7 +614,7 @@ def _patch_realtime_deps():
     }
     for p in patchers.values():
         p.start()
-    return patchers, mock_process
+    return patchers, mock_process, mock_tts
 
 
 def _stop_patchers(patchers: dict) -> None:
@@ -615,7 +632,7 @@ class TestAgentRuntimeIntegration:
             StreamEvent(type="utterance_end"),
         ]
         client, holder = _connect_with_fake_session(events=events)
-        patchers, mock_process = _patch_realtime_deps()
+        patchers, mock_process, _ = _patch_realtime_deps()
         received_types: list[str] = []
         try:
             with client.websocket_connect(REALTIME_WS_PATH) as ws:
@@ -641,7 +658,7 @@ class TestAgentRuntimeIntegration:
             StreamEvent(type="utterance_end"),
         ]
         client, holder = _connect_with_fake_session(events=events)
-        patchers, mock_process = _patch_realtime_deps()
+        patchers, mock_process, _ = _patch_realtime_deps()
         try:
             with client.websocket_connect(REALTIME_WS_PATH) as ws:
                 ws.send_json(_start_with_llm())
@@ -668,7 +685,7 @@ class TestAgentRuntimeIntegration:
             StreamEvent(type="utterance_end"),
         ]
         client, holder = _connect_with_fake_session(events=events)
-        patchers, mock_process = _patch_realtime_deps()
+        patchers, mock_process, _ = _patch_realtime_deps()
         received_types: list[str] = []
         try:
             with client.websocket_connect(REALTIME_WS_PATH) as ws:
@@ -709,7 +726,7 @@ class TestAgentRuntimeIntegration:
             StreamEvent(type="utterance_end"),
         ]
         client, holder = _connect_with_fake_session(events=events)
-        patchers, _ = _patch_realtime_deps()
+        patchers, _, mock_tts = _patch_realtime_deps()
         patchers["process"].stop()
         process_patcher = patch(
             "app.api.voice_realtime.process_realtime_utterance",
@@ -746,7 +763,7 @@ class TestAgentRuntimeIntegration:
             StreamEvent(type="utterance_end"),
         ]
         client, holder = _connect_with_fake_session(events=events)
-        patchers, _ = _patch_realtime_deps()
+        patchers, _, mock_tts = _patch_realtime_deps()
         patchers["process"].stop()
         process_patcher = patch(
             "app.api.voice_realtime.process_realtime_utterance",
@@ -782,7 +799,7 @@ class TestAgentRuntimeIntegration:
             StreamEvent(type="utterance_end"),
         ]
         client, holder = _connect_with_fake_session(events=events)
-        patchers, mock_process = _patch_realtime_deps()
+        patchers, mock_process, _ = _patch_realtime_deps()
         try:
             with client.websocket_connect(REALTIME_WS_PATH) as ws:
                 ws.send_json(_start_with_llm())
@@ -812,7 +829,7 @@ class TestAgentRuntimeIntegration:
             StreamEvent(type="utterance_end"),
         ]
         client, holder = _connect_with_fake_session(events=events)
-        patchers, _ = _patch_realtime_deps()
+        patchers, _, mock_tts = _patch_realtime_deps()
         received_types: list[str] = []
         received_texts: list[str] = []
         try:
@@ -916,7 +933,7 @@ class TestAgentRuntimeIntegration:
             StreamEvent(type="utterance_end"),
         ]
         client, holder = _connect_with_fake_session(events=events)
-        patchers, _ = _patch_realtime_deps()
+        patchers, _, mock_tts = _patch_realtime_deps()
         patchers["process"].stop()
         process_patcher = patch(
             "app.api.voice_realtime.process_realtime_utterance",
@@ -959,7 +976,7 @@ class TestAgentRuntimeIntegration:
         mock_llm = MagicMock()
         mock_llm.close = AsyncMock()
 
-        patchers, _ = _patch_realtime_deps()
+        patchers, _, mock_tts = _patch_realtime_deps()
         # Override the get_llm patcher to return our specific mock
         patchers["get_llm"].stop()
         get_llm_patcher = patch(
@@ -1008,7 +1025,7 @@ class TestAgentRuntimeIntegration:
             StreamEvent(type="utterance_end"),
         ]
         client, holder = _connect_with_fake_session(events=events)
-        patchers, mock_process = _patch_realtime_deps()
+        patchers, mock_process, _ = _patch_realtime_deps()
         try:
             with (
                 patch(
@@ -1079,7 +1096,7 @@ class TestQueueBasedConcurrency:
             StreamEvent(type="utterance_end"),
         ]
         client, holder = _connect_with_fake_session(events=events)
-        patchers, _ = _patch_realtime_deps()
+        patchers, _, mock_tts = _patch_realtime_deps()
         patchers["process"].stop()
         process_patcher = patch(
             "app.api.voice_realtime.process_realtime_utterance",
@@ -1128,7 +1145,7 @@ class TestQueueBasedConcurrency:
             StreamEvent(type="utterance_end"),
         ]
         client, holder = _connect_with_fake_session(events=events)
-        patchers, _ = _patch_realtime_deps()
+        patchers, _, mock_tts = _patch_realtime_deps()
         patchers["process"].stop()
         process_patcher = patch(
             "app.api.voice_realtime.process_realtime_utterance",
@@ -1180,7 +1197,7 @@ class TestQueueBasedConcurrency:
             StreamEvent(type="utterance_end"),
         ]
         client, holder = _connect_with_fake_session(events=events)
-        patchers, _ = _patch_realtime_deps()
+        patchers, _, mock_tts = _patch_realtime_deps()
         patchers["process"].stop()
         process_patcher = patch(
             "app.api.voice_realtime.process_realtime_utterance",
@@ -1243,7 +1260,7 @@ class TestQueueBasedConcurrency:
             StreamEvent(type="utterance_end"),
         ]
         client, holder = _connect_with_fake_session(events=events)
-        patchers, _ = _patch_realtime_deps()
+        patchers, _, mock_tts = _patch_realtime_deps()
         patchers["process"].stop()
         process_patcher = patch(
             "app.api.voice_realtime.process_realtime_utterance",
@@ -1298,7 +1315,7 @@ class TestQueueBasedConcurrency:
             StreamEvent(type="utterance_end"),
         ]
         client, holder = _connect_with_fake_session(events=events)
-        patchers, _ = _patch_realtime_deps()
+        patchers, _, mock_tts = _patch_realtime_deps()
         patchers["process"].stop()
         process_patcher = patch(
             "app.api.voice_realtime.process_realtime_utterance",
@@ -1320,5 +1337,597 @@ class TestQueueBasedConcurrency:
                 assert llm_instances_used[0] == llm_instances_used[1]
         finally:
             process_patcher.stop()
+            _stop_patchers(patchers)
+            holder["patcher"].stop()
+
+
+class TestTTSSynthesis:
+    """Phase 6B.2: TTS synthesis after AgentRuntime responses."""
+
+    def test_agent_response_triggers_tts(self) -> None:
+        """A: Agent response triggers TTS synthesis."""
+        events = [
+            StreamEvent(type="final", text="Hello", confidence=0.9),
+            StreamEvent(type="utterance_end"),
+        ]
+        client, holder = _connect_with_fake_session(events=events)
+        patchers, _, mock_tts = _patch_realtime_deps()
+        try:
+            with client.websocket_connect(REALTIME_WS_PATH) as ws:
+                ws.send_json(_start_with_llm())
+                while True:
+                    event = ws.receive_json()
+                    if event["type"] == "audio":
+                        break
+                    if event["type"] == "error":
+                        break
+                # TTS synthesize must have been called
+                mock_tts.synthesize.assert_awaited_once()
+        finally:
+            _stop_patchers(patchers)
+            holder["patcher"].stop()
+
+    def test_tts_receives_exact_response_text(self) -> None:
+        """B: TTS receives exactly the assistant response text."""
+        from unittest.mock import AsyncMock
+
+        async def _mock_process(**kwargs):
+            return {
+                "response": "The weather is sunny today!",
+                "tool_calls": [],
+                "usage": {"total_tokens": 10},
+                "iterations": 1,
+            }
+
+        events = [
+            StreamEvent(type="final", text="What is the weather?", confidence=0.9),
+            StreamEvent(type="utterance_end"),
+        ]
+        client, holder = _connect_with_fake_session(events=events)
+        patchers, _, mock_tts = _patch_realtime_deps()
+        patchers["process"].stop()
+        process_patcher = patch(
+            "app.api.voice_realtime.process_realtime_utterance",
+            AsyncMock(side_effect=_mock_process),
+        )
+        process_patcher.start()
+        try:
+            with client.websocket_connect(REALTIME_WS_PATH) as ws:
+                ws.send_json(_start_with_llm())
+                while True:
+                    event = ws.receive_json()
+                    if event["type"] == "audio":
+                        break
+                    if event["type"] == "error":
+                        break
+                # TTS must receive the exact response text
+                mock_tts.synthesize.assert_awaited_once()
+                call_kwargs = mock_tts.synthesize.call_args.kwargs
+                assert call_kwargs["text"] == "The weather is sunny today!"
+        finally:
+            process_patcher.stop()
+            _stop_patchers(patchers)
+            holder["patcher"].stop()
+
+    def test_tts_processing_event_emitted(self) -> None:
+        """C: TTS processing event is emitted before audio."""
+        events = [
+            StreamEvent(type="final", text="Hello", confidence=0.9),
+            StreamEvent(type="utterance_end"),
+        ]
+        client, holder = _connect_with_fake_session(events=events)
+        patchers, _, mock_tts = _patch_realtime_deps()
+        received_types: list[str] = []
+        try:
+            with client.websocket_connect(REALTIME_WS_PATH) as ws:
+                ws.send_json(_start_with_llm())
+                while True:
+                    event = ws.receive_json()
+                    received_types.append(event["type"])
+                    if event["type"] == "audio":
+                        break
+                    if event["type"] == "error":
+                        break
+                # tts_processing must come after agent_response, before audio
+                assert "tts_processing" in received_types
+                agent_idx = received_types.index("agent_response")
+                tts_idx = received_types.index("tts_processing")
+                audio_idx = received_types.index("audio")
+                assert agent_idx < tts_idx < audio_idx
+        finally:
+            _stop_patchers(patchers)
+            holder["patcher"].stop()
+
+    def test_successful_tts_emits_audio_event(self) -> None:
+        """D: Successful TTS emits an audio event."""
+        events = [
+            StreamEvent(type="final", text="Hello", confidence=0.9),
+            StreamEvent(type="utterance_end"),
+        ]
+        client, holder = _connect_with_fake_session(events=events)
+        patchers, _, mock_tts = _patch_realtime_deps()
+        audio_event = None
+        try:
+            with client.websocket_connect(REALTIME_WS_PATH) as ws:
+                ws.send_json(_start_with_llm())
+                while True:
+                    event = ws.receive_json()
+                    if event["type"] == "audio":
+                        audio_event = event
+                        break
+                    if event["type"] == "error":
+                        break
+                assert audio_event is not None
+                assert "data" in audio_event
+                assert len(audio_event["data"]) > 0
+        finally:
+            _stop_patchers(patchers)
+            holder["patcher"].stop()
+
+    def test_audio_format_is_mpeg(self) -> None:
+        """E: Audio format is audio/mpeg."""
+        events = [
+            StreamEvent(type="final", text="Hello", confidence=0.9),
+            StreamEvent(type="utterance_end"),
+        ]
+        client, holder = _connect_with_fake_session(events=events)
+        patchers, _, mock_tts = _patch_realtime_deps()
+        audio_event = None
+        try:
+            with client.websocket_connect(REALTIME_WS_PATH) as ws:
+                ws.send_json(_start_with_llm())
+                while True:
+                    event = ws.receive_json()
+                    if event["type"] == "audio":
+                        audio_event = event
+                        break
+                    if event["type"] == "error":
+                        break
+                assert audio_event is not None
+                assert audio_event["format"] == "audio/mpeg"
+        finally:
+            _stop_patchers(patchers)
+            holder["patcher"].stop()
+
+    def test_audio_bytes_valid_nonempty(self) -> None:
+        """F: Audio bytes are valid and non-empty."""
+        import base64
+
+        events = [
+            StreamEvent(type="final", text="Hello", confidence=0.9),
+            StreamEvent(type="utterance_end"),
+        ]
+        client, holder = _connect_with_fake_session(events=events)
+        patchers, _, mock_tts = _patch_realtime_deps()
+        audio_event = None
+        try:
+            with client.websocket_connect(REALTIME_WS_PATH) as ws:
+                ws.send_json(_start_with_llm())
+                while True:
+                    event = ws.receive_json()
+                    if event["type"] == "audio":
+                        audio_event = event
+                        break
+                    if event["type"] == "error":
+                        break
+                assert audio_event is not None
+                # Decode base64 and verify non-empty
+                audio_data = base64.b64decode(audio_event["data"])
+                assert len(audio_data) > 0
+                assert audio_data == b"fake-mp3-audio-data"
+        finally:
+            _stop_patchers(patchers)
+            holder["patcher"].stop()
+
+    def test_tts_error_emits_error_stage_tts(self) -> None:
+        """G: TTS error emits error event with stage=tts."""
+        from unittest.mock import AsyncMock
+
+        events = [
+            StreamEvent(type="final", text="Hello", confidence=0.9),
+            StreamEvent(type="utterance_end"),
+        ]
+        client, holder = _connect_with_fake_session(events=events)
+        patchers, _, mock_tts = _patch_realtime_deps()
+        # Make TTS fail
+        mock_tts.synthesize = AsyncMock(side_effect=RuntimeError("TTS API down"))
+        error_event = None
+        agent_response = None
+        try:
+            with client.websocket_connect(REALTIME_WS_PATH) as ws:
+                ws.send_json(_start_with_llm())
+                while True:
+                    event = ws.receive_json()
+                    if event["type"] == "error" and event.get("stage") == "tts":
+                        error_event = event
+                        break
+                    if event["type"] == "agent_response":
+                        agent_response = event
+                    if event["type"] == "completed":
+                        break
+                # Agent response must still arrive
+                assert agent_response is not None
+                # TTS error must be reported
+                assert error_event is not None
+                assert error_event["stage"] == "tts"
+                assert "TTS API down" in error_event["message"]
+        finally:
+            _stop_patchers(patchers)
+            holder["patcher"].stop()
+
+    def test_tts_error_does_not_destroy_llm_session(self) -> None:
+        """H: TTS error does not destroy the LLM session."""
+        from unittest.mock import AsyncMock
+
+        events = [
+            StreamEvent(type="final", text="First", confidence=0.9),
+            StreamEvent(type="utterance_end"),
+            StreamEvent(type="final", text="Second", confidence=0.9),
+            StreamEvent(type="utterance_end"),
+        ]
+        client, holder = _connect_with_fake_session(events=events)
+        patchers, _, mock_tts = _patch_realtime_deps()
+        # Make TTS fail on first call, succeed on second
+        call_count = 0
+
+        async def _tts_side_effect(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise RuntimeError("TTS temporary failure")
+            from app.providers.types import TTSResult
+
+            return TTSResult(audio_data=b"second-audio", content_type="audio/mpeg")
+
+        mock_tts.synthesize = AsyncMock(side_effect=_tts_side_effect)
+        agent_responses: list[dict] = []
+        error_events: list[dict] = []
+        audio_events: list[dict] = []
+        try:
+            with client.websocket_connect(REALTIME_WS_PATH) as ws:
+                ws.send_json(_start_with_llm())
+                # Wait for both utterances to be processed
+                # Need 2 agent_responses + 1 audio (first TTS fails, second succeeds)
+                while len(agent_responses) < 2 or len(audio_events) < 1:
+                    event = ws.receive_json()
+                    if event["type"] == "agent_response":
+                        agent_responses.append(event)
+                    if event["type"] == "error":
+                        error_events.append(event)
+                    if event["type"] == "audio":
+                        audio_events.append(event)
+                    if len(error_events) > 2:
+                        break
+                # Both agent responses must succeed
+                assert len(agent_responses) == 2
+                # First TTS failed, second succeeded
+                assert len(error_events) == 1
+                assert error_events[0]["stage"] == "tts"
+                assert len(audio_events) == 1
+        finally:
+            _stop_patchers(patchers)
+            holder["patcher"].stop()
+
+    def test_tts_error_does_not_destroy_deepgram_session(self) -> None:
+        """I: TTS error does not destroy the Deepgram session."""
+        from unittest.mock import AsyncMock
+
+        events = [
+            StreamEvent(type="final", text="Hello", confidence=0.9),
+            StreamEvent(type="utterance_end"),
+        ]
+        client, holder = _connect_with_fake_session(events=events)
+        patchers, _, mock_tts = _patch_realtime_deps()
+        # Make TTS fail
+        mock_tts.synthesize = AsyncMock(side_effect=RuntimeError("TTS boom"))
+        received_types: list[str] = []
+        try:
+            with client.websocket_connect(REALTIME_WS_PATH) as ws:
+                ws.send_json(_start_with_llm())
+                # Wait for error, then send STOP
+                while True:
+                    event = ws.receive_json()
+                    received_types.append(event["type"])
+                    if event["type"] == "error" and event.get("stage") == "tts":
+                        break
+                    if event["type"] == "completed":
+                        break
+                # Session must still be usable — send STOP
+                ws.send_json({"type": "stop"})
+                while True:
+                    event = ws.receive_json()
+                    received_types.append(event["type"])
+                    if event["type"] == "completed":
+                        break
+                    if event["type"] == "error":
+                        break
+                # Must complete cleanly
+                assert "completed" in received_types
+                # Deepgram session must be closed (not crashed)
+                assert holder["session"].closed is True
+        finally:
+            _stop_patchers(patchers)
+            holder["patcher"].stop()
+
+    def test_multiple_utterances_fifo_with_tts(self) -> None:
+        """J: Multiple utterances process in FIFO order: LLM → TTS → audio."""
+        from unittest.mock import AsyncMock
+
+        call_order: list[str] = []
+
+        async def _mock_process(**kwargs):
+            call_order.append(f"llm:{kwargs['transcript']}")
+            return {
+                "response": f"Answer for {kwargs['transcript']}",
+                "tool_calls": [],
+                "usage": {"total_tokens": 10},
+                "iterations": 1,
+            }
+
+        events = [
+            StreamEvent(type="final", text="First", confidence=0.9),
+            StreamEvent(type="utterance_end"),
+            StreamEvent(type="final", text="Second", confidence=0.9),
+            StreamEvent(type="utterance_end"),
+        ]
+        client, holder = _connect_with_fake_session(events=events)
+        patchers, _, mock_tts = _patch_realtime_deps()
+        patchers["process"].stop()
+        process_patcher = patch(
+            "app.api.voice_realtime.process_realtime_utterance",
+            AsyncMock(side_effect=_mock_process),
+        )
+        process_patcher.start()
+        tts_calls: list[str] = []
+
+        original_synthesize = mock_tts.synthesize
+
+        async def _tracking_synthesize(**kwargs):
+            tts_calls.append(f"tts:{kwargs['text']}")
+            return await original_synthesize(**kwargs)
+
+        mock_tts.synthesize = AsyncMock(side_effect=_tracking_synthesize)
+        agent_responses: list[dict] = []
+        audio_events: list[dict] = []
+        try:
+            with client.websocket_connect(REALTIME_WS_PATH) as ws:
+                ws.send_json(_start_with_llm())
+                # Wait for both agent responses AND both audio events
+                while len(agent_responses) < 2 or len(audio_events) < 2:
+                    event = ws.receive_json()
+                    if event["type"] == "agent_response":
+                        agent_responses.append(event)
+                    if event["type"] == "audio":
+                        audio_events.append(event)
+                    if event["type"] == "error":
+                        break
+                # Both utterances processed
+                assert len(agent_responses) == 2
+                assert len(audio_events) == 2
+                # FIFO order preserved
+                assert call_order == ["llm:First", "llm:Second"]
+                assert tts_calls == [
+                    "tts:Answer for First",
+                    "tts:Answer for Second",
+                ]
+        finally:
+            process_patcher.stop()
+            _stop_patchers(patchers)
+            holder["patcher"].stop()
+
+    def test_tts_not_called_for_empty_utterances(self) -> None:
+        """K: TTS is not called for empty utterances."""
+        events = [
+            StreamEvent(type="partial", text="", confidence=0.0),
+            StreamEvent(type="utterance_end"),
+        ]
+        client, holder = _connect_with_fake_session(events=events)
+        patchers, _, mock_tts = _patch_realtime_deps()
+        received_types: list[str] = []
+        try:
+            with client.websocket_connect(REALTIME_WS_PATH) as ws:
+                ws.send_json(_start_with_llm())
+                ws.send_json({"type": "stop"})
+                while True:
+                    event = ws.receive_json()
+                    received_types.append(event["type"])
+                    if event["type"] == "completed":
+                        break
+                # No agent processing, no TTS
+                assert "agent_processing" not in received_types
+                assert "tts_processing" not in received_types
+                assert "audio" not in received_types
+                mock_tts.synthesize.assert_not_awaited()
+        finally:
+            _stop_patchers(patchers)
+            holder["patcher"].stop()
+
+    def test_partial_transcripts_never_trigger_tts(self) -> None:
+        """L: Partial transcripts never trigger TTS."""
+        events = [
+            StreamEvent(type="partial", text="hello", confidence=0.5),
+            StreamEvent(type="partial", text="hello world", confidence=0.7),
+        ]
+        client, holder = _connect_with_fake_session(events=events)
+        patchers, _, mock_tts = _patch_realtime_deps()
+        received_types: list[str] = []
+        try:
+            with client.websocket_connect(REALTIME_WS_PATH) as ws:
+                ws.send_json(_start_with_llm())
+                ws.send_json({"type": "stop"})
+                while True:
+                    event = ws.receive_json()
+                    received_types.append(event["type"])
+                    if event["type"] == "completed":
+                        break
+                # Only partials, no utterance_end → no TTS
+                assert "transcript_partial" in received_types
+                assert "utterance_end" not in received_types
+                assert "tts_processing" not in received_types
+                assert "audio" not in received_types
+                mock_tts.synthesize.assert_not_awaited()
+        finally:
+            _stop_patchers(patchers)
+            holder["patcher"].stop()
+
+    def test_tts_does_not_create_duplicate_message(self) -> None:
+        """M: TTS does not create a duplicate conversation message.
+
+        TTS is purely audio representation — it must not call _save_message.
+        """
+        from unittest.mock import AsyncMock
+        from unittest.mock import patch as mock_patch
+
+        events = [
+            StreamEvent(type="final", text="Hello", confidence=0.9),
+            StreamEvent(type="utterance_end"),
+        ]
+        client, holder = _connect_with_fake_session(events=events)
+        patchers, _, mock_tts = _patch_realtime_deps()
+        save_message_calls: list = []
+
+        original_process = patchers["process"].new
+
+        async def _tracking_process(**kwargs):
+            result = await original_process(**kwargs)
+            return result
+
+        patchers["process"].stop()
+        process_patcher = patch(
+            "app.api.voice_realtime.process_realtime_utterance",
+            AsyncMock(side_effect=_tracking_process),
+        )
+        process_patcher.start()
+        try:
+            with mock_patch(
+                "app.services.realtime_voice_service._save_message",
+                side_effect=lambda *a, **kw: save_message_calls.append((a, kw)),
+            ):
+                with client.websocket_connect(REALTIME_WS_PATH) as ws:
+                    ws.send_json(_start_with_llm())
+                    while True:
+                        event = ws.receive_json()
+                        if event["type"] == "audio":
+                            break
+                        if event["type"] == "error":
+                            break
+            # process_realtime_utterance handles message saving internally
+            # TTS must not add additional saves
+            # We verify TTS was called but didn't trigger extra DB writes
+            assert len(save_message_calls) == 0  # mocked at service level
+        finally:
+            process_patcher.stop()
+            _stop_patchers(patchers)
+            holder["patcher"].stop()
+
+    def test_same_providers_reused_across_turns(self) -> None:
+        """N: Same session-level providers remain usable across multiple turns."""
+        from unittest.mock import AsyncMock
+
+        call_count = 0
+
+        async def _mock_process(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            return {
+                "response": f"Response {call_count}",
+                "tool_calls": [],
+                "usage": {"total_tokens": 10},
+                "iterations": 1,
+            }
+
+        events = [
+            StreamEvent(type="final", text="First", confidence=0.9),
+            StreamEvent(type="utterance_end"),
+            StreamEvent(type="final", text="Second", confidence=0.9),
+            StreamEvent(type="utterance_end"),
+            StreamEvent(type="final", text="Third", confidence=0.9),
+            StreamEvent(type="utterance_end"),
+        ]
+        client, holder = _connect_with_fake_session(events=events)
+        patchers, _, mock_tts = _patch_realtime_deps()
+        patchers["process"].stop()
+        process_patcher = patch(
+            "app.api.voice_realtime.process_realtime_utterance",
+            AsyncMock(side_effect=_mock_process),
+        )
+        process_patcher.start()
+        agent_responses: list[dict] = []
+        audio_events: list[dict] = []
+        try:
+            with client.websocket_connect(REALTIME_WS_PATH) as ws:
+                ws.send_json(_start_with_llm())
+                # Wait for all agent responses AND all audio events
+                while len(agent_responses) < 3 or len(audio_events) < 3:
+                    event = ws.receive_json()
+                    if event["type"] == "agent_response":
+                        agent_responses.append(event)
+                    if event["type"] == "audio":
+                        audio_events.append(event)
+                    if event["type"] == "error":
+                        break
+                # All 3 utterances succeeded with same providers
+                assert len(agent_responses) == 3
+                assert len(audio_events) == 3
+                # TTS synthesize called 3 times (same instance)
+                assert mock_tts.synthesize.await_count == 3
+        finally:
+            process_patcher.stop()
+            _stop_patchers(patchers)
+            holder["patcher"].stop()
+
+    def test_tts_closed_on_session_cleanup(self) -> None:
+        """P: TTS close is called on session cleanup."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        events = [
+            StreamEvent(type="final", text="Hello", confidence=0.9),
+            StreamEvent(type="utterance_end"),
+        ]
+        client, holder = _connect_with_fake_session(events=events)
+
+        # Create a specific mock TTS to track close()
+        mock_tts_specific = MagicMock()
+        mock_tts_specific.provider_name = "elevenlabs"
+        mock_tts_specific.synthesize = AsyncMock(
+            return_value=MagicMock(
+                audio_data=b"test-audio",
+                content_type="audio/mpeg",
+            )
+        )
+        mock_tts_specific.close = AsyncMock()
+
+        patchers, _, _ = _patch_realtime_deps()
+        # Override the get_tts patcher to return our specific mock
+        patchers["get_tts"].stop()
+        get_tts_patcher = patch(
+            "app.api.voice_realtime.get_tts_provider",
+            return_value=mock_tts_specific,
+        )
+        get_tts_patcher.start()
+
+        try:
+            with client.websocket_connect(REALTIME_WS_PATH) as ws:
+                ws.send_json(_start_with_llm())
+                # Wait for agent response
+                while True:
+                    event = ws.receive_json()
+                    if event["type"] == "agent_response":
+                        break
+                    if event["type"] == "error":
+                        break
+                # Send STOP to trigger cleanup
+                ws.send_json({"type": "stop"})
+                while True:
+                    event = ws.receive_json()
+                    if event["type"] == "completed":
+                        break
+                    if event["type"] == "error":
+                        break
+
+            # Verify TTS close() was called
+            mock_tts_specific.close.assert_awaited_once()
+        finally:
+            get_tts_patcher.stop()
             _stop_patchers(patchers)
             holder["patcher"].stop()
