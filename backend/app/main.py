@@ -14,6 +14,7 @@ from app.api.providers import router as providers_router
 from app.api.tools import router as tools_router
 from app.api.voice import router as voice_router
 from app.api.voice_realtime import router as voice_realtime_router
+from app.api.voice_telephony import router as voice_telephony_router
 from app.core.config import settings
 from app.core.database import Base, engine
 from app.core.logging import logger, setup_logging
@@ -126,6 +127,7 @@ def create_app() -> FastAPI:
     app.include_router(benchmarks_router, prefix="/api/v1")
     app.include_router(voice_router)
     app.include_router(voice_realtime_router)
+    app.include_router(voice_telephony_router)
 
     return app
 

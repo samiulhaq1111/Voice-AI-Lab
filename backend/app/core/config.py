@@ -28,6 +28,8 @@ class Settings(BaseSettings):
     openrouter_api_key: str = ""
     deepgram_api_key: str = ""
     elevenlabs_api_key: str = ""
+    telnyx_api_key: str = ""
+    telnyx_speak_voice: str = "female"
 
     # --- Default Provider Selections ---
     default_stt_provider: str = "deepgram"
@@ -58,6 +60,7 @@ class Settings(BaseSettings):
             "deepgram": self.deepgram_api_key,
             "openrouter": self.openrouter_api_key,
             "elevenlabs": self.elevenlabs_api_key,
+            "telnyx": self.telnyx_api_key,
         }
         return bool(key_map.get(provider, ""))
 
