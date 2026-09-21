@@ -1780,3 +1780,385 @@ class TestAgentRuntimeTiming:
         msg_list = messages.kwargs.get("messages", messages[1].get("messages", []))
         # system + user1 + assistant1 + user2 = 4
         assert len(msg_list) == 4
+
+
+# ---------------------------------------------------------------------------
+# Milestone 7: Telephone TTS Integration
+# ---------------------------------------------------------------------------
+
+
+class TestAudioConversionMP3ToPCMU:
+    """Test MP3 → PCMU 8kHz audio conversion pipeline."""
+
+    def test_mp3_to_pcmu_empty_input(self) -> None:
+        """Empty MP3 input returns empty PCMU output."""
+        from app.utils.audio import mp3_to_pcmu_8k
+
+        assert mp3_to_pcmu_8k(b"") == b""
+
+    def test_mp3_to_pcmu_with_silent_mp3(self) -> None:
+        """Silent MP3 produces valid PCMU output."""
+        import struct
+        import subprocess
+
+        from app.utils.audio import mp3_to_pcmu_8k
+
+        # Generate a short silent PCM and encode to MP3 via ffmpeg
+        pcm_silence = struct.pack("<8000h", *([0] * 8000))  # 1s silence @ 8kHz
+        proc = subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                "-f", "s16le", "-ar", "8000", "-ac", "1",
+                "-i", "pipe:0",
+                "-f", "mp3",
+                "pipe:1",
+            ],
+            input=pcm_silence,
+            capture_output=True,
+            timeout=10,
+        )
+        assert proc.returncode == 0
+        mp3_data = proc.stdout
+        assert len(mp3_data) > 0
+
+        # Convert MP3 → PCMU
+        pcmu = mp3_to_pcmu_8k(mp3_data)
+        assert len(pcmu) > 0
+        # PCMU should be roughly 8000 bytes for 1s @ 8kHz
+        # (allow some tolerance for resampling artifacts)
+        assert len(pcmu) >= 4000
+
+    def test_mp3_to_pcmu_invalid_data_raises(self) -> None:
+        """Invalid data raises RuntimeError."""
+        from app.utils.audio import mp3_to_pcmu_8k
+
+        # Random bytes that aren't valid MP3
+        with pytest.raises(RuntimeError, match="ffmpeg"):
+            mp3_to_pcmu_8k(b"not valid mp3 data at all " * 100)
+
+
+class TestTelnyxTTSService:
+    """Test the telephone TTS service."""
+
+    @pytest.mark.asyncio
+    async def test_start_creates_tts_provider(self) -> None:
+        """start() creates a TTS provider via get_tts_provider."""
+        from app.services.telnyx_tts import TelnyxTTSService
+
+        mock_tts = AsyncMock()
+        mock_tts.provider_name = "elevenlabs"
+
+        with patch(
+            "app.services.telnyx_tts.get_tts_provider",
+            return_value=mock_tts,
+        ):
+            svc = TelnyxTTSService()
+            await svc.start()
+            assert svc._tts is mock_tts
+            await svc.stop()
+
+    @pytest.mark.asyncio
+    async def test_start_handles_failure_gracefully(self) -> None:
+        """start() handles TTS provider creation failure gracefully."""
+        from app.services.telnyx_tts import TelnyxTTSService
+
+        with patch(
+            "app.services.telnyx_tts.get_tts_provider",
+            side_effect=Exception("no API key"),
+        ):
+            svc = TelnyxTTSService()
+            await svc.start()
+            assert svc._tts is None
+
+    @pytest.mark.asyncio
+    async def test_synthesize_and_send_no_tts_returns_false(self) -> None:
+        """synthesize_and_send returns False when no TTS provider."""
+        from app.services.telnyx_tts import TelnyxTTSService
+
+        svc = TelnyxTTSService()
+        # Don't call start() — _tts is None
+        ws = AsyncMock()
+        result = await svc.synthesize_and_send("hello", 1, ws)
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_synthesize_and_send_success(self) -> None:
+        """synthesize_and_send synthesizes, converts, and sends audio."""
+        import struct
+
+        from app.providers.types import TTSResult
+        from app.services.telnyx_tts import TelnyxTTSService
+
+        # Create a minimal silent MP3 via ffmpeg
+        pcm_silence = struct.pack("<1600h", *([0] * 1600))  # 0.2s @ 8kHz
+        import subprocess
+
+        proc = subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                "-f", "s16le", "-ar", "8000", "-ac", "1",
+                "-i", "pipe:0", "-f", "mp3", "pipe:1",
+            ],
+            input=pcm_silence,
+            capture_output=True,
+            timeout=10,
+        )
+        mp3_data = proc.stdout
+
+        mock_tts = AsyncMock()
+        mock_tts.provider_name = "elevenlabs"
+        mock_tts.synthesize = AsyncMock(
+            return_value=TTSResult(
+                audio_data=mp3_data,
+                content_type="audio/mpeg",
+            )
+        )
+
+        ws = AsyncMock()
+
+        svc = TelnyxTTSService()
+        svc._tts = mock_tts
+
+        result = await svc.synthesize_and_send("Hello", 1, ws)
+        assert result is True
+        # WebSocket should have been called with media events
+        assert ws.send_text.called
+        # Verify the sent data is valid JSON with media event structure
+        import json
+
+        first_call = ws.send_text.call_args_list[0]
+        msg = json.loads(first_call[0][0])
+        assert msg["event"] == "media"
+        assert "payload" in msg["media"]
+
+        await svc.stop()
+
+    @pytest.mark.asyncio
+    async def test_synthesize_and_send_tts_failure(self) -> None:
+        """synthesize_and_send returns False on TTS failure."""
+        from app.services.telnyx_tts import TelnyxTTSService
+
+        mock_tts = AsyncMock()
+        mock_tts.provider_name = "elevenlabs"
+        mock_tts.synthesize = AsyncMock(side_effect=RuntimeError("API error"))
+
+        ws = AsyncMock()
+        svc = TelnyxTTSService()
+        svc._tts = mock_tts
+
+        result = await svc.synthesize_and_send("Hello", 1, ws)
+        assert result is False
+        # WebSocket should NOT have been called
+        ws.send_text.assert_not_called()
+
+
+class TestTelnyxTTSPacing:
+    """Verify that TTS chunks are sent with real-time pacing (20ms each)."""
+
+    @pytest.mark.asyncio
+    async def test_pacing_sleep_between_chunks(self) -> None:
+        """asyncio.sleep(0.020) is called once per chunk after sending."""
+        import struct
+        import subprocess
+
+        from app.providers.types import TTSResult
+        from app.services.telnyx_tts import TelnyxTTSService
+
+        # Create enough PCM silence to produce ~10 chunks (10 * 160 = 1600 samples)
+        pcm_silence = struct.pack("<1600h", *([0] * 1600))
+        proc = subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                "-f", "s16le", "-ar", "8000", "-ac", "1",
+                "-i", "pipe:0", "-f", "mp3", "pipe:1",
+            ],
+            input=pcm_silence,
+            capture_output=True,
+            timeout=10,
+        )
+        mp3_data = proc.stdout
+
+        mock_tts = AsyncMock()
+        mock_tts.provider_name = "elevenlabs"
+        mock_tts.synthesize = AsyncMock(
+            return_value=TTSResult(
+                audio_data=mp3_data,
+                content_type="audio/mpeg",
+            )
+        )
+
+        ws = AsyncMock()
+        svc = TelnyxTTSService()
+        svc._tts = mock_tts
+
+        with patch("app.services.telnyx_tts.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            result = await svc.synthesize_and_send("Hello", 1, ws)
+
+        assert result is True
+        send_count = ws.send_text.call_count
+        sleep_count = mock_sleep.call_count
+        # sleep should be called once per chunk (after each send)
+        assert sleep_count == send_count
+        assert send_count > 0
+        # Every sleep call must be 20ms
+        for call in mock_sleep.call_args_list:
+            assert call.args[0] == pytest.approx(0.020, abs=1e-6)
+
+        await svc.stop()
+
+
+class TestAgentWorkerTTSIntegration:
+    """Test that the agent worker invokes TTS after agent response."""
+
+    @pytest.mark.asyncio
+    async def test_agent_worker_calls_tts(self) -> None:
+        """Agent worker calls TTS service after successful agent response."""
+        import asyncio
+
+        from app.agents.runtime import AgentResult
+        from app.services.telnyx_agent import TelephonyAgentSession
+
+        mock_llm = AsyncMock()
+        mock_tts = AsyncMock()
+        mock_tts.synthesize_and_send = AsyncMock(return_value=True)
+        mock_ws = AsyncMock()
+
+        # Mock AgentRuntime.run to return a simple response
+        mock_result = AgentResult(
+            response="Hello there!",
+            tool_calls=[],
+            usage={"prompt_tokens": 10, "completion_tokens": 5},
+            iterations=1,
+        )
+
+        queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+        agent = TelephonyAgentSession(
+            call_control_id="test-cc",
+            utterance_queue=queue,
+            tts_service=mock_tts,
+            websocket=mock_ws,
+        )
+        agent._llm = mock_llm
+
+        with patch(
+            "app.services.telnyx_agent.AgentRuntime"
+        ) as mock_rt:
+            mock_runtime = AsyncMock()
+            mock_runtime.run = AsyncMock(return_value=mock_result)
+            mock_runtime.state.messages = []
+            mock_runtime.close = AsyncMock()
+            mock_rt.return_value = mock_runtime
+
+            # Start worker, send utterance, then shutdown
+            agent._running = True
+            agent._worker_task = asyncio.create_task(agent._agent_worker())
+            await queue.put("Hello")
+            await asyncio.sleep(0.3)
+            await queue.put(None)  # shutdown
+            await asyncio.sleep(0.1)
+
+        # TTS should have been called
+        mock_tts.synthesize_and_send.assert_awaited_once()
+        call_kwargs = mock_tts.synthesize_and_send.call_args
+        assert call_kwargs.kwargs["text"] == "Hello there!"
+        assert call_kwargs.kwargs["turn"] == 1
+
+    @pytest.mark.asyncio
+    async def test_agent_worker_tts_failure_doesnt_crash(self) -> None:
+        """TTS failure doesn't crash the agent worker."""
+        import asyncio
+
+        from app.agents.runtime import AgentResult
+        from app.services.telnyx_agent import TelephonyAgentSession
+
+        mock_llm = AsyncMock()
+        mock_tts = AsyncMock()
+        mock_tts.synthesize_and_send = AsyncMock(
+            side_effect=RuntimeError("TTS boom")
+        )
+        mock_ws = AsyncMock()
+
+        mock_result = AgentResult(
+            response="Hi",
+            tool_calls=[],
+            usage={},
+            iterations=1,
+        )
+
+        queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+        agent = TelephonyAgentSession(
+            call_control_id="test-cc",
+            utterance_queue=queue,
+            tts_service=mock_tts,
+            websocket=mock_ws,
+        )
+        agent._llm = mock_llm
+
+        with patch(
+            "app.services.telnyx_agent.AgentRuntime"
+        ) as mock_rt:
+            mock_runtime = AsyncMock()
+            mock_runtime.run = AsyncMock(return_value=mock_result)
+            mock_runtime.state.messages = []
+            mock_runtime.close = AsyncMock()
+            mock_rt.return_value = mock_runtime
+
+            agent._running = True
+            agent._worker_task = asyncio.create_task(agent._agent_worker())
+            await queue.put("Hello")
+            await asyncio.sleep(0.3)
+            # Worker should still be alive after TTS failure
+            assert not agent._worker_task.done()
+            await queue.put(None)
+            await asyncio.sleep(0.1)
+
+        # Worker should have processed the turn despite TTS failure
+        assert agent.turn == 1
+
+
+class TestTrackIsolationPreserved:
+    """Verify outbound audio filtering still works with TTS."""
+
+    @pytest.mark.asyncio
+    async def test_outbound_track_skipped_by_bridge(self) -> None:
+        """Outbound track packets are not sent to Deepgram STT."""
+        import base64
+
+        from app.services.telnyx_deepgram import TelnyxDeepgramBridge
+
+        bridge = TelnyxDeepgramBridge()
+        bridge._running = True
+
+        # Simulate an outbound track packet
+        pcmu_silence = bytes(160)
+        payload = base64.b64encode(pcmu_silence).decode("ascii")
+        await bridge.process_media_packet(
+            {"payload": payload, "track": "outbound"}
+        )
+
+        # Outbound packet should be skipped
+        assert bridge._outbound_packets_skipped == 1
+        assert bridge.packets_in == 0  # Not counted as inbound
+        assert bridge._audio_queue.qsize() == 0  # Nothing queued for STT
+
+    @pytest.mark.asyncio
+    async def test_inbound_track_processed(self) -> None:
+        """Inbound track packets are processed normally."""
+        import base64
+
+        from app.services.telnyx_deepgram import TelnyxDeepgramBridge
+
+        bridge = TelnyxDeepgramBridge()
+        bridge._running = True
+
+        pcmu_silence = bytes(160)
+        payload = base64.b64encode(pcmu_silence).decode("ascii")
+        await bridge.process_media_packet(
+            {"payload": payload, "track": "inbound"}
+        )
+
+        assert bridge.packets_in == 1
+        assert bridge._outbound_packets_skipped == 0
+        assert bridge._audio_queue.qsize() == 1  # Queued for STT

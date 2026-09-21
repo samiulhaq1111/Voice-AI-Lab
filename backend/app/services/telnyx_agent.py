@@ -1,8 +1,8 @@
-"""Telephony agent service (Phase 6C Milestone 6).
+"""Telephony agent service (Phase 6C Milestone 6/7).
 
 Processes finalized utterances from the Telnyx → Deepgram pipeline through
-AgentRuntime. Manages session-level LLM provider lifecycle and conversation
-history for multi-turn phone calls.
+AgentRuntime, then synthesizes the text response via TTS and sends
+telephone-compatible audio back through the Telnyx media WebSocket.
 
 Architecture:
     bridge.utterance_queue
@@ -11,16 +11,17 @@ Architecture:
         ↓
     AgentRuntime.run(transcript, initial_messages=history)
         ↓
-    Log text response (no TTS in this milestone)
+    TelnyxTTSService.synthesize_and_send(response_text)
+        ↓
+    Caller hears AI response
 
 The agent worker runs as a separate async task so that the Telnyx media
 receive loop and Deepgram event pump are never blocked by LLM calls.
 
-Session-level LLM provider lifecycle:
-    - Created once when the telephony session starts
+Session-level lifecycle:
+    - LLM + TTS providers created once when the telephony session starts
     - Reused across all utterances in the call
     - Closed exactly once during session cleanup
-    - AgentRuntime must NOT close it
 """
 
 import asyncio
@@ -44,14 +45,17 @@ _TELNYX_LLM_MODEL = "openai/gpt-4o-mini"
 class TelephonyAgentSession:
     """Manages agent processing for a single telephony call.
 
-    Owns the session-level LLM provider and conversation history.
-    Processes utterances one at a time via the agent worker.
+    Owns the session-level LLM provider, TTS service, and conversation
+    history. Processes utterances one at a time via the agent worker.
     """
 
     def __init__(
         self,
         call_control_id: str,
         utterance_queue: asyncio.Queue[str | None],
+        *,
+        tts_service: Any | None = None,
+        websocket: Any | None = None,
     ) -> None:
         self._call_control_id = call_control_id
         self._utterance_queue = utterance_queue
@@ -60,6 +64,8 @@ class TelephonyAgentSession:
         self._turn: int = 0
         self._worker_task: asyncio.Task | None = None
         self._running = False
+        self._tts_service = tts_service
+        self._websocket = websocket
 
     @property
     def call_control_id(self) -> str:
@@ -217,6 +223,26 @@ class TelephonyAgentSession:
                     usage.get("prompt_tokens", "n/a"),
                     usage.get("completion_tokens", "n/a"),
                 )
+
+                # --- TTS synthesis + send audio to Telnyx ---
+                if response_text and self._tts_service and self._websocket:
+                    try:
+                        await self._tts_service.synthesize_and_send(
+                            text=response_text,
+                            turn=turn,
+                            websocket=self._websocket,
+                        )
+                    except Exception as e:
+                        logger.error(
+                            "[VOICE:TELNYX:AGENT] turn=%d tts_send_error=%s",
+                            turn,
+                            e,
+                        )
+                elif response_text and not self._tts_service:
+                    logger.debug(
+                        "[VOICE:TELNYX:AGENT] turn=%d TTS skipped — no service",
+                        turn,
+                    )
 
             except Exception as e:
                 turn_ms = (time.monotonic() - turn_start) * 1000

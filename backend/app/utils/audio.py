@@ -144,3 +144,55 @@ def pcmu_8k_to_pcm_16k(ulaw_bytes: bytes) -> bytes:
     pcm_16k = pcm8k_to_pcm16k(pcm_8k)
 
     return pcm_16k
+
+
+def mp3_to_pcmu_8k(mp3_data: bytes) -> bytes:
+    """Convert MP3 audio to PCMU 8kHz mono using ffmpeg subprocess.
+
+    Args:
+        mp3_data: Raw MP3 audio bytes.
+
+    Returns:
+        PCMU (mu-law) encoded audio at 8kHz mono.
+    """
+    import subprocess
+
+    if not mp3_data:
+        return b""
+
+    # Decode MP3 → PCM16 8kHz mono via ffmpeg
+    proc = subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel", "error",
+            "-i", "pipe:0",
+            "-ar", "8000",
+            "-ac", "1",
+            "-f", "s16le",
+            "pipe:1",
+        ],
+        input=mp3_data,
+        capture_output=True,
+        timeout=30,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"ffmpeg MP3 decode failed (exit {proc.returncode}): "
+            f"{proc.stderr.decode(errors='replace')[:200]}"
+        )
+
+    pcm_8k = proc.stdout
+    if not pcm_8k:
+        return b""
+
+    # Convert PCM16 8kHz → PCMU 8kHz
+    import struct
+
+    num_samples = len(pcm_8k) // 2
+    samples = struct.unpack(f"<{num_samples}h", pcm_8k)
+
+    # Reuse mu-law encoding from telnyx_media
+    from app.services.telnyx_media import _linear_to_ulaw
+
+    return bytes(_linear_to_ulaw(s) for s in samples)

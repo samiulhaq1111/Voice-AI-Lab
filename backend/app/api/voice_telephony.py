@@ -2,12 +2,13 @@
 
 Receives Telnyx webhook events, answers inbound calls, speaks a greeting,
 and starts bidirectional media streaming. Includes a WebSocket endpoint
-for Telnyx media stream connections with Deepgram realtime STT and
-AgentRuntime integration.
+for Telnyx media stream connections with Deepgram realtime STT,
+AgentRuntime integration, and ElevenLabs TTS → telephone audio output.
 
-Milestone 6 flow:
+Milestone 7 flow:
     Telnyx PCMU 8kHz → Deepgram PCM 16kHz → transcript
-    → utterance_end → AgentRuntime → text response (logged only, no TTS)
+    → utterance_end → AgentRuntime → text response
+    → ElevenLabs TTS → MP3 → PCMU 8kHz → Telnyx media WS → caller hears AI
 """
 
 import json
@@ -102,11 +103,13 @@ async def telnyx_media_ws(websocket: WebSocket) -> None:
     """
     from app.services.telnyx_agent import TelephonyAgentSession
     from app.services.telnyx_deepgram import TelnyxDeepgramBridge
+    from app.services.telnyx_tts import TelnyxTTSService
 
     await websocket.accept()
     session = MediaStreamSession()
     bridge = TelnyxDeepgramBridge()
     agent: TelephonyAgentSession | None = None
+    tts_service = TelnyxTTSService()
 
     try:
         while True:
@@ -128,10 +131,13 @@ async def telnyx_media_ws(websocket: WebSocket) -> None:
                 session.handle_message(raw)
                 try:
                     await bridge.start(stream_id)
+                    await tts_service.start()
                     # Start agent session (consumes from bridge.utterance_queue)
                     agent = TelephonyAgentSession(
                         call_control_id=call_control_id or stream_id,
                         utterance_queue=bridge.utterance_queue,
+                        tts_service=tts_service,
+                        websocket=websocket,
                     )
                     await agent.start()
                 except Exception as e:
@@ -142,7 +148,7 @@ async def telnyx_media_ws(websocket: WebSocket) -> None:
                     )
                 continue
 
-            # Handle media event — forward to bridge and send test audio
+            # Handle media event — forward to bridge (no test audio when TTS active)
             if event == "media":
                 session.handle_message(raw)
                 media_data = msg.get("media", {})
@@ -151,18 +157,20 @@ async def telnyx_media_ws(websocket: WebSocket) -> None:
                 if bridge._running:
                     await bridge.process_media_packet(media_data)
 
-                # Send test audio back (existing Milestone 4 behavior)
-                outbound = session.next_outbound_media()
-                if outbound is not None:
-                    await websocket.send_text(json.dumps(outbound))
+                # Only send test audio if TTS is not active
+                if not tts_service._tts:
+                    outbound = session.next_outbound_media()
+                    if outbound is not None:
+                        await websocket.send_text(json.dumps(outbound))
                 continue
 
-            # Handle stop event — stop bridge and agent
+            # Handle stop event — stop bridge, agent, and TTS
             if event == "stop":
                 session.handle_message(raw)
                 if agent:
                     await agent.stop()
                 await bridge.stop()
+                await tts_service.stop()
                 continue
 
             # Handle other events (connected, unknown)
@@ -187,3 +195,4 @@ async def telnyx_media_ws(websocket: WebSocket) -> None:
         if agent:
             await agent.stop()
         await bridge.stop()
+        await tts_service.stop()

@@ -168,7 +168,7 @@ class TelnyxCallControlClient:
         stream_track: str = "both_tracks",
         bidirectional_mode: str = "rtp",
         bidirectional_codec: str = "PCMU",
-        bidirectional_target_legs: str = "opposite",
+        bidirectional_target_legs: str = "self",
     ) -> dict:
         """Start bidirectional media streaming on a call.
 
