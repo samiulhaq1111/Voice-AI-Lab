@@ -160,6 +160,82 @@ class TelnyxCallControlClient:
             )
             raise RuntimeError(f"Telnyx HTTP error: {e}") from e
 
+    async def streaming_start(
+        self,
+        call_control_id: str,
+        stream_url: str,
+        *,
+        stream_track: str = "both_tracks",
+        bidirectional_mode: str = "rtp",
+        bidirectional_codec: str = "PCMU",
+        bidirectional_target_legs: str = "opposite",
+    ) -> dict:
+        """Start bidirectional media streaming on a call.
+
+        POST /v2/calls/{call_control_id}/actions/streaming_start
+
+        Returns the parsed JSON response body on success.
+        Raises RuntimeError on failure.
+        """
+        url = f"/calls/{call_control_id}/actions/streaming_start"
+        body = {
+            "stream_url": stream_url,
+            "stream_track": stream_track,
+            "stream_bidirectional_mode": bidirectional_mode,
+            "stream_bidirectional_codec": bidirectional_codec,
+            "stream_bidirectional_target_legs": bidirectional_target_legs,
+        }
+        logger.info(
+            "[VOICE:TELNYX] streaming_start call_control_id=%s stream_url=%s "
+            "mode=%s codec=%s",
+            call_control_id,
+            stream_url,
+            bidirectional_mode,
+            bidirectional_codec,
+        )
+        try:
+            response = await self._client.post(url, json=body)
+            logger.info(
+                "[VOICE:TELNYX] streaming_start response status=%d",
+                response.status_code,
+            )
+            response.raise_for_status()
+            body_resp = response.json()
+            logger.info(
+                "[VOICE:TELNYX] streaming started call_control_id=%s",
+                call_control_id,
+            )
+            return body_resp if isinstance(body_resp, dict) else {}
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code
+            error_detail = ""
+            try:
+                err_body = e.response.json()
+                errors = err_body.get("errors", [])
+                if errors and isinstance(errors, list):
+                    error_detail = errors[0].get("detail", str(errors[0]))
+                else:
+                    error_detail = str(err_body)[:200]
+            except Exception:
+                error_detail = e.response.text[:200] if e.response.text else ""
+            logger.error(
+                "[VOICE:TELNYX] streaming_start failed status=%d detail=%s",
+                status,
+                error_detail[:200],
+            )
+            raise RuntimeError(
+                f"Telnyx streaming_start failed (HTTP {status}): {error_detail}"
+            ) from e
+        except httpx.TimeoutException:
+            logger.error("[VOICE:TELNYX] streaming_start timed out")
+            raise RuntimeError("Telnyx streaming_start timed out")
+        except httpx.HTTPError as e:
+            logger.error(
+                "[VOICE:TELNYX] streaming_start network error type=%s",
+                type(e).__name__,
+            )
+            raise RuntimeError(f"Telnyx HTTP error: {e}") from e
+
     async def close(self) -> None:
         """Release the underlying httpx client."""
         await self._client.aclose()

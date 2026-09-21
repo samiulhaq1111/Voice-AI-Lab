@@ -1,13 +1,23 @@
 """Telnyx Call Control V2 webhook endpoint (Phase 6C — telephony).
 
-Receives Telnyx webhook events, answers inbound calls, and issues a
-fixed greeting speak action. No AI/media/STT/TTS yet.
+Receives Telnyx webhook events, answers inbound calls, speaks a greeting,
+and starts bidirectional media streaming. Includes a WebSocket endpoint
+for Telnyx media stream connections with Deepgram realtime STT and
+AgentRuntime integration.
+
+Milestone 6 flow:
+    Telnyx PCMU 8kHz → Deepgram PCM 16kHz → transcript
+    → utterance_end → AgentRuntime → text response (logged only, no TTS)
 """
 
-from fastapi import APIRouter, Request
+import json
+
+from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
+from app.core.config import settings
 from app.core.logging import logger
+from app.services.telnyx_media import MediaStreamSession
 
 router = APIRouter()
 
@@ -25,26 +35,18 @@ async def telnyx_webhook(request: Request) -> JSONResponse:
         logger.warning("[VOICE:TELNYX] Webhook received with non-JSON body")
         return JSONResponse(status_code=200, content={"status": "ok"})
 
-    logger.info("[VOICE:TELNYX] Webhook received")
-
     # Extract fields defensively — Telnyx envelope may vary
     data = body.get("data", {}) if isinstance(body, dict) else {}
     event_type = data.get("event_type", "") if isinstance(data, dict) else ""
-    event_id = data.get("id", "") if isinstance(data, dict) else ""
 
     payload = data.get("payload", {}) if isinstance(data, dict) else {}
     call_control_id = (
         payload.get("call_control_id", "") if isinstance(payload, dict) else ""
     )
 
-    if event_type:
-        logger.info("[VOICE:TELNYX] event_type=%s", event_type)
-    if event_id:
-        logger.info("[VOICE:TELNYX] event_id=%s", event_id)
-    if call_control_id:
-        logger.info("[VOICE:TELNYX] call_control_id=%s", call_control_id)
+    logger.info("[VOICE:TELNYX] %s", event_type or "webhook")
 
-    # Answer inbound call on call.initiated, then speak greeting
+    # Answer inbound call on call.initiated, speak greeting, start media stream
     if event_type == "call.initiated" and call_control_id:
         await _handle_inbound_call(call_control_id)
 
@@ -52,7 +54,7 @@ async def telnyx_webhook(request: Request) -> JSONResponse:
 
 
 async def _handle_inbound_call(call_control_id: str) -> None:
-    """Answer an inbound call and speak a fixed greeting."""
+    """Answer an inbound call, speak greeting, then start media streaming."""
     from app.services.telnyx_client import TelnyxCallControlClient
 
     greeting = "Hello, this is the Voice AI Lab."
@@ -61,6 +63,15 @@ async def _handle_inbound_call(call_control_id: str) -> None:
         client = TelnyxCallControlClient()
         await client.answer_call(call_control_id)
         await client.speak(call_control_id, greeting)
+        # Start bidirectional media streaming after speak
+        ws_url = settings.telnyx_media_ws_url
+        if ws_url:
+            await client.streaming_start(call_control_id, ws_url)
+        else:
+            logger.warning(
+                "[VOICE:TELNYX] TELNYX_MEDIA_WS_URL not configured — "
+                "skipping media stream"
+            )
     except ValueError as e:
         logger.error("[VOICE:TELNYX] Cannot handle call — %s", e)
     except RuntimeError as e:
@@ -77,3 +88,102 @@ async def _handle_inbound_call(call_control_id: str) -> None:
                 await client.close()
             except Exception:
                 pass
+
+
+@router.websocket("/api/v1/voice/telephony/media")
+async def telnyx_media_ws(websocket: WebSocket) -> None:
+    """WebSocket endpoint for Telnyx bidirectional media streaming.
+
+    Telnyx connects here after streaming_start. We receive media events,
+    forward audio to Deepgram for realtime STT, and on utterance_end
+    process the transcript through AgentRuntime.
+
+    Milestone 6: Telnyx → Deepgram → AgentRuntime → text response (logged).
+    """
+    from app.services.telnyx_agent import TelephonyAgentSession
+    from app.services.telnyx_deepgram import TelnyxDeepgramBridge
+
+    await websocket.accept()
+    session = MediaStreamSession()
+    bridge = TelnyxDeepgramBridge()
+    agent: TelephonyAgentSession | None = None
+
+    try:
+        while True:
+            raw = await websocket.receive_text()
+
+            # Parse message to extract event type
+            try:
+                msg = json.loads(raw)
+                event = msg.get("event", "") if isinstance(msg, dict) else ""
+            except json.JSONDecodeError:
+                event = ""
+
+            # Handle start event — initialize Deepgram bridge + agent
+            if event == "start":
+                stream_id = msg.get("stream_id", "")
+                call_control_id = (
+                    msg.get("start", {}).get("call_control_id", "")
+                )
+                session.handle_message(raw)
+                try:
+                    await bridge.start(stream_id)
+                    # Start agent session (consumes from bridge.utterance_queue)
+                    agent = TelephonyAgentSession(
+                        call_control_id=call_control_id or stream_id,
+                        utterance_queue=bridge.utterance_queue,
+                    )
+                    await agent.start()
+                except Exception as e:
+                    logger.error(
+                        "[VOICE:TELNYX:MEDIA] Session start failed "
+                        "error=%s",
+                        e,
+                    )
+                continue
+
+            # Handle media event — forward to bridge and send test audio
+            if event == "media":
+                session.handle_message(raw)
+                media_data = msg.get("media", {})
+
+                # Forward to Deepgram bridge (non-blocking)
+                if bridge._running:
+                    await bridge.process_media_packet(media_data)
+
+                # Send test audio back (existing Milestone 4 behavior)
+                outbound = session.next_outbound_media()
+                if outbound is not None:
+                    await websocket.send_text(json.dumps(outbound))
+                continue
+
+            # Handle stop event — stop bridge and agent
+            if event == "stop":
+                session.handle_message(raw)
+                if agent:
+                    await agent.stop()
+                await bridge.stop()
+                continue
+
+            # Handle other events (connected, unknown)
+            session.handle_message(raw)
+
+    except WebSocketDisconnect:
+        logger.info(
+            "[VOICE:TELNYX] call.completed turns=%d "
+            "stt_turns=%d inbound_packets=%d",
+            agent.turn if agent else 0,
+            bridge.utterances_emitted,
+            session.media_packets_in,
+        )
+    except Exception as e:
+        logger.error(
+            "[VOICE:TELNYX:MEDIA] WebSocket error type=%s: %s",
+            type(e).__name__,
+            e,
+        )
+    finally:
+        # Ensure cleanup on any exit
+        if agent:
+            await agent.stop()
+        await bridge.stop()

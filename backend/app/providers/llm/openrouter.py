@@ -41,8 +41,8 @@ class OpenRouterAdapter(LLMInterface):
                 "Content-Type": "application/json",
             },
         )
-        logger.info(
-            "OpenRouter adapter initialized (model=%s)",
+        logger.debug(
+            "OpenRouter adapter initialized model=%s",
             self._default_model or "default",
         )
 
@@ -69,24 +69,10 @@ class OpenRouterAdapter(LLMInterface):
             max_tokens,
         )
 
-        logger.info(
-            "[OPENROUTER] Request started model=%s message_count=%d "
-            "tool_count=%d api_key_configured=%s",
-            resolved_model,
-            len(messages),
-            len(tools) if tools else 0,
-            bool(self._api_key),
-        )
-
         request_start = time.monotonic()
         try:
             response = await self._client.post(_OPENROUTER_CHAT_URL, json=payload)
             duration_ms = (time.monotonic() - request_start) * 1000
-            logger.info(
-                "[OPENROUTER] Response received status=%d duration_ms=%.0f",
-                response.status_code,
-                duration_ms,
-            )
             response.raise_for_status()
 
         except httpx.HTTPStatusError as e:
@@ -99,13 +85,16 @@ class OpenRouterAdapter(LLMInterface):
                 detail = e.response.text[:200]
             if status == 401:
                 logger.error(
-                    "[OPENROUTER] Authentication failed status=401 duration_ms=%.0f",
+                    "[LLM] provider=openrouter model=%s status=error "
+                    "duration_ms=%.0f error=auth_failed",
+                    resolved_model,
                     duration_ms,
                 )
                 raise RuntimeError("OpenRouter authentication failed") from e
             logger.error(
-                "[OPENROUTER] Request failed status=%d duration_ms=%.0f detail=%s",
-                status,
+                "[LLM] provider=openrouter model=%s status=error "
+                "duration_ms=%.0f error=%s",
+                resolved_model,
                 duration_ms,
                 detail[:200],
             )
@@ -114,23 +103,27 @@ class OpenRouterAdapter(LLMInterface):
         except httpx.TimeoutException:
             duration_ms = (time.monotonic() - request_start) * 1000
             logger.error(
-                "[OPENROUTER] Request timed out after %.1fs duration_ms=%.0f",
-                self._timeout,
+                "[LLM] provider=openrouter model=%s status=error "
+                "duration_ms=%.0f error=timeout",
+                resolved_model,
                 duration_ms,
             )
             raise RuntimeError("OpenRouter request timed out")
 
         except httpx.HTTPError as e:
-            logger.error("[OPENROUTER] HTTP error type=%s", type(e).__name__)
+            logger.error("[LLM] provider=openrouter model=%s error_type=%s",
+                         resolved_model, type(e).__name__)
             raise RuntimeError(f"OpenRouter HTTP error: {e}") from e
 
         data = response.json()
         result = self._parse_response(data)
         logger.info(
-            "[OPENROUTER] Response parsed has_content=%s tool_calls=%s finish=%s",
-            bool(result.content),
-            bool(result.tool_calls),
-            result.finish_reason,
+            "[LLM] provider=openrouter model=%s duration_ms=%.0f "
+            "tokens_in=%s tokens_out=%s",
+            resolved_model,
+            duration_ms,
+            result.usage.get("prompt_tokens", "n/a"),
+            result.usage.get("completion_tokens", "n/a"),
         )
         return result
 
@@ -270,8 +263,8 @@ class OpenRouterAdapter(LLMInterface):
             "total_tokens": usage_data.get("total_tokens", 0),
         }
 
-        logger.info(
-            "OpenRouter response (tokens=%s, finish=%s)",
+        logger.debug(
+            "OpenRouter response tokens=%s finish=%s",
             usage.get("total_tokens"),
             finish_reason,
         )

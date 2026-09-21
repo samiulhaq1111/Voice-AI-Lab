@@ -22,6 +22,10 @@ def setup_logging() -> None:
     logging.getLogger("httpcore.connection").setLevel(logging.WARNING)
     logging.getLogger("httpcore.http11").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)
+    # Suppress low-level WebSocket transport frame/payload logs
+    logging.getLogger("websockets.client").setLevel(logging.WARNING)
+    logging.getLogger("websockets.server").setLevel(logging.WARNING)
+    logging.getLogger("websockets.protocol").setLevel(logging.WARNING)
     sa_level = logging.WARNING if not settings.app_debug else logging.INFO
     logging.getLogger("sqlalchemy.engine").setLevel(sa_level)
 

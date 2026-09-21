@@ -8,6 +8,7 @@ and the ToolExecutor — NOT on concrete providers.
 """
 
 import json
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -142,7 +143,11 @@ class AgentRuntime:
         Returns:
             AgentResult with response, tool_calls, usage, iterations.
         """
-        logger.info("Agent start (input=%s...)", text[:80])
+        run_start = time.monotonic()
+        logger.info(
+            "[AGENT] turn start model=%s",
+            self._config.llm_model or "default",
+        )
 
         # Seed state with prior conversation history if provided
         if initial_messages:
@@ -152,15 +157,29 @@ class AgentRuntime:
         self._state.messages.append(LLMMessage(role="user", content=text))
 
         # Run the LLM with tool-call loop
-        result = await self._run_agent_loop(on_tool_call=on_tool_call)
+        try:
+            result = await self._run_agent_loop(on_tool_call=on_tool_call)
+        except Exception as e:
+            total_ms = (time.monotonic() - run_start) * 1000
+            logger.error(
+                "[AGENT] AgentRuntime.failed model=%s total_ms=%.0f "
+                "error_type=%s error=%s",
+                self._config.llm_model or "default",
+                total_ms,
+                type(e).__name__,
+                e,
+            )
+            raise
 
         # Add assistant response to history
         self._state.messages.append(LLMMessage(role="assistant", content=result.response))
 
+        total_ms = (time.monotonic() - run_start) * 1000
         logger.info(
-            "Agent completion (iterations=%d, tool_calls=%d)",
+            "[AGENT] turn completed iterations=%d tools=%d total_ms=%.0f",
             result.iterations,
             len(result.tool_calls),
+            total_ms,
         )
         return result
 
@@ -174,16 +193,19 @@ class AgentRuntime:
         all_tool_calls: list[dict[str, Any]] = []
         total_usage: dict[str, int] = {}
         iterations = 0
+        loop_start = time.monotonic()
 
         for round_num in range(self._config.max_tool_rounds):
             iterations += 1
             messages = self._build_messages()
+            iter_start = time.monotonic()
 
-            logger.info(
-                "[AGENT] Iteration started iteration=%d messages=%d tools=%d",
+            logger.debug(
+                "[AGENT] iteration=%d messages=%d tools=%d model=%s",
                 iterations,
                 len(messages),
                 len(tool_schemas),
+                self._config.llm_model or "default",
             )
 
             response: LLMResponse = await self._llm.chat(
@@ -194,15 +216,19 @@ class AgentRuntime:
                 max_tokens=self._config.max_tokens,
             )
 
+            iter_ms = (time.monotonic() - iter_start) * 1000
+
             # Accumulate usage
             for key, val in response.usage.items():
                 total_usage[key] = total_usage.get(key, 0) + val
 
-            logger.info(
-                "[AGENT] LLM response received has_content=%s tool_calls=%d finish=%s",
-                bool(response.content),
+            logger.debug(
+                "[AGENT] LLM response iteration=%d tool_calls=%d "
+                "finish=%s iter_ms=%.0f",
+                iterations,
                 len(response.tool_calls or []),
                 response.finish_reason,
+                iter_ms,
             )
 
             # If no tool calls, return the text response
@@ -215,8 +241,8 @@ class AgentRuntime:
                 )
 
             # Handle tool calls
-            logger.info(
-                "[AGENT] Tool calls requested count=%d iteration=%d",
+            logger.debug(
+                "[AGENT] tool_calls=%d iteration=%d",
                 len(response.tool_calls),
                 iterations,
             )
@@ -234,9 +260,16 @@ class AgentRuntime:
             for tool_call in response.tool_calls:
                 all_tool_calls.append(tool_call)
                 tool_name = tool_call.get("function", {}).get("name", "")
-                logger.info("[AGENT] Tool call requested name=%s", tool_name)
+                tool_start = time.monotonic()
+                logger.debug("[AGENT] tool executing name=%s", tool_name)
                 raw_result, duration_ms = await self._execute_tool_call(tool_call)
-                logger.info("[AGENT] Tool call completed name=%s", tool_name)
+                tool_ms = (time.monotonic() - tool_start) * 1000
+                logger.info(
+                    "[AGENT] tool=%s duration_ms=%.0f success=%s",
+                    tool_name,
+                    tool_ms,
+                    not (isinstance(raw_result, dict) and "error" in raw_result),
+                )
                 result_dict: dict[str, Any] = {
                     "name": tool_call.get("function", {}).get("name", ""),
                     "success": not (isinstance(raw_result, dict) and "error" in raw_result),
@@ -263,9 +296,12 @@ class AgentRuntime:
                 )
 
         # Safety: max rounds exceeded
+        total_ms = (time.monotonic() - loop_start) * 1000
         logger.warning(
-            "[AGENT] Maximum iterations reached max_iterations=%d",
+            "[AGENT] Maximum iterations reached max_iterations=%d "
+            "total_ms=%.0f",
             self._config.max_tool_rounds,
+            total_ms,
         )
         msg = "I apologize, but I was unable to complete the request within the allowed steps."
         return AgentResult(
@@ -285,7 +321,7 @@ class AgentRuntime:
         tool_name = function_data.get("name", "")
         arguments_str = function_data.get("arguments", "{}")
 
-        logger.info("Executing tool: %s", tool_name)
+        logger.debug("Executing tool: %s", tool_name)
 
         result = await self._tool_executor.execute_from_json(tool_name, arguments_str)
 
