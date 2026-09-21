@@ -226,6 +226,8 @@ export default function RealtimeStt() {
           wsRef.current?.close();
           break;
         case 'error':
+          setAgentProcessing(false);
+          setTtsProcessing(false);
           setError(event.message);
           addLog('error', `${event.stage ? `[${event.stage}] ` : ''}${event.message}`);
           teardownAudio();

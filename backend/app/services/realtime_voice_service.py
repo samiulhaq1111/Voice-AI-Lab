@@ -18,6 +18,7 @@ The WebSocket endpoint remains responsible for:
 """
 
 import json
+import time
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -34,6 +35,12 @@ from app.providers.llm.interface import LLMInterface
 from app.providers.types import LLMMessage
 from app.services.tool_service import get_tool_registry
 from app.tools.executor import ToolExecutor
+
+# Browser Realtime default LLM model.
+# The global default (settings.default_llm_model) may point to a slow free-tier
+# model.  The browser realtime path uses a fast, reliable model so that
+# conversational turns complete quickly.
+_REALTIME_DEFAULT_LLM_MODEL = "openai/gpt-4o-mini"
 
 
 class RealtimeVoiceError(Exception):
@@ -171,7 +178,7 @@ def create_realtime_session(
         The created VoiceSession.
     """
     resolved_provider = llm_provider or settings.default_llm_provider
-    resolved_model = llm_model or settings.default_llm_model or None
+    resolved_model = llm_model or _REALTIME_DEFAULT_LLM_MODEL
 
     session = VoiceSession(
         status="active",
@@ -231,9 +238,19 @@ async def process_realtime_utterance(
         except ValueError as e:
             raise RealtimeVoiceError(str(e)) from e
 
+    logger.info(
+        "[REALTIME] llm_start session=%s provider=%s model=%s",
+        sid, resolved_provider, resolved_model,
+    )
+
     # Load conversation history BEFORE the agent loop
+    history_load_start = time.monotonic()
     history = _load_history(db, sid)
-    logger.info("[REALTIME] Loaded %d history messages for session %s", len(history), sid)
+    history_ms = (time.monotonic() - history_load_start) * 1000
+    logger.info(
+        "[REALTIME] history_loaded session=%s messages=%d ms=%.0f",
+        sid, len(history), history_ms,
+    )
 
     # Build agent
     tool_registry = get_tool_registry()
@@ -250,6 +267,7 @@ async def process_realtime_utterance(
     )
 
     # Run agent loop
+    agent_start = time.monotonic()
     try:
         result: AgentResult = await runtime.run(
             transcript,
@@ -257,20 +275,20 @@ async def process_realtime_utterance(
             on_tool_call=on_tool_call,
         )
     except Exception as e:
+        agent_ms = (time.monotonic() - agent_start) * 1000
         logger.error(
-            "[REALTIME] Utterance processing failed session_id=%s error_type=%s error=%s",
-            sid,
-            type(e).__name__,
-            str(e),
+            "[REALTIME] llm_failed session_id=%s duration_ms=%.0f "
+            "error_type=%s error=%s",
+            sid, agent_ms, type(e).__name__, str(e),
         )
         raise RealtimeVoiceError(f"Agent error: {e}") from e
 
+    agent_ms = (time.monotonic() - agent_start) * 1000
     response_text = result.response
     logger.info(
-        "[REALTIME] Utterance processing completed session_id=%s iterations=%d tool_calls=%d",
-        sid,
-        result.iterations,
-        len(result.tool_calls),
+        "[REALTIME] llm_complete session_id=%s duration_ms=%.0f "
+        "iterations=%d tool_calls=%d",
+        sid, agent_ms, result.iterations, len(result.tool_calls),
     )
 
     # Save all new messages from runtime state.

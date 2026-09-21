@@ -43,6 +43,7 @@ from dataclasses import dataclass, field
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.core.database import SessionLocal
 from app.core.logging import logger
 from app.providers.factory import get_llm_provider, get_tts_provider
@@ -63,8 +64,6 @@ router = APIRouter()
 
 # How long to wait for the provider stream to drain after STOP
 _STOP_DRAIN_TIMEOUT_S = 5.0
-# Log every Nth audio chunk (avoid per-frame log spam)
-_AUDIO_LOG_EVERY_N = 100
 
 
 @dataclass
@@ -231,11 +230,6 @@ async def _pump_provider_events(
                     f"{prev} {event.text}".strip() if prev else event.text
                 )
                 state.utterance_finalized = True
-                logger.info(
-                    "[REALTIME:STT] transcript_final text='%s' buffer='%s'",
-                    event.text[:80],
-                    state.current_utterance_text[:80],
-                )
                 await ws.send_json(
                     {
                         "type": "transcript_final",
@@ -248,8 +242,8 @@ async def _pump_provider_events(
                 if timings.first_utterance_end_at is None:
                     timings.first_utterance_end_at = time.monotonic()
                 logger.info(
-                    "[REALTIME:AGENT] utterance_end received from provider "
-                    "buffer='%s' finalized=%s",
+                    "[REALTIME] utterance_end turn=%d buffer='%s' finalized=%s",
+                    timings.utterance_end_count,
                     state.current_utterance_text[:80],
                     state.utterance_finalized,
                 )
@@ -261,19 +255,17 @@ async def _pump_provider_events(
                     transcript = state.current_utterance_text
                     state.current_utterance_text = ""
                     state.utterance_finalized = False
-                    logger.info(
-                        "[REALTIME:AGENT] enqueue_utterance text='%s' "
-                        "queue_size=%d",
+                    logger.debug(
+                        "[REALTIME] enqueue_utterance text='%s'",
                         transcript[:80],
-                        state.utterance_queue.qsize(),
                     )
                     state.utterance_queue.put_nowait(transcript)
                 else:
                     # Empty utterance — reset state, do not enqueue
                     state.current_utterance_text = ""
                     state.utterance_finalized = False
-                    logger.info(
-                        "[REALTIME:AGENT] skipping empty utterance_end"
+                    logger.debug(
+                        "[REALTIME] skipping empty utterance_end"
                     )
             elif event.type == "error":
                 await ws.send_json(
@@ -333,21 +325,24 @@ async def _agent_worker(
             break
 
         state.agent_processing = True
+        utterance_start = time.monotonic()
+        turn = timings.agent_response_count + 1
         logger.info(
-            "[REALTIME:WORKER] processing utterance text='%s' length=%d "
-            "queue_remaining=%d",
+            "[REALTIME] agent_start turn=%d transcript='%s'",
+            turn,
             transcript[:80],
-            len(transcript),
-            state.utterance_queue.qsize(),
         )
 
         try:
             # Send agent_processing event
             await ws.send_json({"type": "agent_processing"})
-            logger.info("[REALTIME:WORKER] agent_processing event sent")
 
             if state.db is None or state.voice_session_id is None:
-                logger.error("[REALTIME:WORKER] cannot process — no session")
+                logger.error(
+                    "[REALTIME] error turn=%d stage=agent "
+                    "error=session_not_initialized",
+                    turn,
+                )
                 await ws.send_json(
                     {
                         "type": "error",
@@ -366,7 +361,11 @@ async def _agent_worker(
                 .first()
             )
             if voice_session is None:
-                logger.error("[REALTIME:WORKER] voice session not found")
+                logger.error(
+                    "[REALTIME] error turn=%d stage=agent "
+                    "error=session_not_found",
+                    turn,
+                )
                 await ws.send_json(
                     {
                         "type": "error",
@@ -377,21 +376,33 @@ async def _agent_worker(
                 continue
 
             # Process utterance through AgentRuntime
-            logger.info("[REALTIME:WORKER] calling RealtimeVoiceService")
+            resolved_model = (
+                voice_session.llm_model
+                or settings.default_llm_model
+                or "default"
+            )
+            logger.info(
+                "[REALTIME] agent_processing turn=%d model=%s",
+                turn,
+                resolved_model,
+            )
             result = await process_realtime_utterance(
                 db=state.db,
                 session=voice_session,
                 transcript=transcript,
                 llm=state.llm,
             )
-            logger.info("[REALTIME:WORKER] AgentRuntime returned")
-
-            timings.agent_response_count += 1
+            utterance_ms = (time.monotonic() - utterance_start) * 1000
             logger.info(
-                "[REALTIME:WORKER] agent response iterations=%d tool_calls=%d",
+                "[REALTIME] agent_response turn=%d duration_ms=%.0f "
+                "iterations=%d tool_calls=%d",
+                turn,
+                utterance_ms,
                 result["iterations"],
                 len(result["tool_calls"]),
             )
+
+            timings.agent_response_count += 1
 
             # Send agent_response event
             await ws.send_json(
@@ -402,7 +413,6 @@ async def _agent_worker(
                     "iterations": result["iterations"],
                 }
             )
-            logger.info("[REALTIME:WORKER] agent_response sent")
 
             # --- TTS synthesis (Phase 6B.2) ---
             response_text = result["response"]
@@ -410,9 +420,8 @@ async def _agent_worker(
                 try:
                     await ws.send_json({"type": "tts_processing"})
                     logger.info(
-                        "[REALTIME:WORKER] tts_processing event sent "
-                        "text_length=%d",
-                        len(response_text),
+                        "[REALTIME] tts_processing turn=%d",
+                        turn,
                     )
 
                     tts_start = time.monotonic()
@@ -438,21 +447,17 @@ async def _agent_worker(
                     timings.tts_characters += len(response_text)
 
                     logger.info(
-                        "[REALTIME:WORKER] audio sent format=%s "
-                        "audio_bytes=%d characters=%d tts_latency_ms=%.0f",
-                        tts_result.content_type,
+                        "[REALTIME] audio_sent turn=%d bytes=%d tts_ms=%.0f",
+                        turn,
                         len(tts_result.audio_data),
-                        len(response_text),
                         tts_duration_ms,
                     )
 
                 except Exception as e:
                     logger.error(
-                        "[REALTIME:WORKER] TTS synthesis failed "
-                        "error_type=%s error=%s",
-                        type(e).__name__,
+                        "[REALTIME] error turn=%d stage=tts error=%s",
+                        turn,
                         str(e),
-                        exc_info=True,
                     )
                     try:
                         await ws.send_json(
@@ -466,13 +471,16 @@ async def _agent_worker(
                         pass
             elif response_text and state.tts is None:
                 logger.warning(
-                    "[REALTIME:WORKER] TTS skipped — no TTS provider"
+                    "[REALTIME] TTS skipped — no TTS provider"
                 )
 
         except RealtimeVoiceError as e:
+            elapsed_ms = (time.monotonic() - utterance_start) * 1000
             logger.error(
-                "[REALTIME:WORKER] utterance processing failed error=%s",
+                "[REALTIME] error turn=%d stage=agent error=%s duration_ms=%.0f",
+                turn,
                 e.message,
+                elapsed_ms,
             )
             try:
                 await ws.send_json(
@@ -485,10 +493,12 @@ async def _agent_worker(
             except Exception:
                 pass
         except Exception as e:
+            elapsed_ms = (time.monotonic() - utterance_start) * 1000
             logger.error(
-                "[REALTIME:WORKER] utterance processing failed "
-                "error_type=%s",
+                "[REALTIME] error turn=%d stage=agent error_type=%s duration_ms=%.0f",
+                turn,
                 type(e).__name__,
+                elapsed_ms,
                 exc_info=True,
             )
             try:
@@ -629,17 +639,9 @@ async def _handle_realtime_session(ws: WebSocket) -> None:
                 timings.audio_bytes += len(chunk)
                 if timings.first_audio_at is None:
                     timings.first_audio_at = time.monotonic()
-                    logger.info(
-                        "[VOICE:REALTIME] client_audio chunk=1 bytes=%d (first)",
+                    logger.debug(
+                        "[VOICE:REALTIME] client_audio first chunk bytes=%d",
                         len(chunk),
-                    )
-                elif timings.audio_chunks % _AUDIO_LOG_EVERY_N == 0:
-                    logger.info(
-                        "[VOICE:REALTIME] client_audio chunk=%d bytes=%d "
-                        "total_bytes=%d",
-                        timings.audio_chunks,
-                        len(chunk),
-                        timings.audio_bytes,
                     )
                 try:
                     await session.send_audio(chunk)
@@ -722,9 +724,8 @@ async def _handle_realtime_session(ws: WebSocket) -> None:
                     # Pre-create TTS provider for reuse (session-level)
                     try:
                         state.tts = get_tts_provider()
-                        logger.info(
-                            "[VOICE:REALTIME] TTS provider created "
-                            "provider=%s",
+                        logger.debug(
+                            "[VOICE:REALTIME] TTS provider created provider=%s",
                             state.tts.provider_name,
                         )
                     except Exception as e:

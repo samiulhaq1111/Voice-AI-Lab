@@ -1931,3 +1931,89 @@ class TestTTSSynthesis:
             get_tts_patcher.stop()
             _stop_patchers(patchers)
             holder["patcher"].stop()
+
+
+# ---------------------------------------------------------------------------
+# Model resolution: Browser Realtime defaults to gpt-4o-mini
+# ---------------------------------------------------------------------------
+
+
+class TestRealtimeModelResolution:
+    """Verify the Browser Realtime default LLM model.
+
+    The realtime path uses a dedicated default (openai/gpt-4o-mini)
+    instead of the global default (which may be a slow free-tier model).
+    """
+
+    def test_default_model_is_gpt4o_mini(self) -> None:
+        """START without explicit model => openai/gpt-4o-mini."""
+        from unittest.mock import MagicMock
+
+        from app.services.realtime_voice_service import (
+            _REALTIME_DEFAULT_LLM_MODEL,
+            create_realtime_session,
+        )
+
+        mock_db = MagicMock()
+        mock_session = MagicMock()
+        mock_session.id = "test-session"
+        mock_session.llm_provider = "openrouter"
+        mock_session.llm_model = _REALTIME_DEFAULT_LLM_MODEL
+        mock_db.add.return_value = None
+        mock_db.commit.return_value = None
+        mock_db.refresh.return_value = None
+
+        with patch(
+            "app.services.realtime_voice_service.VoiceSession",
+            return_value=mock_session,
+        ):
+            with patch(
+                "app.services.realtime_voice_service.settings"
+            ) as mock_settings:
+                # Global default is a slow free model
+                mock_settings.default_llm_provider = "openrouter"
+                mock_settings.default_llm_model = (
+                    "nvidia/nemotron-3.5-lightning:free"
+                )
+                # Call with no explicit model
+                result = create_realtime_session(
+                    db=mock_db,
+                    llm_provider="openrouter",
+                    llm_model=None,
+                )
+        # The session should use gpt-4o-mini, NOT the global default
+        assert result.llm_model == "openai/gpt-4o-mini"
+
+    def test_explicit_model_preserved(self) -> None:
+        """START with explicit model => requested model is preserved."""
+        from unittest.mock import MagicMock
+
+        from app.services.realtime_voice_service import create_realtime_session
+
+        mock_db = MagicMock()
+        mock_session = MagicMock()
+        mock_session.id = "test-session-2"
+        mock_session.llm_provider = "openrouter"
+        mock_session.llm_model = "anthropic/claude-3.5-sonnet"
+        mock_db.add.return_value = None
+        mock_db.commit.return_value = None
+        mock_db.refresh.return_value = None
+
+        with patch(
+            "app.services.realtime_voice_service.VoiceSession",
+            return_value=mock_session,
+        ):
+            result = create_realtime_session(
+                db=mock_db,
+                llm_provider="openrouter",
+                llm_model="anthropic/claude-3.5-sonnet",
+            )
+        assert result.llm_model == "anthropic/claude-3.5-sonnet"
+
+    def test_realtime_default_constant(self) -> None:
+        """The realtime default model constant is gpt-4o-mini."""
+        from app.services.realtime_voice_service import (
+            _REALTIME_DEFAULT_LLM_MODEL,
+        )
+
+        assert _REALTIME_DEFAULT_LLM_MODEL == "openai/gpt-4o-mini"
