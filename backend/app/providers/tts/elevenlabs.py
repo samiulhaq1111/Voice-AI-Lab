@@ -11,6 +11,9 @@ from app.providers.tts.interface import TTSInterface
 from app.providers.types import TTSResult
 
 _ELEVENLABS_TTS_URL_TEMPLATE = "https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+_ELEVENLABS_TTS_STREAM_URL_TEMPLATE = (
+    "https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream"
+)
 _DEFAULT_VOICE = "JBFqnCBsd6RMkjVDRZzb"  # API-compatible Free tier voice
 _DEFAULT_OUTPUT_FORMAT = "mp3_44100_128"  # Free-tier compatible
 
@@ -219,13 +222,31 @@ class ElevenLabsAdapter(TTSInterface):
         voice: str | None = None,
         model: str | None = None,
         speed: float = 1.0,
+        output_format: str | None = None,
     ) -> AsyncIterator[bytes]:
-        """Stream synthesized audio chunks from ElevenLabs."""
+        """Stream synthesized audio chunks from ElevenLabs.
+
+        Uses the dedicated ElevenLabs streaming endpoint, which returns
+        chunked HTTP audio so playback can begin before generation ends.
+
+        Args:
+            text: Text to synthesize.
+            voice: Voice identifier override.
+            model: Model identifier override.
+            speed: Speech speed multiplier (unused by ElevenLabs).
+            output_format: Audio format identifier. Telephony callers pass
+                'ulaw_8000' to receive raw mu-law 8kHz bytes that need no
+                transcoding. Defaults to the adapter MP3 format.
+
+        Yields:
+            Raw audio byte chunks in the requested format.
+        """
         resolved_voice = voice or self._default_voice
         resolved_model = model or self._default_model
-        url = _ELEVENLABS_TTS_URL_TEMPLATE.format(voice_id=resolved_voice)
+        resolved_format = output_format or _DEFAULT_OUTPUT_FORMAT
+        url = _ELEVENLABS_TTS_STREAM_URL_TEMPLATE.format(voice_id=resolved_voice)
 
-        params = {"output_format": _DEFAULT_OUTPUT_FORMAT}
+        params = {"output_format": resolved_format}
 
         payload = {
             "text": text,
@@ -236,24 +257,55 @@ class ElevenLabsAdapter(TTSInterface):
             },
         }
 
+        stream_start = time.monotonic()
+        first_chunk_ms: float | None = None
+        total_bytes = 0
+        chunks = 0
+
         try:
             async with self._client.stream(
                 "POST",
                 url,
                 json=payload,
                 params=params,
+                headers={"Accept": "application/octet-stream"},
             ) as response:
                 response.raise_for_status()
                 async for chunk in response.aiter_bytes():
-                    if chunk:
-                        yield chunk
+                    if not chunk:
+                        continue
+                    chunks += 1
+                    total_bytes += len(chunk)
+                    if first_chunk_ms is None:
+                        first_chunk_ms = (time.monotonic() - stream_start) * 1000
+                        logger.info(
+                            "[VOICE:TTS] stream first_chunk provider=elevenlabs "
+                            "format=%s bytes=%d ttfa_ms=%.0f",
+                            resolved_format,
+                            len(chunk),
+                            first_chunk_ms,
+                        )
+                    yield chunk
+
+            logger.info(
+                "[VOICE:TTS] stream complete provider=elevenlabs format=%s "
+                "chunks=%d bytes=%d ttfa_ms=%s total_ms=%.0f",
+                resolved_format,
+                chunks,
+                total_bytes,
+                f"{first_chunk_ms:.0f}" if first_chunk_ms is not None else "n/a",
+                (time.monotonic() - stream_start) * 1000,
+            )
 
         except httpx.HTTPStatusError as e:
             logger.error(
-                "ElevenLabs stream error: HTTP %d",
+                "ElevenLabs stream error: HTTP %d (format=%s)",
                 e.response.status_code,
+                resolved_format,
             )
-            raise RuntimeError(f"ElevenLabs stream error: HTTP {e.response.status_code}") from e
+            raise RuntimeError(
+                f"ElevenLabs stream error: HTTP {e.response.status_code}"
+            ) from e
 
         except httpx.HTTPError as e:
             logger.error("ElevenLabs stream HTTP error: %s", e)

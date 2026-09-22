@@ -48,10 +48,12 @@ const EVENT_ICONS: Record<string, string> = {
   greeting_completed: '\u{1F50A}',
   media_connected: '\u{1F517}',
   stt_connected: '\u{1F399}',
+  caller_speech_final: '\u{1F399}',
   caller_transcript: '\u{1F399}',
   agent_processing: '\u{1F9E0}',
   agent_response: '\u2713',
   tts_processing: '\u{1F50A}',
+  tts_first_audio: '\u25B6',
   tts_completed: '\u2713',
   audio_streaming: '\u{1F4E1}',
   turn_completed: '\u2713',
@@ -80,6 +82,7 @@ function deriveState(
       return 'connected';
     case 'stt_connected':
       return 'listening';
+    case 'caller_speech_final':
     case 'caller_transcript':
       return 'listening';
     case 'agent_processing':
@@ -87,6 +90,7 @@ function deriveState(
     case 'agent_response':
       return 'processing';
     case 'tts_processing':
+    case 'tts_first_audio':
     case 'tts_completed':
     case 'audio_streaming':
       return 'speaking';
@@ -150,8 +154,27 @@ export default function TelephoneObservability() {
                 updated.transcript =
                   (event.metadata?.text as string) || event.message;
               }
+              if (event.type === 'agent_processing') {
+                updated.speech_final_to_utterance_end_ms =
+                  event.metadata?.speech_final_to_utterance_end_ms as
+                    | number
+                    | undefined;
+                updated.utterance_end_to_agent_ms =
+                  event.metadata?.utterance_end_to_agent_ms as
+                    | number
+                    | undefined;
+                updated.speech_final_to_agent_ms =
+                  event.metadata?.speech_final_to_agent_ms as
+                    | number
+                    | undefined;
+              }
               if (event.type === 'agent_response') {
                 updated.llm_duration_ms = event.metadata?.duration_ms as
+                  | number
+                  | undefined;
+              }
+              if (event.type === 'tts_first_audio') {
+                updated.first_audio_ms = event.metadata?.ttfa_ms as
                   | number
                   | undefined;
               }
@@ -159,9 +182,10 @@ export default function TelephoneObservability() {
                 updated.tts_duration_ms = event.metadata?.duration_ms as
                   | number
                   | undefined;
-              }
-              if (event.type === 'audio_streaming') {
                 updated.audio_bytes = event.metadata?.bytes as
+                  | number
+                  | undefined;
+                updated.audio_chunks = event.metadata?.chunks as
                   | number
                   | undefined;
               }
@@ -174,6 +198,20 @@ export default function TelephoneObservability() {
             if (event.type === 'caller_transcript') {
               newTurn.transcript =
                 (event.metadata?.text as string) || event.message;
+            }
+            if (event.type === 'agent_processing') {
+              newTurn.speech_final_to_utterance_end_ms =
+                event.metadata?.speech_final_to_utterance_end_ms as
+                  | number
+                  | undefined;
+              newTurn.utterance_end_to_agent_ms =
+                event.metadata?.utterance_end_to_agent_ms as
+                  | number
+                  | undefined;
+              newTurn.speech_final_to_agent_ms =
+                event.metadata?.speech_final_to_agent_ms as
+                  | number
+                  | undefined;
             }
             return [...prev, newTurn];
           });
@@ -297,14 +335,41 @@ export default function TelephoneObservability() {
                 </div>
               )}
               <div className="flex gap-4 text-xs text-gray-500 mt-1">
+                {t.speech_final_to_utterance_end_ms != null && (
+                  <span className="text-yellow-400">
+                    Speech→UtteranceEnd:{' '}
+                    {(t.speech_final_to_utterance_end_ms / 1000).toFixed(2)}s
+                  </span>
+                )}
+                {t.utterance_end_to_agent_ms != null && (
+                  <span>
+                    UtteranceEnd→Agent:{' '}
+                    {(t.utterance_end_to_agent_ms / 1000).toFixed(2)}s
+                  </span>
+                )}
+                {t.speech_final_to_agent_ms != null && (
+                  <span className="text-blue-400">
+                    Total STT delay:{' '}
+                    {(t.speech_final_to_agent_ms / 1000).toFixed(2)}s
+                  </span>
+                )}
                 {t.llm_duration_ms != null && (
                   <span>LLM: {(t.llm_duration_ms / 1000).toFixed(2)}s</span>
+                )}
+                {t.first_audio_ms != null && (
+                  <span className="text-green-400">
+                    First audio:{' '}
+                    {(t.first_audio_ms / 1000).toFixed(2)}s
+                  </span>
                 )}
                 {t.tts_duration_ms != null && (
                   <span>TTS: {(t.tts_duration_ms / 1000).toFixed(2)}s</span>
                 )}
                 {t.audio_bytes != null && (
                   <span>Audio: {(t.audio_bytes / 1024).toFixed(0)} KB</span>
+                )}
+                {t.audio_chunks != null && (
+                  <span>Frames: {t.audio_chunks}</span>
                 )}
               </div>
             </div>
@@ -338,8 +403,22 @@ export default function TelephoneObservability() {
                       return `${(v / 1000).toFixed(2)}s`;
                     if (k === 'total_ms' && typeof v === 'number')
                       return `${(v / 1000).toFixed(1)}s`;
+                    if (k === 'ttfa_ms' && typeof v === 'number')
+                      return `first audio ${(v / 1000).toFixed(2)}s`;
+                    if (k === 'playback_ms' && typeof v === 'number')
+                      return `${(v / 1000).toFixed(1)}s voice`;
                     if (k === 'bytes' && typeof v === 'number')
                       return `${(v / 1024).toFixed(0)} KB`;
+                    if (k === 'chunks' && typeof v === 'number')
+                      return `${v} frames`;
+                    if (k === 'speech_final_to_utterance_end_ms' && typeof v === 'number')
+                      return `speech→utterance ${(v / 1000).toFixed(2)}s`;
+                    if (k === 'utterance_end_to_agent_ms' && typeof v === 'number')
+                      return `utterance→agent ${(v / 1000).toFixed(2)}s`;
+                    if (k === 'speech_final_to_agent_ms' && typeof v === 'number')
+                      return `total ${(v / 1000).toFixed(2)}s`;
+                    if (k === 'last_word_end' && typeof v === 'number')
+                      return `last word ${v.toFixed(2)}s`;
                     if (k === 'model') return String(v);
                     return null;
                   })

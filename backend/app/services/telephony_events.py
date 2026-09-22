@@ -15,6 +15,7 @@ Architecture:
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import UTC, datetime
 from typing import Any
@@ -53,9 +54,9 @@ async def broadcast_telephony_event(
 ) -> None:
     """Broadcast a semantic telephony event to all connected observers.
 
-    This is fire-and-forget: if no observers are connected or a send
-    fails, the error is silently logged and the telephone pipeline
-    continues unaffected.
+    This is fire-and-forget: the broadcast is spawned as a background task
+    so the telephone pipeline never blocks on observer delivery. A stalled
+    or disconnected frontend observer cannot delay STT/agent processing.
 
     Args:
         event_type: Semantic event type (e.g. "agent_processing").
@@ -79,12 +80,24 @@ async def broadcast_telephony_event(
         event["metadata"] = metadata
 
     payload = json.dumps(event)
+    # Spawn a task so the caller returns immediately. The task handles
+    # timeouts and stale observer cleanup.
+    asyncio.create_task(_broadcast_payload(payload))
+
+
+async def _broadcast_payload(payload: str) -> None:
+    """Deliver payload to all observers with per-send timeout.
+
+    Observers that fail to receive within 100ms are marked stale and
+    removed from the set. This guarantees the telephone pipeline never
+    blocks on a slow frontend.
+    """
     stale: list[WebSocket] = []
 
     for ws in list(_observers):
         try:
-            await ws.send_text(payload)
-        except Exception:
+            await asyncio.wait_for(ws.send_text(payload), timeout=0.1)
+        except (TimeoutError, Exception):
             stale.append(ws)
 
     # Clean up disconnected observers

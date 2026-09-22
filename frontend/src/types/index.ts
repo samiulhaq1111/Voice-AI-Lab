@@ -589,10 +589,12 @@ export type TelephonyEventType =
   | 'greeting_completed'
   | 'media_connected'
   | 'stt_connected'
+  | 'caller_speech_final'
   | 'caller_transcript'
   | 'agent_processing'
   | 'agent_response'
   | 'tts_processing'
+  | 'tts_first_audio'
   | 'tts_completed'
   | 'audio_streaming'
   | 'turn_completed'
@@ -623,5 +625,10 @@ export interface TelephonyTurnInfo {
   response?: string;
   llm_duration_ms?: number;
   tts_duration_ms?: number;
+  first_audio_ms?: number;
   audio_bytes?: number;
+  audio_chunks?: number;
+  speech_final_to_utterance_end_ms?: number;
+  utterance_end_to_agent_ms?: number;
+  speech_final_to_agent_ms?: number;
 }

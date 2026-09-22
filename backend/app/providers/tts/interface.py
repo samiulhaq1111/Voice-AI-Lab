@@ -47,14 +47,23 @@ class TTSInterface(ABC):
         voice: str | None = None,
         model: str | None = None,
         speed: float = 1.0,
+        output_format: str | None = None,
     ) -> AsyncIterator[bytes]:
         """Stream synthesized audio in chunks.
+
+        Chunks are raw encoded-audio bytes in the requested output format.
+        Providers that expose a telephony-native format (e.g. ElevenLabs
+        'ulaw_8000') emit chunks that are directly playable without local
+        transcoding.
 
         Args:
             text: Text to synthesize.
             voice: Voice identifier override.
             model: Model identifier override.
             speed: Speech speed multiplier.
+            output_format: Provider-specific audio format identifier
+                (e.g. 'ulaw_8000', 'mp3_44100_128'). None uses the
+                provider default.
 
         Yields:
             Audio byte chunks.

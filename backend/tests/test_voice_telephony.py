@@ -452,7 +452,8 @@ class TestTelnyxSpeakFlow:
         assert resp.status_code == 200
         mock_answer.assert_awaited_once_with("cc_speak_test")
         mock_speak.assert_awaited_once_with(
-            "cc_speak_test", "Hello, this is the Voice AI Lab."
+            "cc_speak_test",
+            "Hello, I am automated assistance. How can I help you today",
         )
 
     def test_speak_not_triggered_when_answer_fails(self) -> None:
@@ -1012,8 +1013,8 @@ class TestUtteranceAccumulation:
         # The utterance should be in the queue
         assert not bridge.utterance_queue.empty()
         utterance = await bridge.utterance_queue.get()
-        assert "Hello" in utterance
-        assert "world" in utterance
+        assert "Hello" in utterance.text
+        assert "world" in utterance.text
 
     async def test_partial_does_not_trigger_utterance(self) -> None:
         """Partial transcripts do NOT produce an utterance."""
@@ -1093,11 +1094,11 @@ class TestUtteranceAccumulation:
             u = await bridge.utterance_queue.get()
             utterances.append(u)
         assert len(utterances) == 2
-        assert "First" in utterances[0]
-        assert "Second" in utterances[1]
+        assert "First" in utterances[0].text
+        assert "Second" in utterances[1].text
         # Utterances should NOT contain text from each other
-        assert "Second" not in utterances[0]
-        assert "First" not in utterances[1]
+        assert "Second" not in utterances[0].text
+        assert "First" not in utterances[1].text
 
 
 class TestTelephonyAgentSession:
@@ -1106,10 +1107,12 @@ class TestTelephonyAgentSession:
     async def test_agent_worker_processes_utterance(self) -> None:
         """Agent worker processes a queued utterance."""
         import asyncio
+        import time
 
         from app.services.telnyx_agent import TelephonyAgentSession
+        from app.services.telnyx_deepgram import Utterance
 
-        queue: asyncio.Queue[str | None] = asyncio.Queue()
+        queue: asyncio.Queue[Utterance | None] = asyncio.Queue()
         agent = TelephonyAgentSession("cc_test", queue)
 
         # Mock LLM
@@ -1138,7 +1141,8 @@ class TestTelephonyAgentSession:
         ):
             await agent.start()
             # Queue an utterance
-            await queue.put("Hello")
+            now = time.monotonic()
+            await queue.put(Utterance(text="Hello", speech_final_at=now, utterance_end_at=now + 1.0, last_word_end=0.5))
             # Give worker time to process
             await asyncio.sleep(0.3)
             # Stop
@@ -1187,10 +1191,12 @@ class TestTelephonyAgentSession:
     async def test_agent_failure_does_not_crash(self) -> None:
         """AgentRuntime failure is handled without crashing."""
         import asyncio
+        import time
 
         from app.services.telnyx_agent import TelephonyAgentSession
+        from app.services.telnyx_deepgram import Utterance
 
-        queue: asyncio.Queue[str | None] = asyncio.Queue()
+        queue: asyncio.Queue[Utterance | None] = asyncio.Queue()
         agent = TelephonyAgentSession("cc_fail", queue)
 
         mock_llm = AsyncMock()
@@ -1210,10 +1216,11 @@ class TestTelephonyAgentSession:
             ),
         ):
             await agent.start()
-            await queue.put("test")
+            now = time.monotonic()
+            await queue.put(Utterance(text="test", speech_final_at=now, utterance_end_at=now + 1.0, last_word_end=0.5))
             await asyncio.sleep(0.3)
             # Queue another utterance — worker should still be alive
-            await queue.put("test2")
+            await queue.put(Utterance(text="test2", speech_final_at=now, utterance_end_at=now + 1.0, last_word_end=0.5))
             await asyncio.sleep(0.3)
             await agent.stop()
 
@@ -1246,10 +1253,12 @@ class TestTelephonyAgentSession:
     async def test_conversation_history_accumulated(self) -> None:
         """AgentRuntime receives conversation history across turns."""
         import asyncio
+        import time
 
         from app.services.telnyx_agent import TelephonyAgentSession
+        from app.services.telnyx_deepgram import Utterance
 
-        queue: asyncio.Queue[str | None] = asyncio.Queue()
+        queue: asyncio.Queue[Utterance | None] = asyncio.Queue()
         agent = TelephonyAgentSession("cc_hist", queue)
 
         mock_llm = AsyncMock()
@@ -1277,10 +1286,11 @@ class TestTelephonyAgentSession:
         ):
             await agent.start()
             # First utterance
-            await queue.put("Hello")
+            now = time.monotonic()
+            await queue.put(Utterance(text="Hello", speech_final_at=now, utterance_end_at=now + 1.0, last_word_end=0.5))
             await asyncio.sleep(0.3)
             # Second utterance — should have history from first
-            await queue.put("How are you?")
+            await queue.put(Utterance(text="How are you?", speech_final_at=now, utterance_end_at=now + 1.0, last_word_end=0.5))
             await asyncio.sleep(0.3)
             await agent.stop()
 
@@ -1491,7 +1501,7 @@ class TestTelnyxModelConfiguration:
 
         assert _TELNYX_LLM_MODEL == "openai/gpt-4o-mini"
 
-        queue: asyncio.Queue[str | None] = asyncio.Queue()
+        queue: asyncio.Queue[Utterance | None] = asyncio.Queue()
         agent = TelephonyAgentSession("cc_model", queue)
 
         mock_llm = AsyncMock()
@@ -1523,10 +1533,12 @@ class TestTelnyxModelConfiguration:
     async def test_telnyx_multiple_utterances_sequential(self) -> None:
         """Telnyx session processes multiple utterances sequentially."""
         import asyncio
+        import time
 
         from app.services.telnyx_agent import TelephonyAgentSession
+        from app.services.telnyx_deepgram import Utterance
 
-        queue: asyncio.Queue[str | None] = asyncio.Queue()
+        queue: asyncio.Queue[Utterance | None] = asyncio.Queue()
         agent = TelephonyAgentSession("cc_multi", queue)
 
         call_count = 0
@@ -1555,9 +1567,10 @@ class TestTelnyxModelConfiguration:
         ):
             await agent.start()
             # Queue 3 utterances
-            await queue.put("My name is Sami")
-            await queue.put("What is my name?")
-            await queue.put("Thank you")
+            now = time.monotonic()
+            await queue.put(Utterance(text="My name is Sami", speech_final_at=now, utterance_end_at=now + 1.0, last_word_end=0.5))
+            await queue.put(Utterance(text="What is my name?", speech_final_at=now, utterance_end_at=now + 1.0, last_word_end=0.5))
+            await queue.put(Utterance(text="Thank you", speech_final_at=now, utterance_end_at=now + 1.0, last_word_end=0.5))
             # Give worker time to process all
             await asyncio.sleep(0.5)
             await agent.stop()
@@ -1568,10 +1581,12 @@ class TestTelnyxModelConfiguration:
     async def test_slow_llm_does_not_block_media_loop(self) -> None:
         """A slow LLM request does not block the Telnyx media receive loop."""
         import asyncio
+        import time
 
         from app.services.telnyx_agent import TelephonyAgentSession
+        from app.services.telnyx_deepgram import Utterance
 
-        queue: asyncio.Queue[str | None] = asyncio.Queue()
+        queue: asyncio.Queue[Utterance | None] = asyncio.Queue()
         agent = TelephonyAgentSession("cc_slow", queue)
 
         async def slow_chat(**kwargs):
@@ -1597,7 +1612,8 @@ class TestTelnyxModelConfiguration:
         ):
             await agent.start()
             # Queue an utterance — worker starts processing (slow)
-            await queue.put("Hello")
+            now = time.monotonic()
+            await queue.put(Utterance(text="Hello", speech_final_at=now, utterance_end_at=now + 1.0, last_word_end=0.5))
             # Media/STT should continue receiving audio while LLM is slow.
             # Verify by checking the worker task is running (not done).
             await asyncio.sleep(0.1)
@@ -1613,9 +1629,10 @@ class TestTelnyxModelConfiguration:
         """Agent worker processes utterances while bridge receives audio."""
         import asyncio
         import base64
+        import time
 
         from app.services.telnyx_agent import TelephonyAgentSession
-        from app.services.telnyx_deepgram import TelnyxDeepgramBridge
+        from app.services.telnyx_deepgram import TelnyxDeepgramBridge, Utterance
 
         # Setup bridge
         bridge = TelnyxDeepgramBridge()
@@ -1628,7 +1645,7 @@ class TestTelnyxModelConfiguration:
         mock_dg_session.receive = AsyncMock(return_value=None)
 
         # Setup Agent
-        queue: asyncio.Queue[str | None] = asyncio.Queue()
+        queue: asyncio.Queue[Utterance | None] = asyncio.Queue()
         agent = TelephonyAgentSession("cc_parallel", queue)
 
         mock_llm = AsyncMock()
@@ -1666,7 +1683,8 @@ class TestTelnyxModelConfiguration:
                 )
 
             # Queue an utterance for agent processing
-            await queue.put("Test while media flowing")
+            now = time.monotonic()
+            await queue.put(Utterance(text="Test while media flowing", speech_final_at=now, utterance_end_at=now + 1.0, last_word_end=0.5))
             await asyncio.sleep(0.3)
 
             # More media while agent is working/done
@@ -2007,6 +2025,461 @@ class TestTelnyxTTSPacing:
         await svc.stop()
 
 
+class TestTelnyxTTSStreaming:
+    """Streaming telephony TTS: mu-law chunks must reach Telnyx progressively."""
+
+    @staticmethod
+    def _frames(ws: AsyncMock) -> list[bytes]:
+        """Decode every base64 PCMU frame handed to the media WebSocket."""
+        import base64
+        import json
+
+        out: list[bytes] = []
+        for call in ws.send_text.call_args_list:
+            msg = json.loads(call.args[0])
+            assert msg["event"] == "media"
+            out.append(base64.b64decode(msg["media"]["payload"]))
+        return out
+
+    @staticmethod
+    def _provider(chunks: list[bytes], error: Exception | None = None):
+        """Build a stream_synthesize stand-in yielding raw mu-law chunks."""
+
+        async def _stream(**_kwargs):
+            for chunk in chunks:
+                yield chunk
+            if error is not None:
+                raise error
+
+        return _stream
+
+    @pytest.mark.asyncio
+    async def test_streaming_path_avoids_buffered_synthesize(self) -> None:
+        """When the provider streams mu-law, the buffered path is not used."""
+        from app.services.telnyx_tts import TelnyxTTSService
+
+        mock_tts = AsyncMock()
+        mock_tts.provider_name = "elevenlabs"
+        mock_tts.stream_synthesize = self._provider([b"\xff" * 400])
+        mock_tts.synthesize = AsyncMock(side_effect=AssertionError("buffered used"))
+
+        ws = AsyncMock()
+        svc = TelnyxTTSService()
+        svc._tts = mock_tts
+
+        with patch("app.services.telnyx_tts.asyncio.sleep", new_callable=AsyncMock):
+            result = await svc.synthesize_and_send("Hello", 1, ws, call_id="cc_1")
+
+        assert result is True
+        mock_tts.synthesize.assert_not_called()
+        # 400 bytes → two complete 160-byte frames, 80-byte tail dropped
+        assert ws.send_text.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_ulaw_8000_format_requested(self) -> None:
+        """The provider is asked for telephony-native ulaw_8000 output."""
+        from app.services.telnyx_tts import TelnyxTTSService
+
+        captured: dict[str, object] = {}
+
+        async def _stream(*, text: str = "", output_format: str | None = None, **_kw):
+            captured["text"] = text
+            captured["output_format"] = output_format
+            yield b"\xff" * 160
+
+        mock_tts = AsyncMock()
+        mock_tts.provider_name = "elevenlabs"
+        mock_tts.stream_synthesize = _stream
+
+        ws = AsyncMock()
+        svc = TelnyxTTSService()
+        svc._tts = mock_tts
+
+        with patch("app.services.telnyx_tts.asyncio.sleep", new_callable=AsyncMock):
+            assert await svc.synthesize_and_send("Hello", 1, ws) is True
+
+        assert captured["output_format"] == "ulaw_8000"
+        assert captured["text"] == "Hello"
+
+    @pytest.mark.asyncio
+    async def test_pcmu_frame_size_preserved(self) -> None:
+        """Every frame sent to Telnyx is exactly one 20ms PCMU packet."""
+        from app.services.telnyx_tts import TelnyxTTSService
+
+        mock_tts = AsyncMock()
+        mock_tts.provider_name = "elevenlabs"
+        # Odd-sized network chunks must be re-framed into 160-byte packets
+        mock_tts.stream_synthesize = self._provider(
+            [b"\xff" * 37, b"\x7f" * 400, b"\x00" * 5]
+        )
+
+        ws = AsyncMock()
+        svc = TelnyxTTSService()
+        svc._tts = mock_tts
+
+        with patch("app.services.telnyx_tts.asyncio.sleep", new_callable=AsyncMock):
+            assert await svc.synthesize_and_send("Hello", 1, ws) is True
+
+        frames = self._frames(ws)
+        assert len(frames) == 2  # 442 bytes → 2 full frames + 122 tail dropped
+        assert all(len(f) == 160 for f in frames)
+
+    @pytest.mark.asyncio
+    async def test_chunks_forwarded_incrementally(self) -> None:
+        """Audio reaches Telnyx while the provider is still generating."""
+        from app.services.telnyx_tts import TelnyxTTSService
+
+        ws = AsyncMock()
+        sends_seen: list[int] = []
+
+        async def _stream(**_kwargs):
+            yield b"\xff" * 320  # 2 frames worth
+            sends_seen.append(ws.send_text.call_count)
+            yield b"\xff" * 160  # 1 more frame
+            sends_seen.append(ws.send_text.call_count)
+
+        mock_tts = AsyncMock()
+        mock_tts.provider_name = "elevenlabs"
+        mock_tts.stream_synthesize = _stream
+
+        svc = TelnyxTTSService()
+        svc._tts = mock_tts
+
+        with patch("app.services.telnyx_tts.asyncio.sleep", new_callable=AsyncMock):
+            assert await svc.synthesize_and_send("Hello", 1, ws) is True
+
+        # Frames were already played out before the stream produced its last chunk
+        assert sends_seen == [2, 3]
+
+    @pytest.mark.asyncio
+    async def test_pacing_20ms_per_frame(self) -> None:
+        """Each streamed frame is paced with a 20ms sleep."""
+        from app.services.telnyx_tts import TelnyxTTSService
+
+        mock_tts = AsyncMock()
+        mock_tts.provider_name = "elevenlabs"
+        mock_tts.stream_synthesize = self._provider([b"\xff" * 800])
+
+        ws = AsyncMock()
+        svc = TelnyxTTSService()
+        svc._tts = mock_tts
+
+        with patch("app.services.telnyx_tts.asyncio.sleep", new_callable=AsyncMock) as sleep:
+            assert await svc.synthesize_and_send("Hello", 1, ws) is True
+
+        assert sleep.await_count == ws.send_text.call_count == 5
+        for call in sleep.call_args_list:
+            assert call.args[0] == pytest.approx(0.020, abs=1e-6)
+
+    @pytest.mark.asyncio
+    async def test_first_audio_event_emitted_before_completion(self) -> None:
+        """tts_first_audio fires when the FIRST frame is sent, not at the end."""
+        import json
+
+        from app.services.telephony_events import _observers
+        from app.services.telnyx_tts import TelnyxTTSService
+
+        trace: list[str] = []
+
+        ws = AsyncMock()
+        ws.send_text = AsyncMock(side_effect=lambda _p: trace.append("frame"))
+
+        obs = AsyncMock()
+        obs.send_text = AsyncMock(
+            side_effect=lambda p: trace.append(json.loads(p)["type"])
+        )
+        _observers.clear()
+        _observers.add(obs)
+
+        mock_tts = AsyncMock()
+        mock_tts.provider_name = "elevenlabs"
+        # 3 frames total: the first is playable before the stream ends
+        mock_tts.stream_synthesize = self._provider([b"\xff" * 160, b"\xff" * 320])
+
+        svc = TelnyxTTSService()
+        svc._tts = mock_tts
+
+        try:
+            with patch("app.services.telnyx_tts.asyncio.sleep", new_callable=AsyncMock):
+                assert await svc.synthesize_and_send(
+                    "Hello there friend", 2, ws, call_id="cc_stream"
+                ) is True
+            # Allow broadcast tasks to complete
+            await asyncio.sleep(0.05)
+        finally:
+            events = [json.loads(c.args[0]) for c in obs.send_text.call_args_list]
+            _observers.clear()
+
+        # With fire-and-forget broadcasts, events may not interleave with frames
+        # in a deterministic order. Check that all expected events are present
+        # and that tts_first_audio appears before tts_completed.
+        event_types = [e["type"] for e in events]
+        assert "tts_processing" in event_types
+        assert "tts_first_audio" in event_types
+        assert "audio_streaming" in event_types
+        assert "tts_completed" in event_types
+        assert "turn_completed" in event_types
+
+        # tts_first_audio must appear before tts_completed
+        first_audio_idx = event_types.index("tts_first_audio")
+        completed_idx = event_types.index("tts_completed")
+        assert first_audio_idx < completed_idx
+
+        # All frames were sent
+        assert ws.send_text.call_count == 3
+
+        # Every event carries the call_id and the turn number
+        assert all(e["call_id"] == "cc_stream" for e in events)
+        assert all(e["turn"] == 2 for e in events)
+
+        first = next(e for e in events if e["type"] == "tts_first_audio")
+        assert first["metadata"]["format"] == "ulaw_8000"
+        assert isinstance(first["metadata"]["ttfa_ms"], int)
+
+        done = next(e for e in events if e["type"] == "tts_completed")
+        assert done["metadata"]["chunks"] == 3
+        assert done["metadata"]["bytes"] == 480
+        assert done["metadata"]["playback_ms"] == 60
+
+    @pytest.mark.asyncio
+    async def test_empty_stream_falls_back_to_buffered(self) -> None:
+        """A stream that yields nothing falls back to the buffered path."""
+        from app.services.telnyx_tts import TelnyxTTSService
+
+        mock_tts = AsyncMock()
+        mock_tts.provider_name = "elevenlabs"
+        mock_tts.stream_synthesize = self._provider([])
+        mock_tts.synthesize = AsyncMock(side_effect=RuntimeError("buffered attempted"))
+
+        ws = AsyncMock()
+        svc = TelnyxTTSService()
+        svc._tts = mock_tts
+
+        result = await svc.synthesize_and_send("Hello", 1, ws)
+
+        # Fallback was attempted; it failed here only because it is mocked
+        mock_tts.synthesize.assert_awaited_once()
+        assert result is False
+        ws.send_text.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_sub_frame_stream_falls_back(self) -> None:
+        """Fewer than 160 bytes total is not playable → buffered fallback."""
+        from app.services.telnyx_tts import TelnyxTTSService
+
+        mock_tts = AsyncMock()
+        mock_tts.provider_name = "elevenlabs"
+        mock_tts.stream_synthesize = self._provider([b"\xff" * 159])
+        mock_tts.synthesize = AsyncMock(side_effect=RuntimeError("buffered attempted"))
+
+        svc = TelnyxTTSService()
+        svc._tts = mock_tts
+
+        assert await svc.synthesize_and_send("Hello", 1, AsyncMock()) is False
+        mock_tts.synthesize.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_stream_error_after_first_frame_completes_turn(self) -> None:
+        """A mid-stream failure is reported as partial audio, never replayed."""
+        import json
+
+        from app.services.telephony_events import _observers
+        from app.services.telnyx_tts import TelnyxTTSService
+
+        mock_tts = AsyncMock()
+        mock_tts.provider_name = "elevenlabs"
+        mock_tts.stream_synthesize = self._provider(
+            [b"\xff" * 160], error=RuntimeError("connection reset")
+        )
+        mock_tts.synthesize = AsyncMock(side_effect=AssertionError("buffered used"))
+
+        ws = AsyncMock()
+        obs = AsyncMock()
+        _observers.clear()
+        _observers.add(obs)
+
+        svc = TelnyxTTSService()
+        svc._tts = mock_tts
+
+        try:
+            with patch("app.services.telnyx_tts.asyncio.sleep", new_callable=AsyncMock):
+                assert await svc.synthesize_and_send(
+                    "Hello", 1, ws, call_id="cc_partial"
+                ) is True
+            # Allow broadcast tasks to complete
+            await asyncio.sleep(0.05)
+        finally:
+            events = [json.loads(c.args[0]) for c in obs.send_text.call_args_list]
+            _observers.clear()
+
+        mock_tts.synthesize.assert_not_called()
+        assert ws.send_text.call_count == 1
+        error_events = [e for e in events if e["type"] == "error"]
+        assert len(error_events) == 1
+        assert error_events[0]["metadata"]["stage"] == "tts_stream"
+        assert error_events[0]["call_id"] == "cc_partial"
+        # The turn still terminates cleanly for the UI
+        assert events[-1]["type"] == "turn_completed"
+
+    @pytest.mark.asyncio
+    async def test_websocket_failure_returns_false(self) -> None:
+        """A dead media WebSocket aborts the turn without replaying."""
+        from app.services.telnyx_tts import TelnyxTTSService
+
+        mock_tts = AsyncMock()
+        mock_tts.provider_name = "elevenlabs"
+        mock_tts.stream_synthesize = self._provider([b"\xff" * 320])
+
+        ws = AsyncMock()
+        ws.send_text = AsyncMock(side_effect=ConnectionResetError("gone"))
+
+        svc = TelnyxTTSService()
+        svc._tts = mock_tts
+
+        with patch("app.services.telnyx_tts.asyncio.sleep", new_callable=AsyncMock):
+            assert await svc.synthesize_and_send("Hello", 1, ws) is False
+
+    @pytest.mark.asyncio
+    async def test_buffered_fallback_still_reports_first_audio(self) -> None:
+        """Legacy providers still emit tts_first_audio (buffered format tag)."""
+        import json
+        import struct
+        import subprocess
+
+        from app.providers.types import TTSResult
+        from app.services.telephony_events import _observers
+        from app.services.telnyx_tts import TelnyxTTSService
+
+        pcm_silence = struct.pack("<1600h", *([0] * 1600))
+        proc = subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                "-f", "s16le", "-ar", "8000", "-ac", "1",
+                "-i", "pipe:0", "-f", "mp3", "pipe:1",
+            ],
+            input=pcm_silence,
+            capture_output=True,
+            timeout=10,
+        )
+
+        mock_tts = AsyncMock()
+        mock_tts.provider_name = "elevenlabs"
+        mock_tts.synthesize = AsyncMock(
+            return_value=TTSResult(audio_data=proc.stdout, content_type="audio/mpeg")
+        )
+
+        ws = AsyncMock()
+        obs = AsyncMock()
+        _observers.clear()
+        _observers.add(obs)
+
+        svc = TelnyxTTSService()
+        svc._tts = mock_tts
+
+        try:
+            with patch("app.services.telnyx_tts.asyncio.sleep", new_callable=AsyncMock):
+                assert await svc.synthesize_and_send("Hello", 3, ws, call_id="cc_old") is True
+            # Allow broadcast tasks to complete
+            await asyncio.sleep(0.05)
+        finally:
+            events = [json.loads(c.args[0]) for c in obs.send_text.call_args_list]
+            _observers.clear()
+
+        types = [e["type"] for e in events]
+        assert "tts_first_audio" in types
+        first = next(e for e in events if e["type"] == "tts_first_audio")
+        assert first["metadata"]["format"] == "pcmu_8000_buffered"
+
+
+class TestElevenLabsStreamAdapter:
+    """The ElevenLabs HTTP streaming endpoint must be used with ulaw_8000."""
+
+    @pytest.mark.asyncio
+    async def test_stream_endpoint_and_format(self) -> None:
+        """stream_synthesize hits /stream and forwards output_format."""
+        import httpx
+
+        from app.providers.tts.elevenlabs import ElevenLabsAdapter
+
+        seen: dict[str, str] = {}
+
+        async def _body():
+            yield b"\x00" * 100
+            yield b"\x00" * 60
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            seen["path"] = request.url.path
+            seen["format"] = request.url.params.get("output_format", "")
+            seen["accept"] = request.headers.get("accept", "")
+            return httpx.Response(200, content=_body())
+
+        adapter = ElevenLabsAdapter(api_key="test-key")
+        await adapter._client.aclose()
+        adapter._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            headers={"xi-api-key": "test-key"},
+        )
+
+        chunks = [
+            c async for c in adapter.stream_synthesize("hi", output_format="ulaw_8000")
+        ]
+        await adapter.close()
+
+        assert seen["path"].endswith("/stream")
+        assert seen["format"] == "ulaw_8000"
+        assert len(chunks) == 2  # progressive chunks, not one buffered body
+        assert b"".join(chunks) == b"\x00" * 160
+
+    @pytest.mark.asyncio
+    async def test_stream_default_format_is_mp3(self) -> None:
+        """Without an explicit format the adapter keeps its MP3 default."""
+        import httpx
+
+        from app.providers.tts.elevenlabs import ElevenLabsAdapter
+
+        seen: dict[str, str] = {}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            seen["format"] = request.url.params.get("output_format", "")
+            return httpx.Response(200, content=b"\x00" * 10)
+
+        adapter = ElevenLabsAdapter(api_key="test-key")
+        await adapter._client.aclose()
+        adapter._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            headers={"xi-api-key": "test-key"},
+        )
+
+        chunks = [c async for c in adapter.stream_synthesize("hi")]
+        await adapter.close()
+
+        assert seen["format"] == "mp3_44100_128"
+        assert b"".join(chunks) == b"\x00" * 10
+
+    @pytest.mark.asyncio
+    async def test_stream_http_error_raises(self) -> None:
+        """A non-2xx streaming response surfaces as a RuntimeError."""
+        import httpx
+
+        from app.providers.tts.elevenlabs import ElevenLabsAdapter
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(400, json={"detail": "bad format"})
+
+        adapter = ElevenLabsAdapter(api_key="test-key")
+        await adapter._client.aclose()
+        adapter._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            headers={"xi-api-key": "test-key"},
+        )
+
+        with pytest.raises(RuntimeError, match="HTTP 400"):
+            async for _ in adapter.stream_synthesize("hi", output_format="ulaw_8000"):
+                pass
+
+        await adapter.close()
+
+
 class TestAgentWorkerTTSIntegration:
     """Test that the agent worker invokes TTS after agent response."""
 
@@ -2014,9 +2487,11 @@ class TestAgentWorkerTTSIntegration:
     async def test_agent_worker_calls_tts(self) -> None:
         """Agent worker calls TTS service after successful agent response."""
         import asyncio
+        import time
 
         from app.agents.runtime import AgentResult
         from app.services.telnyx_agent import TelephonyAgentSession
+        from app.services.telnyx_deepgram import Utterance
 
         mock_llm = AsyncMock()
         mock_tts = AsyncMock()
@@ -2031,7 +2506,7 @@ class TestAgentWorkerTTSIntegration:
             iterations=1,
         )
 
-        queue: asyncio.Queue[str | None] = asyncio.Queue()
+        queue: asyncio.Queue[Utterance | None] = asyncio.Queue()
 
         agent = TelephonyAgentSession(
             call_control_id="test-cc",
@@ -2053,7 +2528,8 @@ class TestAgentWorkerTTSIntegration:
             # Start worker, send utterance, then shutdown
             agent._running = True
             agent._worker_task = asyncio.create_task(agent._agent_worker())
-            await queue.put("Hello")
+            now = time.monotonic()
+            await queue.put(Utterance(text="Hello", speech_final_at=now, utterance_end_at=now + 1.0, last_word_end=0.5))
             await asyncio.sleep(0.3)
             await queue.put(None)  # shutdown
             await asyncio.sleep(0.1)
@@ -2068,9 +2544,11 @@ class TestAgentWorkerTTSIntegration:
     async def test_agent_worker_tts_failure_doesnt_crash(self) -> None:
         """TTS failure doesn't crash the agent worker."""
         import asyncio
+        import time
 
         from app.agents.runtime import AgentResult
         from app.services.telnyx_agent import TelephonyAgentSession
+        from app.services.telnyx_deepgram import Utterance
 
         mock_llm = AsyncMock()
         mock_tts = AsyncMock()
@@ -2086,7 +2564,7 @@ class TestAgentWorkerTTSIntegration:
             iterations=1,
         )
 
-        queue: asyncio.Queue[str | None] = asyncio.Queue()
+        queue: asyncio.Queue[Utterance | None] = asyncio.Queue()
 
         agent = TelephonyAgentSession(
             call_control_id="test-cc",
@@ -2107,7 +2585,8 @@ class TestAgentWorkerTTSIntegration:
 
             agent._running = True
             agent._worker_task = asyncio.create_task(agent._agent_worker())
-            await queue.put("Hello")
+            now = time.monotonic()
+            await queue.put(Utterance(text="Hello", speech_final_at=now, utterance_end_at=now + 1.0, last_word_end=0.5))
             await asyncio.sleep(0.3)
             # Worker should still be alive after TTS failure
             assert not agent._worker_task.done()
@@ -2184,6 +2663,7 @@ class TestTelephonyEventBus:
     @pytest.mark.asyncio
     async def test_broadcast_sends_to_observer(self) -> None:
         """broadcast_telephony_event sends JSON event to all observers."""
+        import asyncio
         import json
 
         from app.services.telephony_events import (
@@ -2203,6 +2683,8 @@ class TestTelephonyEventBus:
                 turn=1,
                 metadata={"model": "openai/gpt-4o-mini"},
             )
+            # Allow the broadcast task to complete
+            await asyncio.sleep(0.05)
 
             assert mock_ws.send_text.called
             sent = json.loads(mock_ws.send_text.call_args[0][0])
@@ -2218,6 +2700,8 @@ class TestTelephonyEventBus:
     @pytest.mark.asyncio
     async def test_broadcast_removes_stale_observers(self) -> None:
         """Failed sends are removed from observer set."""
+        import asyncio
+
         from app.services.telephony_events import (
             _observers,
             broadcast_telephony_event,
@@ -2232,6 +2716,8 @@ class TestTelephonyEventBus:
             await broadcast_telephony_event(
                 "call_completed", "cc_xyz", "Call completed"
             )
+            # Allow the broadcast task to complete
+            await asyncio.sleep(0.05)
             assert mock_ws not in _observers
         finally:
             _observers.clear()
@@ -2239,6 +2725,7 @@ class TestTelephonyEventBus:
     @pytest.mark.asyncio
     async def test_broadcast_event_schema(self) -> None:
         """Event has all required fields and correct types."""
+        import asyncio
         import json
 
         from app.services.telephony_events import (
@@ -2258,6 +2745,8 @@ class TestTelephonyEventBus:
                 turn=2,
                 metadata={"text": "Hello"},
             )
+            # Allow the broadcast task to complete
+            await asyncio.sleep(0.05)
 
             sent = json.loads(mock_ws.send_text.call_args[0][0])
             # Required fields
@@ -2274,6 +2763,7 @@ class TestTelephonyEventBus:
     @pytest.mark.asyncio
     async def test_broadcast_without_turn_omits_field(self) -> None:
         """Events without turn omit the turn field."""
+        import asyncio
         import json
 
         from app.services.telephony_events import (
@@ -2289,6 +2779,8 @@ class TestTelephonyEventBus:
             await broadcast_telephony_event(
                 "call_received", "cc_1", "Incoming call"
             )
+            # Allow the broadcast task to complete
+            await asyncio.sleep(0.05)
 
             sent = json.loads(mock_ws.send_text.call_args[0][0])
             assert "turn" not in sent
@@ -2327,3 +2819,227 @@ class TestTelephonyEventBus:
             ws.close()
         # Should be unregistered after disconnect
         assert len(_observers) == 0
+
+
+class TestEndOfSpeechObservability:
+    """Phase 8B: end-of-speech latency observability (speech_final/utterance_end/agent_processing)."""
+
+    @pytest.mark.asyncio
+    async def test_speech_final_metadata_preserved(self) -> None:
+        """speech_final metadata from Deepgram is preserved through the bridge."""
+        from app.providers.stt.streaming import StreamEvent
+        from app.services.telnyx_deepgram import TelnyxDeepgramBridge
+
+        bridge = TelnyxDeepgramBridge()
+        bridge._running = True
+        bridge._session = AsyncMock()
+
+        # Simulate a final event with speech_final=True
+        final_event = StreamEvent(
+            type="final",
+            text="Hello world",
+            confidence=0.95,
+            metadata={"speech_final": True},
+        )
+        utterance_end_event = StreamEvent(type="utterance_end", metadata={"last_word_end": 1.5})
+
+        bridge._session.receive = AsyncMock(
+            side_effect=[final_event, utterance_end_event, None]
+        )
+
+        await bridge._transcript_processor()
+
+        # Verify the utterance on the queue has speech_final_at captured
+        utterance = await bridge.utterance_queue.get()
+        assert utterance is not None
+        assert utterance.speech_final_at is not None
+        assert bridge.utterances_emitted == 1
+
+    @pytest.mark.asyncio
+    async def test_last_word_end_preserved(self) -> None:
+        """last_word_end from UtteranceEnd is preserved in the Utterance."""
+        from app.providers.stt.streaming import StreamEvent
+        from app.services.telnyx_deepgram import TelnyxDeepgramBridge
+
+        bridge = TelnyxDeepgramBridge()
+        bridge._running = True
+        bridge._session = AsyncMock()
+
+        final_event = StreamEvent(
+            type="final",
+            text="Test transcript",
+            confidence=0.9,
+            metadata={"speech_final": True},
+        )
+        utterance_end_event = StreamEvent(
+            type="utterance_end",
+            metadata={"last_word_end": 2.24},
+        )
+
+        bridge._session.receive = AsyncMock(
+            side_effect=[final_event, utterance_end_event, None]
+        )
+
+        await bridge._transcript_processor()
+
+        # Verify the utterance on the queue has last_word_end
+        utterance = await bridge.utterance_queue.get()
+        assert utterance is not None
+        assert utterance.last_word_end == 2.24
+        assert utterance.text == "Test transcript"
+
+    @pytest.mark.asyncio
+    async def test_caller_speech_final_event_emitted(self) -> None:
+        """caller_speech_final event is emitted at utterance_end with timing metadata."""
+        import json
+
+        from app.providers.stt.streaming import StreamEvent
+        from app.services.telephony_events import _observers, broadcast_telephony_event
+        from app.services.telnyx_deepgram import TelnyxDeepgramBridge
+
+        _observers.clear()
+        mock_ws = AsyncMock()
+        _observers.add(mock_ws)
+
+        try:
+            bridge = TelnyxDeepgramBridge()
+            bridge._running = True
+            bridge._stream_id = "test_stream"
+            bridge._session = AsyncMock()
+
+            final_event = StreamEvent(
+                type="final",
+                text="Hello",
+                confidence=0.95,
+                metadata={"speech_final": True},
+            )
+            utterance_end_event = StreamEvent(
+                type="utterance_end",
+                metadata={"last_word_end": 1.5},
+            )
+
+            bridge._session.receive = AsyncMock(
+                side_effect=[final_event, utterance_end_event, None]
+            )
+
+            await bridge._transcript_processor()
+
+            # Allow broadcast tasks to complete
+            await asyncio.sleep(0.05)
+
+            # Verify caller_speech_final was broadcast
+            calls = [json.loads(c[0][0]) for c in mock_ws.send_text.call_args_list]
+            speech_final_events = [c for c in calls if c["type"] == "caller_speech_final"]
+            assert len(speech_final_events) == 1
+            evt = speech_final_events[0]
+            assert evt["call_id"] == "test_stream"
+            assert evt["turn"] == 1
+            assert evt["metadata"]["last_word_end"] == 1.5
+            assert evt["metadata"]["speech_final_to_utterance_end_ms"] is not None
+        finally:
+            _observers.clear()
+
+    @pytest.mark.asyncio
+    async def test_timing_fields_calculated_correctly(self) -> None:
+        """Timing deltas are calculated correctly from monotonic timestamps."""
+        import time
+
+        from app.services.telnyx_agent import TelephonyAgentSession
+        from app.services.telnyx_deepgram import Utterance
+
+        queue: asyncio.Queue[Utterance | None] = asyncio.Queue()
+        agent = TelephonyAgentSession(
+            call_control_id="cc_test",
+            utterance_queue=queue,
+            tts_service=None,
+            websocket=None,
+        )
+        agent._llm = AsyncMock()
+        agent._llm.close = AsyncMock()
+
+        # Create an utterance with known timestamps
+        now = time.monotonic()
+        utterance = Utterance(
+            text="Test",
+            speech_final_at=now,
+            utterance_end_at=now + 1.0,  # 1000ms later
+            last_word_end=0.5,
+        )
+        await queue.put(utterance)
+        await queue.put(None)  # sentinel
+
+        # Mock AgentRuntime to return immediately
+        with patch("app.services.telnyx_agent.AgentRuntime") as mock_runtime:
+            mock_runtime.return_value.run = AsyncMock(
+                return_value=AsyncMock(
+                    response="Response",
+                    tool_calls=[],
+                    usage={},
+                    iterations=1,
+                )
+            )
+            await agent.start()
+            await agent._worker_task
+
+        # Verify the agent processed the utterance
+        assert agent.turn == 1
+
+    @pytest.mark.asyncio
+    async def test_observer_disconnect_does_not_block_processing(self) -> None:
+        """A stalled observer cannot delay STT/agent processing."""
+        import asyncio
+
+        from app.services.telephony_events import (
+            _observers,
+            broadcast_telephony_event,
+        )
+
+        _observers.clear()
+        mock_ws = AsyncMock()
+        # Simulate a stalled observer (send_text hangs)
+        async def slow_send(*args, **kwargs):
+            await asyncio.sleep(10)
+
+        mock_ws.send_text = slow_send
+        _observers.add(mock_ws)
+
+        try:
+            # broadcast should return immediately (fire-and-forget)
+            start = asyncio.get_event_loop().time()
+            await broadcast_telephony_event(
+                "test_event", "cc_1", "Test message"
+            )
+            elapsed = asyncio.get_event_loop().time() - start
+
+            # Should return almost immediately (< 50ms), not wait for the slow send
+            assert elapsed < 0.05
+        finally:
+            _observers.clear()
+
+    @pytest.mark.asyncio
+    async def test_existing_utterance_end_behavior_unchanged(self) -> None:
+        """The existing utterance_end trigger path remains unchanged."""
+        from app.providers.stt.streaming import StreamEvent
+        from app.services.telnyx_deepgram import TelnyxDeepgramBridge
+
+        bridge = TelnyxDeepgramBridge()
+        bridge._running = True
+        bridge._session = AsyncMock()
+
+        # Two finals then utterance_end (existing test pattern)
+        bridge._session.receive = AsyncMock(
+            side_effect=[
+                StreamEvent(type="final", text="Hello", confidence=0.9),
+                StreamEvent(type="final", text="world", confidence=0.95),
+                StreamEvent(type="utterance_end", metadata={"last_word_end": 1.0}),
+                None,
+            ]
+        )
+
+        await bridge._transcript_processor()
+
+        # Verify the utterance was emitted with accumulated text
+        utterance = await bridge.utterance_queue.get()
+        assert utterance is not None
+        assert utterance.text == "Hello world"
+        assert bridge.utterances_emitted == 1

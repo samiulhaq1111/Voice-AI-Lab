@@ -1,18 +1,22 @@
-"""Telephone TTS service (Phase 6C — telephony TTS milestone).
+"""Telephone TTS service (Phase 6C — telephony TTS, Phase 8B — streaming).
 
-Converts agent text responses to telephone-compatible audio:
+Preferred streaming path (no transcoding, lowest time-to-first-audio):
 
     AgentRuntime text response
         ↓
-    ElevenLabs TTS (MP3 44.1kHz)
+    ElevenLabs Flash v2.5 /stream (output_format=ulaw_8000)
+        ↓  raw mu-law 8kHz bytes, progressively over chunked HTTP
+    160-byte PCMU frames (20ms) → base64
         ↓
-    ffmpeg → PCM16 8kHz mono
+    Telnyx bidirectional media WebSocket (real-time paced)
+
+Fallback path (used only when the provider cannot stream mu-law):
+
+    ElevenLabs TTS (MP3 44.1kHz, buffered)
         ↓
-    _linear_to_ulaw() → PCMU 8kHz
+    ffmpeg → PCM16 8kHz mono → _linear_to_ulaw() → PCMU 8kHz
         ↓
-    160-byte chunks (20ms) → base64
-        ↓
-    Telnyx bidirectional media WebSocket
+    160-byte chunks (20ms) → base64 → Telnyx media WebSocket
 
 Uses the existing TTS provider abstraction (get_tts_provider).
 No ElevenLabs-specific logic at the application level.
@@ -22,6 +26,7 @@ import asyncio
 import base64
 import json
 import time
+from collections.abc import AsyncIterator
 
 from fastapi import WebSocket
 
@@ -31,6 +36,24 @@ from app.providers.tts.interface import TTSInterface
 from app.services.telephony_events import broadcast_telephony_event
 from app.services.telnyx_media import pcmu_chunks_from_bytes
 from app.utils.audio import mp3_to_pcmu_8k
+
+# ElevenLabs native telephony format: raw mu-law (PCMU) 8kHz mono.
+# Telnyx media streaming already expects PCMU/8000, so streamed chunks
+# are forwarded verbatim — no MP3 decode, no resampling, no ffmpeg.
+_TELEPHONY_OUTPUT_FORMAT = "ulaw_8000"
+
+# One 20ms PCMU frame at 8kHz = 160 samples = 160 bytes.
+_PCMU_FRAME_BYTES = 160
+_CHUNK_PACE_SECONDS = 0.020
+_ULAW_BYTES_PER_SECOND = 8000
+
+
+class _StreamingUnavailableError(Exception):
+    """Raised internally when the streaming path cannot serve this turn.
+
+    Only raised *before* any audio has reached Telnyx, so the caller can
+    safely retry the turn through the buffered MP3 fallback path.
+    """
 
 
 class TelnyxTTSService:
@@ -76,7 +99,12 @@ class TelnyxTTSService:
         *,
         call_id: str = "",
     ) -> bool:
-        """Synthesize text to speech and send audio to Telnyx.
+        """Speak `text` to the caller as early as possible.
+
+        Streams ElevenLabs mu-law 8kHz audio straight into the Telnyx media
+        WebSocket, so the caller starts hearing the response while the rest
+        is still being generated. Falls back to buffered MP3 + ffmpeg when
+        streaming is unavailable.
 
         Args:
             text: The agent response text to speak.
@@ -97,38 +125,170 @@ class TelnyxTTSService:
 
         tts_start = time.monotonic()
         logger.info(
-            "[VOICE:TELNYX:TTS] turn=%d tts_start text_length=%d",
+            "[VOICE:TELNYX:TTS] turn=%d tts_start text_length=%d "
+            "mode=stream format=%s",
             turn,
             len(text),
+            _TELEPHONY_OUTPUT_FORMAT,
         )
         await broadcast_telephony_event(
             "tts_processing",
             call_id,
             "Generating voice with ElevenLabs",
             turn=turn,
-            metadata={"provider": "elevenlabs", "text_length": len(text)},
+            metadata={
+                "provider": "elevenlabs",
+                "text_length": len(text),
+                "mode": "stream",
+            },
         )
 
         try:
-            # Run TTS synthesis in background thread to avoid blocking
-            tts_result = await self._tts.synthesize(text=text)
-            tts_ms = (time.monotonic() - tts_start) * 1000
+            return await self._stream_to_telnyx(
+                text, turn, websocket, call_id, tts_start
+            )
+        except _StreamingUnavailableError as e:
             logger.info(
-                "[VOICE:TELNYX:TTS] turn=%d tts_done bytes=%d tts_ms=%.0f",
+                "[VOICE:TELNYX:TTS] turn=%d streaming_unavailable reason=%s "
+                "— using buffered MP3 fallback",
                 turn,
-                len(tts_result.audio_data),
-                tts_ms,
+                e,
             )
+            return await self._send_buffered(
+                text, turn, websocket, call_id, tts_start
+            )
+
+    # --- streaming path (preferred) ------------------------------------
+
+    def _open_stream(self, text: str) -> AsyncIterator[bytes]:
+        """Start provider streaming, or signal that it is unavailable."""
+        stream_fn = getattr(self._tts, "stream_synthesize", None)
+        if stream_fn is None:
+            raise _StreamingUnavailableError("provider has no stream_synthesize")
+
+        try:
+            stream = stream_fn(
+                text=text, output_format=_TELEPHONY_OUTPUT_FORMAT
+            )
+        except TypeError as e:
+            # Provider does not accept an output_format override.
+            raise _StreamingUnavailableError(
+                f"stream_synthesize signature unsupported: {e}"
+            ) from e
+
+        if not hasattr(stream, "__aiter__"):
+            if asyncio.iscoroutine(stream):
+                stream.close()
+            raise _StreamingUnavailableError("provider stream is not async-iterable")
+        return stream
+
+    async def _stream_to_telnyx(
+        self,
+        text: str,
+        turn: int,
+        websocket: WebSocket,
+        call_id: str,
+        tts_start: float,
+    ) -> bool:
+        """Forward provider mu-law chunks to Telnyx as they arrive."""
+        stream = self._open_stream(text)
+
+        pending = bytearray()
+        provider_bytes = 0
+        sent_bytes = 0
+        frames_sent = 0
+        first_audio_ms: float | None = None
+        provider_done_ms: float | None = None
+        stream_error: str | None = None
+
+        try:
+            async for piece in stream:
+                if not piece:
+                    continue
+                provider_bytes += len(piece)
+                provider_done_ms = (time.monotonic() - tts_start) * 1000
+                pending.extend(piece)
+
+                # Ship every complete 20ms PCMU frame immediately — never
+                # wait for the whole response to be generated.
+                while len(pending) >= _PCMU_FRAME_BYTES:
+                    frame = bytes(pending[:_PCMU_FRAME_BYTES])
+                    del pending[:_PCMU_FRAME_BYTES]
+
+                    if not await self._send_frame(frame, turn, websocket):
+                        return False
+
+                    frames_sent += 1
+                    sent_bytes += len(frame)
+                    if first_audio_ms is None:
+                        first_audio_ms = (time.monotonic() - tts_start) * 1000
+                        await self._announce_first_audio(
+                            turn, call_id, first_audio_ms, _TELEPHONY_OUTPUT_FORMAT
+                        )
+                    # Pace at real-time: 20ms per 160-byte PCMU frame
+                    await asyncio.sleep(_CHUNK_PACE_SECONDS)
+        except Exception as e:
+            stream_error = f"{type(e).__name__}: {e}"
+            logger.error(
+                "[VOICE:TELNYX:TTS] turn=%d stream_error error=%s frames_sent=%d",
+                turn,
+                stream_error,
+                frames_sent,
+            )
+        finally:
+            await self._close_stream(stream)
+
+        if frames_sent == 0:
+            # Nothing reached the caller yet → safe to try the fallback.
+            raise _StreamingUnavailableError(
+                stream_error
+                or f"stream produced no playable audio (provider_bytes={provider_bytes})"
+            )
+
+        if stream_error is not None:
             await broadcast_telephony_event(
-                "tts_completed",
+                "error",
                 call_id,
-                "Voice generated",
+                "AI voice stream ended early",
                 turn=turn,
-                metadata={
-                    "duration_ms": round(tts_ms),
-                    "bytes": len(tts_result.audio_data),
-                },
+                metadata={"stage": "tts_stream", "partial": True},
             )
+
+        logger.info(
+            "[VOICE:TELNYX:TTS] turn=%d stream_sent frames=%d bytes=%d "
+            "provider_bytes=%d ttfa_ms=%s provider_ms=%s",
+            turn,
+            frames_sent,
+            sent_bytes,
+            provider_bytes,
+            f"{first_audio_ms:.0f}" if first_audio_ms is not None else "n/a",
+            f"{provider_done_ms:.0f}" if provider_done_ms is not None else "n/a",
+        )
+        await self._emit_turn_summary(
+            turn=turn,
+            call_id=call_id,
+            tts_start=tts_start,
+            provider_done_ms=provider_done_ms,
+            first_audio_ms=first_audio_ms,
+            frames_sent=frames_sent,
+            sent_bytes=sent_bytes,
+            audio_format=_TELEPHONY_OUTPUT_FORMAT,
+        )
+        return True
+
+    # --- buffered fallback path ----------------------------------------
+
+    async def _send_buffered(
+        self,
+        text: str,
+        turn: int,
+        websocket: WebSocket,
+        call_id: str,
+        tts_start: float,
+    ) -> bool:
+        """Legacy path: full MP3 first, then ffmpeg → PCMU, then paced send."""
+        try:
+            tts_result = await self._tts.synthesize(text=text)
         except Exception as e:
             tts_ms = (time.monotonic() - tts_start) * 1000
             logger.error(
@@ -140,6 +300,14 @@ class TelnyxTTSService:
                 tts_ms,
             )
             return False
+
+        provider_done_ms = (time.monotonic() - tts_start) * 1000
+        logger.info(
+            "[VOICE:TELNYX:TTS] turn=%d tts_done mode=buffered bytes=%d tts_ms=%.0f",
+            turn,
+            len(tts_result.audio_data),
+            provider_done_ms,
+        )
 
         # Convert MP3 → PCMU 8kHz
         try:
@@ -164,33 +332,87 @@ class TelnyxTTSService:
         # Telnyx expects media at ~real-time pace (1 chunk per 20ms).
         chunks = pcmu_chunks_from_bytes(pcmu_data)
         total_bytes = 0
+        first_audio_ms: float | None = None
         for chunk in chunks:
-            payload = base64.b64encode(chunk).decode("ascii")
-            try:
-                await websocket.send_text(
-                    json.dumps({"event": "media", "media": {"payload": payload}})
-                )
-                total_bytes += len(chunk)
-            except Exception as e:
-                logger.error(
-                    "[VOICE:TELNYX:TTS] turn=%d websocket_send_error "
-                    "error=%s sent_bytes=%d",
-                    turn,
-                    str(e),
-                    total_bytes,
-                )
+            if not await self._send_frame(chunk, turn, websocket):
                 return False
+            total_bytes += len(chunk)
+            if first_audio_ms is None:
+                first_audio_ms = (time.monotonic() - tts_start) * 1000
+                await self._announce_first_audio(
+                    turn, call_id, first_audio_ms, "pcmu_8000_buffered"
+                )
             # Pace at real-time: 20ms per 160-byte PCMU chunk
-            await asyncio.sleep(0.020)
+            await asyncio.sleep(_CHUNK_PACE_SECONDS)
 
-        send_ms = (time.monotonic() - tts_start) * 1000
         logger.info(
-            "[VOICE:TELNYX:TTS] turn=%d audio_sent chunks=%d "
-            "bytes=%d total_ms=%.0f",
+            "[VOICE:TELNYX:TTS] turn=%d audio_sent mode=buffered chunks=%d "
+            "bytes=%d ttfa_ms=%s",
             turn,
             len(chunks),
             total_bytes,
-            send_ms,
+            f"{first_audio_ms:.0f}" if first_audio_ms is not None else "n/a",
+        )
+        await self._emit_turn_summary(
+            turn=turn,
+            call_id=call_id,
+            tts_start=tts_start,
+            provider_done_ms=provider_done_ms,
+            first_audio_ms=first_audio_ms,
+            frames_sent=len(chunks),
+            sent_bytes=total_bytes,
+            audio_format="pcmu_8000_buffered",
+        )
+        return True
+
+    # --- shared helpers --------------------------------------------------
+
+    @staticmethod
+    async def _send_frame(frame: bytes, turn: int, websocket: WebSocket) -> bool:
+        """Send one base64 PCMU frame to Telnyx as a media event."""
+        payload = base64.b64encode(frame).decode("ascii")
+        try:
+            await websocket.send_text(
+                json.dumps({"event": "media", "media": {"payload": payload}})
+            )
+        except Exception as e:
+            logger.error(
+                "[VOICE:TELNYX:TTS] turn=%d websocket_send_error error=%s",
+                turn,
+                str(e),
+            )
+            return False
+        return True
+
+    @staticmethod
+    async def _close_stream(stream: AsyncIterator[bytes]) -> None:
+        """Release the provider stream without masking the original error."""
+        aclose = getattr(stream, "aclose", None)
+        if aclose is None:
+            return
+        try:
+            await aclose()
+        except Exception:
+            pass
+
+    async def _announce_first_audio(
+        self,
+        turn: int,
+        call_id: str,
+        ttfa_ms: float,
+        audio_format: str,
+    ) -> None:
+        """Tell observers the caller is now hearing AI audio.
+
+        Emitted the instant the FIRST PCMU frame is handed to Telnyx — not
+        after the whole utterance has been synthesized.
+        """
+        await broadcast_telephony_event(
+            "tts_first_audio",
+            call_id,
+            f"AI voice reaching the caller ({ttfa_ms / 1000:.2f}s)",
+            turn=turn,
+            metadata={"ttfa_ms": round(ttfa_ms), "format": audio_format},
         )
         await broadcast_telephony_event(
             "audio_streaming",
@@ -198,8 +420,39 @@ class TelnyxTTSService:
             "Streaming AI voice to caller",
             turn=turn,
             metadata={
-                "chunks": len(chunks),
-                "bytes": total_bytes,
+                "format": audio_format,
+                "frame_bytes": _PCMU_FRAME_BYTES,
+            },
+        )
+
+    async def _emit_turn_summary(
+        self,
+        *,
+        turn: int,
+        call_id: str,
+        tts_start: float,
+        provider_done_ms: float | None,
+        first_audio_ms: float | None,
+        frames_sent: int,
+        sent_bytes: int,
+        audio_format: str,
+    ) -> None:
+        """Emit the terminal tts_completed / turn_completed events."""
+        total_ms = (time.monotonic() - tts_start) * 1000
+        playback_ms = sent_bytes / _ULAW_BYTES_PER_SECOND * 1000
+
+        await broadcast_telephony_event(
+            "tts_completed",
+            call_id,
+            "Voice generated",
+            turn=turn,
+            metadata={
+                "duration_ms": round(provider_done_ms or total_ms),
+                "bytes": sent_bytes,
+                "chunks": frames_sent,
+                "ttfa_ms": round(first_audio_ms) if first_audio_ms else None,
+                "playback_ms": round(playback_ms),
+                "format": audio_format,
             },
         )
         await broadcast_telephony_event(
@@ -207,6 +460,15 @@ class TelnyxTTSService:
             call_id,
             f"Turn {turn} completed",
             turn=turn,
-            metadata={"total_ms": round(send_ms)},
+            metadata={"total_ms": round(total_ms)},
         )
-        return True
+        logger.info(
+            "[VOICE:TELNYX:TTS] turn=%d completed ttfa_ms=%s total_ms=%.0f "
+            "playback_ms=%.0f frames=%d bytes=%d",
+            turn,
+            f"{first_audio_ms:.0f}" if first_audio_ms is not None else "n/a",
+            total_ms,
+            playback_ms,
+            frames_sent,
+            sent_bytes,
+        )

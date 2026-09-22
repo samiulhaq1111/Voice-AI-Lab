@@ -28,6 +28,8 @@ while Deepgram transcript events are processed concurrently.
 
 import asyncio
 import base64
+import time
+from dataclasses import dataclass
 from typing import Any
 
 from app.core.logging import logger
@@ -49,6 +51,21 @@ _AUDIO_QUEUE_MAX_SIZE = 100
 _UTTERANCE_QUEUE_MAX_SIZE = 20
 
 
+@dataclass(frozen=True)
+class Utterance:
+    """A completed caller utterance with end-of-speech timing marks.
+
+    Carries monotonic timestamps so the agent worker can compute
+    speech_final → utterance_end → agent_processing deltas without
+    depending on wall-clock alignment.
+    """
+
+    text: str
+    speech_final_at: float | None  # monotonic, None if no speech_final seen
+    utterance_end_at: float  # monotonic
+    last_word_end: float | None  # Deepgram audio-time seconds, None if absent
+
+
 class TelnyxDeepgramBridge:
     """Bridge between Telnyx media stream and Deepgram realtime STT.
 
@@ -63,7 +80,7 @@ class TelnyxDeepgramBridge:
             maxsize=_AUDIO_QUEUE_MAX_SIZE
         )
         # Completed utterances ready for agent processing
-        self.utterance_queue: asyncio.Queue[str] = asyncio.Queue(
+        self.utterance_queue: asyncio.Queue[Utterance | None] = asyncio.Queue(
             maxsize=_UTTERANCE_QUEUE_MAX_SIZE
         )
         self._audio_task: asyncio.Task | None = None
@@ -79,6 +96,9 @@ class TelnyxDeepgramBridge:
         # Utterance accumulation state
         self._current_utterance_text: str = ""
         self._utterance_finalized: bool = False
+        # End-of-speech timing marks for the current accumulation
+        self._speech_final_at: float | None = None
+        self._last_word_end: float | None = None
 
     @property
     def stream_id(self) -> str:
@@ -333,6 +353,14 @@ class TelnyxDeepgramBridge:
                         f"{prev} {event.text}".strip() if prev else event.text
                     )
                     self._utterance_finalized = True
+                    # Capture the FIRST speech_final mark for this accumulation
+                    # (multi-segment utterances may have multiple speech_final finals;
+                    # we anchor on the first one to avoid re-timing).
+                    if (
+                        self._speech_final_at is None
+                        and event.metadata.get("speech_final")
+                    ):
+                        self._speech_final_at = time.monotonic()
                     logger.debug(
                         "[VOICE:TELNYX:STT] final text='%s' confidence=%.2f",
                         event.text[:120],
@@ -340,9 +368,17 @@ class TelnyxDeepgramBridge:
                     )
                 elif event.type == "utterance_end":
                     # Emit the accumulated utterance for agent processing
-                    utterance = self._current_utterance_text.strip()
-                    if utterance and self._utterance_finalized:
+                    utterance_text = self._current_utterance_text.strip()
+                    utterance_end_at = time.monotonic()
+                    last_word_end = event.metadata.get("last_word_end")
+                    if utterance_text and self._utterance_finalized:
                         self._utterances_emitted += 1
+                        utterance = Utterance(
+                            text=utterance_text,
+                            speech_final_at=self._speech_final_at,
+                            utterance_end_at=utterance_end_at,
+                            last_word_end=last_word_end,
+                        )
                         try:
                             self.utterance_queue.put_nowait(utterance)
                         except asyncio.QueueFull:
@@ -354,14 +390,37 @@ class TelnyxDeepgramBridge:
                         logger.info(
                             "[VOICE:TELNYX:STT] turn=%d transcript=\"%s\"",
                             self._utterances_emitted,
-                            utterance[:120],
+                            utterance_text[:120],
+                        )
+                        # Emit caller_speech_final with timing metadata.
+                        # Only emitted when speech_final was observed for this
+                        # accumulation — the frontend uses this to distinguish
+                        # a clean end-of-speech from a forced flush.
+                        speech_final_to_utterance_end_ms: float | None = None
+                        if self._speech_final_at is not None:
+                            speech_final_to_utterance_end_ms = (
+                                utterance_end_at - self._speech_final_at
+                            ) * 1000
+                        await broadcast_telephony_event(
+                            "caller_speech_final",
+                            self._stream_id,
+                            "Deepgram detected end of speech",
+                            turn=self._utterances_emitted,
+                            metadata={
+                                "last_word_end": last_word_end,
+                                "speech_final_to_utterance_end_ms": (
+                                    round(speech_final_to_utterance_end_ms)
+                                    if speech_final_to_utterance_end_ms is not None
+                                    else None
+                                ),
+                            },
                         )
                         await broadcast_telephony_event(
                             "caller_transcript",
                             self._stream_id,
-                            f'Caller: "{utterance}"',
+                            f'Caller: "{utterance_text}"',
                             turn=self._utterances_emitted,
-                            metadata={"text": utterance},
+                            metadata={"text": utterance_text},
                         )
                     else:
                         logger.debug(
@@ -370,6 +429,8 @@ class TelnyxDeepgramBridge:
                     # Reset utterance accumulation for next utterance
                     self._current_utterance_text = ""
                     self._utterance_finalized = False
+                    self._speech_final_at = None
+                    self._last_word_end = None
                 elif event.type == "error":
                     logger.error(
                         "[VOICE:TELNYX:STT] Deepgram error text='%s'",

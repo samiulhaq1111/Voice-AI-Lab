@@ -201,7 +201,12 @@ class DeepgramStreamingSession(StreamingSTTSession):
             return self._translate_results(data)
         if msg_type == "UtteranceEnd":
             logger.info("[VOICE:REALTIME] deepgram_utterance_end")
-            return StreamEvent(type="utterance_end")
+            return StreamEvent(
+                type="utterance_end",
+                metadata={
+                    "last_word_end": data.get("last_word_end"),
+                },
+            )
         if msg_type == "Metadata":
             logger.debug("[VOICE:REALTIME] deepgram_event type=Metadata")
             return None

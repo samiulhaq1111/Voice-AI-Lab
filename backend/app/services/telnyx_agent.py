@@ -35,6 +35,7 @@ from app.providers.factory import ProviderError, get_llm_provider
 from app.providers.llm.interface import LLMInterface
 from app.providers.types import LLMMessage
 from app.services.telephony_events import broadcast_telephony_event
+from app.services.telnyx_deepgram import Utterance
 from app.services.tool_service import get_tool_registry
 from app.tools.executor import ToolExecutor
 
@@ -53,7 +54,7 @@ class TelephonyAgentSession:
     def __init__(
         self,
         call_control_id: str,
-        utterance_queue: asyncio.Queue[str | None],
+        utterance_queue: asyncio.Queue[Utterance | None],
         *,
         tts_service: Any | None = None,
         websocket: Any | None = None,
@@ -188,10 +189,33 @@ class TelephonyAgentSession:
             self._turn += 1
             turn = self._turn
             turn_start = time.monotonic()
+            # Compute end-of-speech latency deltas from the bridge's
+            # monotonic timestamps. These are the same clock used by
+            # the bridge, so the deltas are exact.
+            speech_final_to_utterance_end_ms: float | None = None
+            utterance_end_to_agent_ms: float | None = None
+            speech_final_to_agent_ms: float | None = None
+            if (
+                utterance.speech_final_at is not None
+                and utterance.utterance_end_at is not None
+            ):
+                speech_final_to_utterance_end_ms = (
+                    utterance.utterance_end_at - utterance.speech_final_at
+                ) * 1000
+                utterance_end_to_agent_ms = (
+                    turn_start - utterance.utterance_end_at
+                ) * 1000
+                speech_final_to_agent_ms = (
+                    turn_start - utterance.speech_final_at
+                ) * 1000
             logger.info(
-                "[VOICE:TELNYX:AGENT] turn=%d start model=%s",
+                "[VOICE:TELNYX:AGENT] turn=%d start model=%s "
+                "speech_final_to_utterance_end_ms=%.0f "
+                "utterance_end_to_agent_ms=%.0f",
                 turn,
                 _TELNYX_LLM_MODEL,
+                speech_final_to_utterance_end_ms or 0.0,
+                utterance_end_to_agent_ms or 0.0,
             )
             await broadcast_telephony_event(
                 "agent_processing",
@@ -201,17 +225,32 @@ class TelephonyAgentSession:
                 metadata={
                     "provider": "openrouter",
                     "model": _TELNYX_LLM_MODEL,
+                    "speech_final_to_utterance_end_ms": (
+                        round(speech_final_to_utterance_end_ms)
+                        if speech_final_to_utterance_end_ms is not None
+                        else None
+                    ),
+                    "utterance_end_to_agent_ms": (
+                        round(utterance_end_to_agent_ms)
+                        if utterance_end_to_agent_ms is not None
+                        else None
+                    ),
+                    "speech_final_to_agent_ms": (
+                        round(speech_final_to_agent_ms)
+                        if speech_final_to_agent_ms is not None
+                        else None
+                    ),
                 },
             )
             logger.debug(
                 "[VOICE:TELNYX:AGENT] turn=%d transcript='%s' history=%d",
                 turn,
-                utterance[:80],
+                utterance.text[:80],
                 len(self._history),
             )
 
             try:
-                result = await self._process_utterance(utterance)
+                result = await self._process_utterance(utterance.text)
                 turn_ms = (time.monotonic() - turn_start) * 1000
                 response_text = result.get("response", "")
                 usage = result.get("usage", {})
