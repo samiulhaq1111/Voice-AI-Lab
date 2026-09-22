@@ -2162,3 +2162,168 @@ class TestTrackIsolationPreserved:
         assert bridge.packets_in == 1
         assert bridge._outbound_packets_skipped == 0
         assert bridge._audio_queue.qsize() == 1  # Queued for STT
+
+
+class TestTelephonyEventBus:
+    """Tests for the telephony semantic event bus (Phase 8A)."""
+
+    @pytest.mark.asyncio
+    async def test_broadcast_no_observers_is_noop(self) -> None:
+        """broadcast_telephony_event with no observers does nothing."""
+        from app.services.telephony_events import (
+            _observers,
+            broadcast_telephony_event,
+        )
+
+        _observers.clear()
+        # Should not raise
+        await broadcast_telephony_event(
+            "call_received", "cc_123", "Incoming call"
+        )
+
+    @pytest.mark.asyncio
+    async def test_broadcast_sends_to_observer(self) -> None:
+        """broadcast_telephony_event sends JSON event to all observers."""
+        import json
+
+        from app.services.telephony_events import (
+            _observers,
+            broadcast_telephony_event,
+        )
+
+        _observers.clear()
+        mock_ws = AsyncMock()
+        _observers.add(mock_ws)
+
+        try:
+            await broadcast_telephony_event(
+                "agent_processing",
+                "cc_abc",
+                "Processing with GPT-4o-mini",
+                turn=1,
+                metadata={"model": "openai/gpt-4o-mini"},
+            )
+
+            assert mock_ws.send_text.called
+            sent = json.loads(mock_ws.send_text.call_args[0][0])
+            assert sent["type"] == "agent_processing"
+            assert sent["call_id"] == "cc_abc"
+            assert sent["turn"] == 1
+            assert sent["message"] == "Processing with GPT-4o-mini"
+            assert sent["metadata"]["model"] == "openai/gpt-4o-mini"
+            assert "timestamp" in sent
+        finally:
+            _observers.clear()
+
+    @pytest.mark.asyncio
+    async def test_broadcast_removes_stale_observers(self) -> None:
+        """Failed sends are removed from observer set."""
+        from app.services.telephony_events import (
+            _observers,
+            broadcast_telephony_event,
+        )
+
+        _observers.clear()
+        mock_ws = AsyncMock()
+        mock_ws.send_text.side_effect = RuntimeError("disconnected")
+        _observers.add(mock_ws)
+
+        try:
+            await broadcast_telephony_event(
+                "call_completed", "cc_xyz", "Call completed"
+            )
+            assert mock_ws not in _observers
+        finally:
+            _observers.clear()
+
+    @pytest.mark.asyncio
+    async def test_broadcast_event_schema(self) -> None:
+        """Event has all required fields and correct types."""
+        import json
+
+        from app.services.telephony_events import (
+            _observers,
+            broadcast_telephony_event,
+        )
+
+        _observers.clear()
+        mock_ws = AsyncMock()
+        _observers.add(mock_ws)
+
+        try:
+            await broadcast_telephony_event(
+                "caller_transcript",
+                "cc_test",
+                'Caller: "Hello"',
+                turn=2,
+                metadata={"text": "Hello"},
+            )
+
+            sent = json.loads(mock_ws.send_text.call_args[0][0])
+            # Required fields
+            assert isinstance(sent["type"], str)
+            assert isinstance(sent["call_id"], str)
+            assert isinstance(sent["timestamp"], str)
+            assert isinstance(sent["message"], str)
+            # Optional fields
+            assert sent["turn"] == 2
+            assert isinstance(sent["metadata"], dict)
+        finally:
+            _observers.clear()
+
+    @pytest.mark.asyncio
+    async def test_broadcast_without_turn_omits_field(self) -> None:
+        """Events without turn omit the turn field."""
+        import json
+
+        from app.services.telephony_events import (
+            _observers,
+            broadcast_telephony_event,
+        )
+
+        _observers.clear()
+        mock_ws = AsyncMock()
+        _observers.add(mock_ws)
+
+        try:
+            await broadcast_telephony_event(
+                "call_received", "cc_1", "Incoming call"
+            )
+
+            sent = json.loads(mock_ws.send_text.call_args[0][0])
+            assert "turn" not in sent
+        finally:
+            _observers.clear()
+
+    @pytest.mark.asyncio
+    async def test_register_unregister_observer(self) -> None:
+        """register/unregister manages observer set correctly."""
+        from app.services.telephony_events import (
+            _observers,
+            register_observer,
+            unregister_observer,
+        )
+
+        _observers.clear()
+        mock_ws = AsyncMock()
+
+        register_observer(mock_ws)
+        assert mock_ws in _observers
+
+        unregister_observer(mock_ws)
+        assert mock_ws not in _observers
+
+    @pytest.mark.asyncio
+    async def test_observe_ws_endpoint(self) -> None:
+        """The /api/v1/voice/telephony/observe WebSocket endpoint accepts connections."""
+        from app.services.telephony_events import _observers
+
+        _observers.clear()
+        with _client().websocket_connect(
+            "/api/v1/voice/telephony/observe"
+        ) as ws:
+            # Should be registered after connect
+            assert len(_observers) == 1
+            ws.close()
+        # Should be unregistered after disconnect
+        assert len(_observers) == 0

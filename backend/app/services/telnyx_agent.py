@@ -34,6 +34,7 @@ from app.core.logging import logger
 from app.providers.factory import ProviderError, get_llm_provider
 from app.providers.llm.interface import LLMInterface
 from app.providers.types import LLMMessage
+from app.services.telephony_events import broadcast_telephony_event
 from app.services.tool_service import get_tool_registry
 from app.tools.executor import ToolExecutor
 
@@ -192,6 +193,16 @@ class TelephonyAgentSession:
                 turn,
                 _TELNYX_LLM_MODEL,
             )
+            await broadcast_telephony_event(
+                "agent_processing",
+                self._call_control_id,
+                "Processing with GPT-4o-mini",
+                turn=turn,
+                metadata={
+                    "provider": "openrouter",
+                    "model": _TELNYX_LLM_MODEL,
+                },
+            )
             logger.debug(
                 "[VOICE:TELNYX:AGENT] turn=%d transcript='%s' history=%d",
                 turn,
@@ -215,6 +226,17 @@ class TelephonyAgentSession:
                     iterations,
                     len(tool_calls),
                 )
+                await broadcast_telephony_event(
+                    "agent_response",
+                    self._call_control_id,
+                    "Response generated",
+                    turn=turn,
+                    metadata={
+                        "duration_ms": round(turn_ms),
+                        "iterations": iterations,
+                        "tool_calls": len(tool_calls),
+                    },
+                )
                 logger.debug(
                     "[VOICE:TELNYX:AGENT] turn=%d response='%s' "
                     "tokens_in=%s tokens_out=%s",
@@ -231,6 +253,7 @@ class TelephonyAgentSession:
                             text=response_text,
                             turn=turn,
                             websocket=self._websocket,
+                            call_id=self._call_control_id,
                         )
                     except Exception as e:
                         logger.error(
@@ -252,6 +275,13 @@ class TelephonyAgentSession:
                     turn,
                     turn_ms,
                     e,
+                )
+                await broadcast_telephony_event(
+                    "error",
+                    self._call_control_id,
+                    "Agent processing failed",
+                    turn=turn,
+                    metadata={"stage": "agent"},
                 )
                 # Do NOT crash — keep the media/Deepgram pipeline alive
 

@@ -38,6 +38,7 @@ from app.providers.stt.streaming import (
     StreamingSTTSession,
     open_streaming_session,
 )
+from app.services.telephony_events import broadcast_telephony_event
 from app.utils.audio import pcmu_8k_to_pcm_16k
 
 # Queue size for audio packets (bounded to prevent memory growth)
@@ -354,6 +355,13 @@ class TelnyxDeepgramBridge:
                             "[VOICE:TELNYX:STT] turn=%d transcript=\"%s\"",
                             self._utterances_emitted,
                             utterance[:120],
+                        )
+                        await broadcast_telephony_event(
+                            "caller_transcript",
+                            self._stream_id,
+                            f'Caller: "{utterance}"',
+                            turn=self._utterances_emitted,
+                            metadata={"text": utterance},
                         )
                     else:
                         logger.debug(

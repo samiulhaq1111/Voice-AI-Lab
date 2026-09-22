@@ -28,6 +28,7 @@ from fastapi import WebSocket
 from app.core.logging import logger
 from app.providers.factory import get_tts_provider
 from app.providers.tts.interface import TTSInterface
+from app.services.telephony_events import broadcast_telephony_event
 from app.services.telnyx_media import pcmu_chunks_from_bytes
 from app.utils.audio import mp3_to_pcmu_8k
 
@@ -72,6 +73,8 @@ class TelnyxTTSService:
         text: str,
         turn: int,
         websocket: WebSocket,
+        *,
+        call_id: str = "",
     ) -> bool:
         """Synthesize text to speech and send audio to Telnyx.
 
@@ -79,6 +82,7 @@ class TelnyxTTSService:
             text: The agent response text to speak.
             turn: Current turn number for logging.
             websocket: The Telnyx media WebSocket.
+            call_id: Telnyx call_control_id for observability events.
 
         Returns:
             True if audio was sent successfully, False on failure.
@@ -97,6 +101,13 @@ class TelnyxTTSService:
             turn,
             len(text),
         )
+        await broadcast_telephony_event(
+            "tts_processing",
+            call_id,
+            "Generating voice with ElevenLabs",
+            turn=turn,
+            metadata={"provider": "elevenlabs", "text_length": len(text)},
+        )
 
         try:
             # Run TTS synthesis in background thread to avoid blocking
@@ -107,6 +118,16 @@ class TelnyxTTSService:
                 turn,
                 len(tts_result.audio_data),
                 tts_ms,
+            )
+            await broadcast_telephony_event(
+                "tts_completed",
+                call_id,
+                "Voice generated",
+                turn=turn,
+                metadata={
+                    "duration_ms": round(tts_ms),
+                    "bytes": len(tts_result.audio_data),
+                },
             )
         except Exception as e:
             tts_ms = (time.monotonic() - tts_start) * 1000
@@ -170,5 +191,22 @@ class TelnyxTTSService:
             len(chunks),
             total_bytes,
             send_ms,
+        )
+        await broadcast_telephony_event(
+            "audio_streaming",
+            call_id,
+            "Streaming AI voice to caller",
+            turn=turn,
+            metadata={
+                "chunks": len(chunks),
+                "bytes": total_bytes,
+            },
+        )
+        await broadcast_telephony_event(
+            "turn_completed",
+            call_id,
+            f"Turn {turn} completed",
+            turn=turn,
+            metadata={"total_ms": round(send_ms)},
         )
         return True

@@ -580,3 +580,48 @@ export interface BenchmarkComparisonResult {
   configurations: ComparisonConfigurationResult[];
   validation_errors: string[];
 }
+
+// --- Telephony Observability Types (Phase 8A) ---
+
+export type TelephonyEventType =
+  | 'call_received'
+  | 'call_answered'
+  | 'greeting_completed'
+  | 'media_connected'
+  | 'stt_connected'
+  | 'caller_transcript'
+  | 'agent_processing'
+  | 'agent_response'
+  | 'tts_processing'
+  | 'tts_completed'
+  | 'audio_streaming'
+  | 'turn_completed'
+  | 'call_completed'
+  | 'error';
+
+export type TelephonyCallState =
+  | 'idle'
+  | 'connected'
+  | 'listening'
+  | 'processing'
+  | 'speaking'
+  | 'error'
+  | 'completed';
+
+export interface TelephonyEvent {
+  type: TelephonyEventType;
+  call_id: string;
+  timestamp: string;
+  message: string;
+  turn?: number;
+  metadata?: Record<string, unknown>;
+}
+
+export interface TelephonyTurnInfo {
+  turn: number;
+  transcript?: string;
+  response?: string;
+  llm_duration_ms?: number;
+  tts_duration_ms?: number;
+  audio_bytes?: number;
+}
