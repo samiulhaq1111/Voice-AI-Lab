@@ -225,6 +225,8 @@ class TelephonyAgentSession:
                 metadata={
                     "provider": "openrouter",
                     "model": _TELNYX_LLM_MODEL,
+                    "release_reason": utterance.release_reason,
+                    "settle_ms": utterance.settle_ms,
                     "speech_final_to_utterance_end_ms": (
                         round(speech_final_to_utterance_end_ms)
                         if speech_final_to_utterance_end_ms is not None

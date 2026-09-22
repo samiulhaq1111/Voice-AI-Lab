@@ -50,6 +50,12 @@ _AUDIO_QUEUE_MAX_SIZE = 100
 # Queue size for completed utterances (bounded to prevent memory growth)
 _UTTERANCE_QUEUE_MAX_SIZE = 20
 
+# Settle timer duration (ms) for early release on speech_final.
+# If no new STT evidence arrives within this window, release the utterance
+# without waiting for utterance_end. This saves ~600ms vs waiting for the
+# full 1s utterance_end silence timeout.
+_SETTLE_MS = 400
+
 
 @dataclass(frozen=True)
 class Utterance:
@@ -64,6 +70,8 @@ class Utterance:
     speech_final_at: float | None  # monotonic, None if no speech_final seen
     utterance_end_at: float  # monotonic
     last_word_end: float | None  # Deepgram audio-time seconds, None if absent
+    release_reason: str = "utterance_end"  # "speech_final_settle" or "utterance_end"
+    settle_ms: int | None = None  # settle timer duration if early release
 
 
 class TelnyxDeepgramBridge:
@@ -99,6 +107,9 @@ class TelnyxDeepgramBridge:
         # End-of-speech timing marks for the current accumulation
         self._speech_final_at: float | None = None
         self._last_word_end: float | None = None
+        # Settle timer for early release on speech_final
+        self._settle_task: asyncio.Task | None = None
+        self._released: bool = False  # True if current utterance already released
 
     @property
     def stream_id(self) -> str:
@@ -189,6 +200,9 @@ class TelnyxDeepgramBridge:
             self._finals,
             self._utterances_emitted,
         )
+
+        # Cancel settle timer if active
+        self._cancel_settle_timer()
 
         # Signal audio forwarder to stop
         await self._audio_queue.put(b"")  # Sentinel
@@ -316,6 +330,146 @@ class TelnyxDeepgramBridge:
 
         logger.debug("[VOICE:TELNYX:STT] Audio forwarder stopped")
 
+    def _cancel_settle_timer(self) -> None:
+        """Cancel the settle timer if active."""
+        if self._settle_task is not None and not self._settle_task.done():
+            self._settle_task.cancel()
+        self._settle_task = None
+
+    def _start_settle_timer(self) -> None:
+        """Start the settle timer for early release on speech_final.
+
+        The timer will fire after _SETTLE_MS if no new STT evidence arrives.
+        """
+        self._cancel_settle_timer()
+        self._settle_task = asyncio.create_task(self._settle_timer_expired())
+        logger.debug(
+            "[VOICE:TELNYX:STT] settle timer started settle_ms=%d text='%s'",
+            _SETTLE_MS,
+            self._current_utterance_text[:80],
+        )
+
+    async def _settle_timer_expired(self) -> None:
+        """Called when the settle timer expires without new STT evidence.
+
+        Releases the accumulated utterance early to reduce end-of-speech latency.
+        """
+        try:
+            await asyncio.sleep(_SETTLE_MS / 1000.0)
+            # Timer expired — release the utterance early
+            if self._released:
+                # Already released (e.g., by utterance_end)
+                return
+            if not self._current_utterance_text.strip():
+                # No text to release
+                return
+            if not self._utterance_finalized:
+                # No final transcript yet — wait for utterance_end
+                return
+
+            logger.info(
+                "[VOICE:TELNYX:STT] settle timer expired — early release "
+                "settle_ms=%d text='%s'",
+                _SETTLE_MS,
+                self._current_utterance_text[:80],
+            )
+            await self._release_utterance(
+                release_reason="speech_final_settle",
+                settle_ms=_SETTLE_MS,
+            )
+        except asyncio.CancelledError:
+            # Timer was cancelled (new STT evidence arrived)
+            pass
+        except Exception as e:
+            logger.error("[VOICE:TELNYX:STT] settle timer error=%s", e)
+
+    async def _release_utterance(
+        self,
+        release_reason: str = "utterance_end",
+        settle_ms: int | None = None,
+    ) -> None:
+        """Release the accumulated utterance to the agent queue.
+
+        Args:
+            release_reason: "speech_final_settle" or "utterance_end"
+            settle_ms: settle timer duration if early release
+        """
+        if self._released:
+            # Prevent duplicate releases
+            return
+
+        utterance_text = self._current_utterance_text.strip()
+        if not utterance_text or not self._utterance_finalized:
+            # Nothing to release
+            return
+
+        release_at = time.monotonic()
+        last_word_end = self._last_word_end
+
+        self._utterances_emitted += 1
+        utterance = Utterance(
+            text=utterance_text,
+            speech_final_at=self._speech_final_at,
+            utterance_end_at=release_at,
+            last_word_end=last_word_end,
+            release_reason=release_reason,
+            settle_ms=settle_ms,
+        )
+        try:
+            self.utterance_queue.put_nowait(utterance)
+        except asyncio.QueueFull:
+            logger.warning(
+                "[VOICE:TELNYX:STT] Utterance queue full — dropping utterance "
+                "queue_size=%d",
+                self.utterance_queue.qsize(),
+            )
+
+        logger.info(
+            "[VOICE:TELNYX:STT] turn=%d release_reason=%s transcript=\"%s\"",
+            self._utterances_emitted,
+            release_reason,
+            utterance_text[:120],
+        )
+
+        # Emit caller_speech_final with timing metadata
+        speech_final_to_release_ms: float | None = None
+        if self._speech_final_at is not None:
+            speech_final_to_release_ms = (
+                release_at - self._speech_final_at
+            ) * 1000
+
+        await broadcast_telephony_event(
+            "caller_speech_final",
+            self._stream_id,
+            "Deepgram detected end of speech",
+            turn=self._utterances_emitted,
+            metadata={
+                "last_word_end": last_word_end,
+                "speech_final_to_utterance_end_ms": (
+                    round(speech_final_to_release_ms)
+                    if speech_final_to_release_ms is not None
+                    else None
+                ),
+                "release_reason": release_reason,
+                "settle_ms": settle_ms,
+            },
+        )
+        await broadcast_telephony_event(
+            "caller_transcript",
+            self._stream_id,
+            f'Caller: "{utterance_text}"',
+            turn=self._utterances_emitted,
+            metadata={"text": utterance_text},
+        )
+
+        # Mark as released to prevent duplicate releases
+        self._released = True
+        # Reset utterance accumulation for next utterance
+        self._current_utterance_text = ""
+        self._utterance_finalized = False
+        self._speech_final_at = None
+        self._last_word_end = None
+
     async def _transcript_processor(self) -> None:
         """Process transcript events from Deepgram.
 
@@ -340,6 +494,8 @@ class TelnyxDeepgramBridge:
 
                 if event.type == "partial":
                     self._partials += 1
+                    # Cancel settle timer — new STT evidence arrived
+                    self._cancel_settle_timer()
                     logger.debug(
                         "[VOICE:TELNYX:STT] partial text='%s' confidence=%.2f",
                         event.text[:80],
@@ -347,6 +503,8 @@ class TelnyxDeepgramBridge:
                     )
                 elif event.type == "final":
                     self._finals += 1
+                    # Cancel settle timer — new final arrived
+                    self._cancel_settle_timer()
                     # Accumulate final transcript into current utterance
                     prev = self._current_utterance_text
                     self._current_utterance_text = (
@@ -361,76 +519,34 @@ class TelnyxDeepgramBridge:
                         and event.metadata.get("speech_final")
                     ):
                         self._speech_final_at = time.monotonic()
+                    # Start/restart settle timer if speech_final has been seen
+                    if self._speech_final_at is not None:
+                        self._start_settle_timer()
                     logger.debug(
                         "[VOICE:TELNYX:STT] final text='%s' confidence=%.2f",
                         event.text[:120],
                         event.confidence,
                     )
                 elif event.type == "utterance_end":
-                    # Emit the accumulated utterance for agent processing
-                    utterance_text = self._current_utterance_text.strip()
-                    utterance_end_at = time.monotonic()
+                    # Cancel settle timer if still active
+                    self._cancel_settle_timer()
+                    # Capture last_word_end from utterance_end event
                     last_word_end = event.metadata.get("last_word_end")
+                    if last_word_end is not None:
+                        self._last_word_end = last_word_end
+                    # Release the accumulated utterance if not already released
+                    utterance_text = self._current_utterance_text.strip()
                     if utterance_text and self._utterance_finalized:
-                        self._utterances_emitted += 1
-                        utterance = Utterance(
-                            text=utterance_text,
-                            speech_final_at=self._speech_final_at,
-                            utterance_end_at=utterance_end_at,
-                            last_word_end=last_word_end,
-                        )
-                        try:
-                            self.utterance_queue.put_nowait(utterance)
-                        except asyncio.QueueFull:
-                            logger.warning(
-                                "[VOICE:TELNYX:STT] Utterance queue full "
-                                "— dropping utterance queue_size=%d",
-                                self.utterance_queue.qsize(),
-                            )
-                        logger.info(
-                            "[VOICE:TELNYX:STT] turn=%d transcript=\"%s\"",
-                            self._utterances_emitted,
-                            utterance_text[:120],
-                        )
-                        # Emit caller_speech_final with timing metadata.
-                        # Only emitted when speech_final was observed for this
-                        # accumulation — the frontend uses this to distinguish
-                        # a clean end-of-speech from a forced flush.
-                        speech_final_to_utterance_end_ms: float | None = None
-                        if self._speech_final_at is not None:
-                            speech_final_to_utterance_end_ms = (
-                                utterance_end_at - self._speech_final_at
-                            ) * 1000
-                        await broadcast_telephony_event(
-                            "caller_speech_final",
-                            self._stream_id,
-                            "Deepgram detected end of speech",
-                            turn=self._utterances_emitted,
-                            metadata={
-                                "last_word_end": last_word_end,
-                                "speech_final_to_utterance_end_ms": (
-                                    round(speech_final_to_utterance_end_ms)
-                                    if speech_final_to_utterance_end_ms is not None
-                                    else None
-                                ),
-                            },
-                        )
-                        await broadcast_telephony_event(
-                            "caller_transcript",
-                            self._stream_id,
-                            f'Caller: "{utterance_text}"',
-                            turn=self._utterances_emitted,
-                            metadata={"text": utterance_text},
+                        await self._release_utterance(
+                            release_reason="utterance_end",
+                            settle_ms=None,
                         )
                     else:
                         logger.debug(
                             "[VOICE:TELNYX:STT] utterance_end (empty)"
                         )
-                    # Reset utterance accumulation for next utterance
-                    self._current_utterance_text = ""
-                    self._utterance_finalized = False
-                    self._speech_final_at = None
-                    self._last_word_end = None
+                    # Reset released flag for next utterance
+                    self._released = False
                 elif event.type == "error":
                     logger.error(
                         "[VOICE:TELNYX:STT] Deepgram error text='%s'",

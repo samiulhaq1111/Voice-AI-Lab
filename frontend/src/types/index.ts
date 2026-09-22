@@ -631,4 +631,6 @@ export interface TelephonyTurnInfo {
   speech_final_to_utterance_end_ms?: number;
   utterance_end_to_agent_ms?: number;
   speech_final_to_agent_ms?: number;
+  release_reason?: string;
+  settle_ms?: number;
 }

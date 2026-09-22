@@ -1498,6 +1498,7 @@ class TestTelnyxModelConfiguration:
             _TELNYX_LLM_MODEL,
             TelephonyAgentSession,
         )
+        from app.services.telnyx_deepgram import Utterance
 
         assert _TELNYX_LLM_MODEL == "openai/gpt-4o-mini"
 
@@ -2894,7 +2895,7 @@ class TestEndOfSpeechObservability:
         import json
 
         from app.providers.stt.streaming import StreamEvent
-        from app.services.telephony_events import _observers, broadcast_telephony_event
+        from app.services.telephony_events import _observers
         from app.services.telnyx_deepgram import TelnyxDeepgramBridge
 
         _observers.clear()
@@ -3043,3 +3044,449 @@ class TestEndOfSpeechObservability:
         assert utterance is not None
         assert utterance.text == "Hello world"
         assert bridge.utterances_emitted == 1
+
+
+class TestSettleTimer:
+    """Phase 8C: guarded settle timer for early release on speech_final."""
+
+    @pytest.mark.asyncio
+    async def test_speech_final_starts_timer(self) -> None:
+        """A: speech_final starts the settle timer."""
+        from app.providers.stt.streaming import StreamEvent
+        from app.services.telnyx_deepgram import _SETTLE_MS, TelnyxDeepgramBridge
+
+        bridge = TelnyxDeepgramBridge()
+        bridge._running = True
+        bridge._session = AsyncMock()
+
+        # Final with speech_final should start the timer
+        final_event = StreamEvent(
+            type="final",
+            text="Hello",
+            confidence=0.95,
+            metadata={"speech_final": True},
+        )
+        # Don't send utterance_end — let the timer fire
+        bridge._session.receive = AsyncMock(side_effect=[final_event, None])
+
+        # Run the processor with a timeout to let the timer fire
+        try:
+            await asyncio.wait_for(
+                bridge._transcript_processor(),
+                timeout=(_SETTLE_MS / 1000) + 0.2,
+            )
+        except TimeoutError:
+            pass
+
+        # Verify the timer was started
+        assert bridge._speech_final_at is not None
+
+    @pytest.mark.asyncio
+    async def test_timer_does_not_release_before_settle_ms(self) -> None:
+        """B: Timer does not release before _SETTLE_MS."""
+        from app.providers.stt.streaming import StreamEvent
+        from app.services.telnyx_deepgram import _SETTLE_MS, TelnyxDeepgramBridge
+
+        bridge = TelnyxDeepgramBridge()
+        bridge._running = True
+        bridge._session = AsyncMock()
+
+        final_event = StreamEvent(
+            type="final",
+            text="Hello",
+            confidence=0.95,
+            metadata={"speech_final": True},
+        )
+        bridge._session.receive = AsyncMock(side_effect=[final_event, None])
+
+        # Run for less than _SETTLE_MS
+        start = asyncio.get_event_loop().time()
+        try:
+            await asyncio.wait_for(
+                bridge._transcript_processor(),
+                timeout=(_SETTLE_MS / 1000) - 0.05,
+            )
+        except TimeoutError:
+            pass
+        elapsed = asyncio.get_event_loop().time() - start
+
+        # Verify no utterance was released yet
+        assert bridge.utterance_queue.empty()
+        assert elapsed < (_SETTLE_MS / 1000)
+
+    @pytest.mark.asyncio
+    async def test_partial_resets_timer(self) -> None:
+        """C: Partial transcript resets the timer."""
+        from app.providers.stt.streaming import StreamEvent
+        from app.services.telnyx_deepgram import _SETTLE_MS, TelnyxDeepgramBridge
+
+        bridge = TelnyxDeepgramBridge()
+        bridge._running = True
+        bridge._session = AsyncMock()
+
+        # Final with speech_final, then partial, then let timer fire
+        events = [
+            StreamEvent(
+                type="final",
+                text="Hello",
+                confidence=0.95,
+                metadata={"speech_final": True},
+            ),
+            StreamEvent(type="partial", text="Hello world", confidence=0.9),
+            None,
+        ]
+        bridge._session.receive = AsyncMock(side_effect=events)
+
+        # Run the processor
+        try:
+            await asyncio.wait_for(
+                bridge._transcript_processor(),
+                timeout=(_SETTLE_MS / 1000) + 0.3,
+            )
+        except TimeoutError:
+            pass
+
+        # Timer should have been cancelled by partial
+        # (no utterance released because no new speech_final after partial)
+        assert bridge.utterance_queue.empty()
+
+    @pytest.mark.asyncio
+    async def test_final_resets_timer(self) -> None:
+        """D: Final transcript resets the timer."""
+        from app.providers.stt.streaming import StreamEvent
+        from app.services.telnyx_deepgram import _SETTLE_MS, TelnyxDeepgramBridge
+
+        bridge = TelnyxDeepgramBridge()
+        bridge._running = True
+        bridge._session = AsyncMock()
+
+        # Two finals with speech_final on first, then let timer fire
+        events = [
+            StreamEvent(
+                type="final",
+                text="Hello",
+                confidence=0.95,
+                metadata={"speech_final": True},
+            ),
+            StreamEvent(type="final", text="world", confidence=0.9),
+            None,
+        ]
+        bridge._session.receive = AsyncMock(side_effect=events)
+
+        # Run the processor
+        try:
+            await asyncio.wait_for(
+                bridge._transcript_processor(),
+                timeout=(_SETTLE_MS / 1000) + 0.3,
+            )
+        except TimeoutError:
+            pass
+
+        # Timer was cancelled by second final, no new speech_final started
+        # so no utterance released
+        assert bridge.utterance_queue.empty()
+
+    @pytest.mark.asyncio
+    async def test_timer_expiry_releases_exactly_once(self) -> None:
+        """E: Timer expiry releases exactly once."""
+        from app.providers.stt.streaming import StreamEvent
+        from app.services.telnyx_deepgram import _SETTLE_MS, TelnyxDeepgramBridge
+
+        bridge = TelnyxDeepgramBridge()
+        bridge._running = True
+        bridge._session = AsyncMock()
+
+        final_event = StreamEvent(
+            type="final",
+            text="Hello world",
+            confidence=0.95,
+            metadata={"speech_final": True},
+        )
+        bridge._session.receive = AsyncMock(side_effect=[final_event, None])
+
+        # Run the processor
+        await bridge._transcript_processor()
+        # Wait for the timer to fire
+        await asyncio.sleep((_SETTLE_MS / 1000) + 0.1)
+
+        # Verify exactly one utterance was released
+        assert bridge.utterances_emitted == 1
+        utterance = await bridge.utterance_queue.get()
+        assert utterance.text == "Hello world"
+        assert utterance.release_reason == "speech_final_settle"
+        assert utterance.settle_ms == _SETTLE_MS
+
+    @pytest.mark.asyncio
+    async def test_utterance_end_releases_immediately(self) -> None:
+        """F: utterance_end releases immediately."""
+        from app.providers.stt.streaming import StreamEvent
+        from app.services.telnyx_deepgram import TelnyxDeepgramBridge
+
+        bridge = TelnyxDeepgramBridge()
+        bridge._running = True
+        bridge._session = AsyncMock()
+
+        # Final with speech_final, then immediate utterance_end
+        events = [
+            StreamEvent(
+                type="final",
+                text="Hello",
+                confidence=0.95,
+                metadata={"speech_final": True},
+            ),
+            StreamEvent(type="utterance_end", metadata={"last_word_end": 1.0}),
+            None,
+        ]
+        bridge._session.receive = AsyncMock(side_effect=events)
+
+        # Run the processor — should not wait for timer
+        start = asyncio.get_event_loop().time()
+        await bridge._transcript_processor()
+        elapsed = asyncio.get_event_loop().time() - start
+
+        # Verify utterance was released immediately
+        assert bridge.utterances_emitted == 1
+        utterance = await bridge.utterance_queue.get()
+        assert utterance.release_reason == "utterance_end"
+        # Should be much faster than _SETTLE_MS
+        assert elapsed < 0.1
+
+    @pytest.mark.asyncio
+    async def test_utterance_end_after_early_release_no_duplicate(self) -> None:
+        """G: utterance_end after early release does not duplicate the turn."""
+        from app.providers.stt.streaming import StreamEvent
+        from app.services.telnyx_deepgram import _SETTLE_MS, TelnyxDeepgramBridge
+
+        bridge = TelnyxDeepgramBridge()
+        bridge._running = True
+        bridge._session = AsyncMock()
+
+        # Final with speech_final, then utterance_end after timer fires
+        call_count = 0
+
+        async def receive_side_effect():
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return StreamEvent(
+                    type="final",
+                    text="Hello",
+                    confidence=0.95,
+                    metadata={"speech_final": True},
+                )
+            elif call_count == 2:
+                # Wait for timer to fire
+                await asyncio.sleep((_SETTLE_MS / 1000) + 0.1)
+                return StreamEvent(
+                    type="utterance_end",
+                    metadata={"last_word_end": 1.0},
+                )
+            else:
+                return None
+
+        bridge._session.receive = receive_side_effect
+
+        # Run the processor
+        await bridge._transcript_processor()
+
+        # Verify only one utterance was released
+        assert bridge.utterances_emitted == 1
+        utterance = await bridge.utterance_queue.get()
+        assert utterance.release_reason == "speech_final_settle"
+
+    @pytest.mark.asyncio
+    async def test_multiple_speech_final_no_duplicate_turns(self) -> None:
+        """H: Multiple speech_final events do not create duplicate turns."""
+        from app.providers.stt.streaming import StreamEvent
+        from app.services.telnyx_deepgram import _SETTLE_MS, TelnyxDeepgramBridge
+
+        bridge = TelnyxDeepgramBridge()
+        bridge._running = True
+        bridge._session = AsyncMock()
+
+        # Multiple finals with speech_final
+        events = [
+            StreamEvent(
+                type="final",
+                text="Hello",
+                confidence=0.95,
+                metadata={"speech_final": True},
+            ),
+            StreamEvent(
+                type="final",
+                text="world",
+                confidence=0.9,
+                metadata={"speech_final": True},
+            ),
+            None,
+        ]
+        bridge._session.receive = AsyncMock(side_effect=events)
+
+        # Run the processor
+        await bridge._transcript_processor()
+        # Wait for the timer to fire
+        await asyncio.sleep((_SETTLE_MS / 1000) + 0.1)
+
+        # Verify only one utterance was released
+        assert bridge.utterances_emitted == 1
+        utterance = await bridge.utterance_queue.get()
+        assert utterance.text == "Hello world"
+
+    @pytest.mark.asyncio
+    async def test_resumed_speech_before_settle_timer_expires(self) -> None:
+        """I: Resumed speech after a pause becomes part of the same utterance."""
+        from app.providers.stt.streaming import StreamEvent
+        from app.services.telnyx_deepgram import _SETTLE_MS, TelnyxDeepgramBridge
+
+        bridge = TelnyxDeepgramBridge()
+        bridge._running = True
+        bridge._session = AsyncMock()
+
+        # speech_final, then partial before timer expires
+        events = [
+            StreamEvent(
+                type="final",
+                text="Please tell me",
+                confidence=0.95,
+                metadata={"speech_final": True},
+            ),
+            # Partial arrives before timer expires
+            StreamEvent(type="partial", text="the weather", confidence=0.9),
+            # Then final with new speech_final
+            StreamEvent(
+                type="final",
+                text="the weather",
+                confidence=0.95,
+                metadata={"speech_final": True},
+            ),
+            None,
+        ]
+        bridge._session.receive = AsyncMock(side_effect=events)
+
+        # Run the processor
+        await bridge._transcript_processor()
+        # Wait for the timer to fire
+        await asyncio.sleep((_SETTLE_MS / 1000) + 0.1)
+
+        # Verify the utterance includes both parts
+        assert bridge.utterances_emitted == 1
+        utterance = await bridge.utterance_queue.get()
+        assert "Please tell me" in utterance.text
+        assert "the weather" in utterance.text
+
+    @pytest.mark.asyncio
+    async def test_timer_cleanup_on_bridge_shutdown(self) -> None:
+        """J: Timer cleanup on bridge shutdown."""
+        from app.providers.stt.streaming import StreamEvent
+        from app.services.telnyx_deepgram import TelnyxDeepgramBridge
+
+        bridge = TelnyxDeepgramBridge()
+        bridge._running = True
+        bridge._session = AsyncMock()
+
+        # Start a final with speech_final but don't let timer fire
+        final_event = StreamEvent(
+            type="final",
+            text="Hello",
+            confidence=0.95,
+            metadata={"speech_final": True},
+        )
+        bridge._session.receive = AsyncMock(side_effect=[final_event, None])
+
+        # Run the processor
+        await bridge._transcript_processor()
+
+        # The timer should have been started
+        assert bridge._settle_task is not None
+
+        # Stop the bridge (should cancel the timer)
+        bridge._running = False
+        bridge._cancel_settle_timer()
+
+        # Verify the timer was cancelled
+        assert bridge._settle_task is None or bridge._settle_task.done()
+
+    @pytest.mark.asyncio
+    async def test_existing_non_early_utterance_behavior(self) -> None:
+        """K: Existing non-early utterance behavior still works."""
+        from app.providers.stt.streaming import StreamEvent
+        from app.services.telnyx_deepgram import TelnyxDeepgramBridge
+
+        bridge = TelnyxDeepgramBridge()
+        bridge._running = True
+        bridge._session = AsyncMock()
+
+        # No speech_final — just finals and utterance_end
+        events = [
+            StreamEvent(type="final", text="Hello", confidence=0.9),
+            StreamEvent(type="final", text="world", confidence=0.95),
+            StreamEvent(type="utterance_end", metadata={"last_word_end": 1.0}),
+            None,
+        ]
+        bridge._session.receive = AsyncMock(side_effect=events)
+
+        await bridge._transcript_processor()
+
+        # Verify the utterance was emitted normally
+        assert bridge.utterances_emitted == 1
+        utterance = await bridge.utterance_queue.get()
+        assert utterance.text == "Hello world"
+        assert utterance.release_reason == "utterance_end"
+        assert utterance.settle_ms is None
+
+    @pytest.mark.asyncio
+    async def test_no_overlapping_agent_turns(self) -> None:
+        """L: No overlapping agent/TTS turns."""
+        import time
+
+        from app.services.telnyx_agent import TelephonyAgentSession
+        from app.services.telnyx_deepgram import Utterance
+
+        queue: asyncio.Queue[Utterance | None] = asyncio.Queue()
+        agent = TelephonyAgentSession(
+            call_control_id="cc_test",
+            utterance_queue=queue,
+            tts_service=None,
+            websocket=None,
+        )
+        agent._llm = AsyncMock()
+        agent._llm.close = AsyncMock()
+
+        # Create two utterances
+        now = time.monotonic()
+        utterance1 = Utterance(
+            text="First",
+            speech_final_at=now,
+            utterance_end_at=now + 0.5,
+            last_word_end=0.5,
+            release_reason="speech_final_settle",
+            settle_ms=400,
+        )
+        utterance2 = Utterance(
+            text="Second",
+            speech_final_at=now + 1.0,
+            utterance_end_at=now + 1.5,
+            last_word_end=1.5,
+            release_reason="utterance_end",
+            settle_ms=None,
+        )
+        await queue.put(utterance1)
+        await queue.put(utterance2)
+        await queue.put(None)  # sentinel
+
+        # Mock AgentRuntime to track calls
+        with patch("app.services.telnyx_agent.AgentRuntime") as mock_runtime:
+            mock_runtime.return_value.run = AsyncMock(
+                return_value=AsyncMock(
+                    response="Response",
+                    tool_calls=[],
+                    usage={},
+                    iterations=1,
+                )
+            )
+            await agent.start()
+            await agent._worker_task
+
+        # Verify both utterances were processed sequentially
+        assert agent.turn == 2
+        assert mock_runtime.return_value.run.call_count == 2

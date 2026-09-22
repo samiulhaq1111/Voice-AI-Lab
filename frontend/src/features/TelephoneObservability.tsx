@@ -167,6 +167,12 @@ export default function TelephoneObservability() {
                   event.metadata?.speech_final_to_agent_ms as
                     | number
                     | undefined;
+                updated.release_reason = event.metadata?.release_reason as
+                  | string
+                  | undefined;
+                updated.settle_ms = event.metadata?.settle_ms as
+                  | number
+                  | undefined;
               }
               if (event.type === 'agent_response') {
                 updated.llm_duration_ms = event.metadata?.duration_ms as
@@ -212,6 +218,12 @@ export default function TelephoneObservability() {
                 event.metadata?.speech_final_to_agent_ms as
                   | number
                   | undefined;
+              newTurn.release_reason = event.metadata?.release_reason as
+                | string
+                | undefined;
+              newTurn.settle_ms = event.metadata?.settle_ms as
+                | number
+                | undefined;
             }
             return [...prev, newTurn];
           });
@@ -351,6 +363,19 @@ export default function TelephoneObservability() {
                   <span className="text-blue-400">
                     Total STT delay:{' '}
                     {(t.speech_final_to_agent_ms / 1000).toFixed(2)}s
+                  </span>
+                )}
+                {t.release_reason && (
+                  <span
+                    className={
+                      t.release_reason === 'speech_final_settle'
+                        ? 'text-green-400'
+                        : 'text-gray-400'
+                    }
+                  >
+                    {t.release_reason === 'speech_final_settle'
+                      ? `Early release (${t.settle_ms}ms)`
+                      : 'Normal release'}
                   </span>
                 )}
                 {t.llm_duration_ms != null && (
