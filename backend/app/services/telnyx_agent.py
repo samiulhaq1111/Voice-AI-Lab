@@ -34,6 +34,7 @@ from app.core.logging import logger
 from app.providers.factory import ProviderError, get_llm_provider
 from app.providers.llm.interface import LLMInterface
 from app.providers.types import LLMMessage
+from app.services.sentence_buffer import SentenceBuffer
 from app.services.telephony_events import broadcast_telephony_event
 from app.services.telnyx_deepgram import Utterance
 from app.services.tool_service import get_tool_registry
@@ -42,6 +43,11 @@ from app.tools.executor import ToolExecutor
 # Telnyx telephony uses a fast, reliable model for low-latency phone calls.
 # This is independent of the global default LLM model.
 _TELNYX_LLM_MODEL = "openai/gpt-4o-mini"
+
+# Default system prompt for telephone voice assistant
+_TELNYX_SYSTEM_PROMPT = (
+    "You are a helpful voice assistant. Keep responses concise and conversational."
+)
 
 
 class TelephonyAgentSession:
@@ -252,20 +258,25 @@ class TelephonyAgentSession:
             )
 
             try:
-                result = await self._process_utterance(utterance.text)
+                # Use streaming path for reduced latency
+                result = await self._process_utterance_streaming(
+                    utterance.text, turn
+                )
                 turn_ms = (time.monotonic() - turn_start) * 1000
                 response_text = result.get("response", "")
                 usage = result.get("usage", {})
                 iterations = result.get("iterations", 0)
                 tool_calls = result.get("tool_calls", [])
+                streamed = result.get("streamed", False)
 
                 logger.info(
                     "[VOICE:TELNYX:AGENT] turn=%d completed "
-                    "duration_ms=%.0f iterations=%d tools=%d",
+                    "duration_ms=%.0f iterations=%d tools=%d streamed=%s",
                     turn,
                     turn_ms,
                     iterations,
                     len(tool_calls),
+                    streamed,
                 )
                 await broadcast_telephony_event(
                     "agent_response",
@@ -276,6 +287,17 @@ class TelephonyAgentSession:
                         "duration_ms": round(turn_ms),
                         "iterations": iterations,
                         "tool_calls": len(tool_calls),
+                        "streamed": streamed,
+                        "first_token_ms": (
+                            round(result["first_token_ms"])
+                            if result.get("first_token_ms") is not None
+                            else None
+                        ),
+                        "first_sentence_ms": (
+                            round(result["first_sentence_ms"])
+                            if result.get("first_sentence_ms") is not None
+                            else None
+                        ),
                     },
                 )
                 logger.debug(
@@ -287,8 +309,8 @@ class TelephonyAgentSession:
                     usage.get("completion_tokens", "n/a"),
                 )
 
-                # --- TTS synthesis + send audio to Telnyx ---
-                if response_text and self._tts_service and self._websocket:
+                # For non-streamed responses (tool calls), handle TTS here
+                if not streamed and response_text and self._tts_service and self._websocket:
                     try:
                         await self._tts_service.synthesize_and_send(
                             text=response_text,
@@ -377,4 +399,185 @@ class TelephonyAgentSession:
             "tool_calls": result.tool_calls,
             "usage": result.usage,
             "iterations": result.iterations,
+        }
+
+    async def _process_utterance_streaming(
+        self, transcript: str, turn: int
+    ) -> dict[str, Any]:
+        """Process utterance with LLM streaming for reduced latency.
+
+        Uses a two-phase approach:
+        1. First, use non-streaming chat() to check for tool calls
+        2. If no tools, use stream_chat() to stream the response
+        3. Sentence buffer feeds TTS incrementally
+
+        Args:
+            transcript: The user's transcribed text.
+            turn: Current turn number for observability.
+
+        Returns:
+            Dict with response, timing metrics, and streaming info.
+        """
+        if self._llm is None:
+            raise RuntimeError("LLM provider not initialized")
+
+        stream_start = time.monotonic()
+        first_token_ms: float | None = None
+        first_sentence_ms: float | None = None
+
+        # Build messages for LLM
+        messages = [LLMMessage(role="system", content=_TELNYX_SYSTEM_PROMPT)]
+        messages.extend(self._history)
+        messages.append(LLMMessage(role="user", content=transcript))
+
+        # Phase 1: Check for tool calls using non-streaming chat()
+        tool_schemas = get_tool_registry().get_schemas()
+        logger.debug(
+            "[VOICE:TELNYX:AGENT] turn=%d streaming phase1: tool check",
+            turn,
+        )
+
+        response = await self._llm.chat(
+            messages=messages,
+            model=_TELNYX_LLM_MODEL,
+            tools=tool_schemas if tool_schemas else None,
+        )
+
+        # If tool calls detected, fall back to non-streaming path
+        if response.tool_calls:
+            logger.info(
+                "[VOICE:TELNYX:AGENT] turn=%d tool_calls=%d — "
+                "falling back to non-streaming",
+                turn,
+                len(response.tool_calls),
+            )
+            # Use existing AgentRuntime for tool execution
+            result = await self._process_utterance(transcript)
+            result["streamed"] = False
+            result["fallback_reason"] = "tool_calls"
+            return result
+
+        # Phase 2: No tools — stream the response
+        logger.info(
+            "[VOICE:TELNYX:AGENT] turn=%d streaming phase2: no tools, "
+            "using stream_chat",
+            turn,
+        )
+
+        await broadcast_telephony_event(
+            "llm_stream_start",
+            self._call_control_id,
+            "LLM streaming response",
+            turn=turn,
+            metadata={"provider": "openrouter"},
+        )
+
+        # Stream the response
+        sentence_buffer = SentenceBuffer()
+        sentence_queue: asyncio.Queue[str | None] = asyncio.Queue()
+        accumulated_text = ""
+
+        async def stream_llm() -> None:
+            """Stream LLM tokens and feed sentence buffer."""
+            nonlocal first_token_ms, first_sentence_ms, accumulated_text
+
+            try:
+                async for chunk in self._llm.stream_chat(
+                    messages=messages,
+                    model=_TELNYX_LLM_MODEL,
+                ):
+                    if first_token_ms is None:
+                        first_token_ms = (
+                            time.monotonic() - stream_start
+                        ) * 1000
+                        await broadcast_telephony_event(
+                            "llm_first_token",
+                            self._call_control_id,
+                            f"First LLM token after {first_token_ms:.0f}ms",
+                            turn=turn,
+                            metadata={"ttft_ms": round(first_token_ms)},
+                        )
+
+                    accumulated_text += chunk
+                    sentences = sentence_buffer.add(chunk)
+
+                    for sentence in sentences:
+                        if first_sentence_ms is None:
+                            first_sentence_ms = (
+                                time.monotonic() - stream_start
+                            ) * 1000
+                            await broadcast_telephony_event(
+                                "llm_first_sentence",
+                                self._call_control_id,
+                                f"First sentence after {first_sentence_ms:.0f}ms",
+                                turn=turn,
+                                metadata={"ttfs_ms": round(first_sentence_ms)},
+                            )
+                        await sentence_queue.put(sentence)
+
+                # Flush remaining text
+                remaining = sentence_buffer.flush()
+                if remaining:
+                    await sentence_queue.put(remaining)
+
+            except Exception as e:
+                logger.error(
+                    "[VOICE:TELNYX:AGENT] turn=%d LLM stream error=%s",
+                    turn,
+                    e,
+                )
+            finally:
+                await sentence_queue.put(None)  # Sentinel
+
+        async def sentence_iterator():
+            """Yield sentences from the queue."""
+            while True:
+                sentence = await sentence_queue.get()
+                if sentence is None:
+                    break
+                yield sentence
+
+        # Start LLM streaming in background
+        stream_task = asyncio.create_task(stream_llm())
+
+        # Stream sentences to TTS
+        tts_result = {"success": False}
+        if self._tts_service and self._websocket:
+            tts_result = await self._tts_service.stream_sentences(
+                sentences=sentence_iterator(),
+                turn=turn,
+                websocket=self._websocket,
+                call_id=self._call_control_id,
+            )
+
+        # Wait for stream to complete
+        await stream_task
+
+        # Update history
+        self._history.append(LLMMessage(role="user", content=transcript))
+        self._history.append(
+            LLMMessage(role="assistant", content=accumulated_text)
+        )
+
+        total_ms = (time.monotonic() - stream_start) * 1000
+        logger.info(
+            "[VOICE:TELNYX:AGENT] turn=%d streaming completed "
+            "ttft_ms=%s ttfs_ms=%s total_ms=%.0f text_length=%d",
+            turn,
+            f"{first_token_ms:.0f}" if first_token_ms is not None else "n/a",
+            f"{first_sentence_ms:.0f}" if first_sentence_ms is not None else "n/a",
+            total_ms,
+            len(accumulated_text),
+        )
+
+        return {
+            "response": accumulated_text,
+            "tool_calls": [],
+            "usage": response.usage,
+            "iterations": 1,
+            "streamed": True,
+            "first_token_ms": first_token_ms,
+            "first_sentence_ms": first_sentence_ms,
+            "tts_first_audio_ms": tts_result.get("first_audio_ms"),
+            "total_sentences": tts_result.get("total_sentences", 0),
         }

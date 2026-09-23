@@ -3439,6 +3439,7 @@ class TestSettleTimer:
         """L: No overlapping agent/TTS turns."""
         import time
 
+        from app.providers.types import LLMResponse
         from app.services.telnyx_agent import TelephonyAgentSession
         from app.services.telnyx_deepgram import Utterance
 
@@ -3449,8 +3450,22 @@ class TestSettleTimer:
             tts_service=None,
             websocket=None,
         )
+        # Mock LLM with proper chat() and stream_chat() responses
         agent._llm = AsyncMock()
         agent._llm.close = AsyncMock()
+        # chat() returns no tool calls
+        agent._llm.chat = AsyncMock(
+            return_value=LLMResponse(
+                content="Response",
+                tool_calls=None,
+                usage={"prompt_tokens": 10, "completion_tokens": 5},
+            )
+        )
+        # stream_chat() returns an async iterator of chunks
+        async def mock_stream_chat(*args, **kwargs):
+            for chunk in ["Response", " text"]:
+                yield chunk
+        agent._llm.stream_chat = mock_stream_chat
 
         # Create two utterances
         now = time.monotonic()
@@ -3474,19 +3489,8 @@ class TestSettleTimer:
         await queue.put(utterance2)
         await queue.put(None)  # sentinel
 
-        # Mock AgentRuntime to track calls
-        with patch("app.services.telnyx_agent.AgentRuntime") as mock_runtime:
-            mock_runtime.return_value.run = AsyncMock(
-                return_value=AsyncMock(
-                    response="Response",
-                    tool_calls=[],
-                    usage={},
-                    iterations=1,
-                )
-            )
-            await agent.start()
-            await agent._worker_task
+        await agent.start()
+        await agent._worker_task
 
         # Verify both utterances were processed sequentially
         assert agent.turn == 2
-        assert mock_runtime.return_value.run.call_count == 2

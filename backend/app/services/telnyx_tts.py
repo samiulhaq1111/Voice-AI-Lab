@@ -27,6 +27,7 @@ import base64
 import json
 import time
 from collections.abc import AsyncIterator
+from typing import Any
 
 from fastapi import WebSocket
 
@@ -157,6 +158,170 @@ class TelnyxTTSService:
             return await self._send_buffered(
                 text, turn, websocket, call_id, tts_start
             )
+
+    async def stream_sentences(
+        self,
+        sentences: AsyncIterator[str],
+        turn: int,
+        websocket: WebSocket,
+        *,
+        call_id: str = "",
+    ) -> dict[str, Any]:
+        """Stream sentences to TTS as they become available.
+
+        Processes sentences sequentially — each sentence gets its own
+        ElevenLabs stream, and audio is forwarded to Telnyx as it arrives.
+        This enables incremental TTS during LLM streaming.
+
+        Args:
+            sentences: Async iterator of complete sentences from the
+                sentence buffer.
+            turn: Current turn number for logging.
+            websocket: The Telnyx media WebSocket.
+            call_id: Telnyx call_control_id for observability events.
+
+        Returns:
+            Dict with timing metrics:
+                - tts_start: monotonic timestamp when TTS started
+                - first_audio_ms: time from tts_start to first audio frame
+                - total_sentences: number of sentences processed
+                - total_frames: total PCMU frames sent
+                - total_bytes: total bytes sent
+                - success: True if all sentences processed
+        """
+        if self._tts is None:
+            logger.warning(
+                "[VOICE:TELNYX:TTS] turn=%d stream_sentences skipped "
+                "— no TTS provider",
+                turn,
+            )
+            return {"success": False, "total_sentences": 0}
+
+        tts_start = time.monotonic()
+        first_audio_ms: float | None = None
+        total_sentences = 0
+        total_frames = 0
+        total_bytes = 0
+        success = True
+
+        await broadcast_telephony_event(
+            "tts_processing",
+            call_id,
+            "Streaming sentences to ElevenLabs",
+            turn=turn,
+            metadata={"mode": "sentence_stream"},
+        )
+
+        async for sentence in sentences:
+            if not sentence.strip():
+                continue
+
+            total_sentences += 1
+            sentence_start = time.monotonic()
+
+            logger.debug(
+                "[VOICE:TELNYX:TTS] turn=%d sentence=%d text='%s'",
+                turn,
+                total_sentences,
+                sentence[:80],
+            )
+
+            try:
+                # Stream this sentence through TTS
+                stream = self._open_stream(sentence)
+                pending = bytearray()
+                sentence_frames = 0
+
+                async for piece in stream:
+                    if not piece:
+                        continue
+                    pending.extend(piece)
+
+                    # Send every complete PCMU frame immediately
+                    while len(pending) >= _PCMU_FRAME_BYTES:
+                        frame = bytes(pending[:_PCMU_FRAME_BYTES])
+                        del pending[:_PCMU_FRAME_BYTES]
+
+                        if not await self._send_frame(frame, turn, websocket):
+                            success = False
+                            break
+
+                        sentence_frames += 1
+                        total_frames += 1
+                        total_bytes += len(frame)
+
+                        if first_audio_ms is None:
+                            first_audio_ms = (
+                                time.monotonic() - tts_start
+                            ) * 1000
+                            await self._announce_first_audio(
+                                turn,
+                                call_id,
+                                first_audio_ms,
+                                _TELEPHONY_OUTPUT_FORMAT,
+                            )
+
+                        # Pace at real-time
+                        await asyncio.sleep(_CHUNK_PACE_SECONDS)
+
+                    if not success:
+                        break
+
+                await self._close_stream(stream)
+
+                sentence_ms = (time.monotonic() - sentence_start) * 1000
+                logger.debug(
+                    "[VOICE:TELNYX:TTS] turn=%d sentence=%d completed "
+                    "frames=%d ms=%.0f",
+                    turn,
+                    total_sentences,
+                    sentence_frames,
+                    sentence_ms,
+                )
+
+            except Exception as e:
+                logger.error(
+                    "[VOICE:TELNYX:TTS] turn=%d sentence=%d error=%s",
+                    turn,
+                    total_sentences,
+                    e,
+                )
+                success = False
+                break
+
+        # Emit turn summary
+        total_ms = (time.monotonic() - tts_start) * 1000
+        logger.info(
+            "[VOICE:TELNYX:TTS] turn=%d sentence_stream completed "
+            "sentences=%d frames=%d bytes=%d ttfa_ms=%s total_ms=%.0f",
+            turn,
+            total_sentences,
+            total_frames,
+            total_bytes,
+            f"{first_audio_ms:.0f}" if first_audio_ms is not None else "n/a",
+            total_ms,
+        )
+
+        if total_frames > 0:
+            await self._emit_turn_summary(
+                turn=turn,
+                call_id=call_id,
+                tts_start=tts_start,
+                provider_done_ms=total_ms,
+                first_audio_ms=first_audio_ms,
+                frames_sent=total_frames,
+                sent_bytes=total_bytes,
+                audio_format=_TELEPHONY_OUTPUT_FORMAT,
+            )
+
+        return {
+            "tts_start": tts_start,
+            "first_audio_ms": first_audio_ms,
+            "total_sentences": total_sentences,
+            "total_frames": total_frames,
+            "total_bytes": total_bytes,
+            "success": success,
+        }
 
     # --- streaming path (preferred) ------------------------------------
 

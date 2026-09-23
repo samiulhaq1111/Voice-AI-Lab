@@ -633,4 +633,8 @@ export interface TelephonyTurnInfo {
   speech_final_to_agent_ms?: number;
   release_reason?: string;
   settle_ms?: number;
+  // Streaming metrics
+  streamed?: boolean;
+  first_token_ms?: number;
+  first_sentence_ms?: number;
 }

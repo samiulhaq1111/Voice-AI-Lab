@@ -178,6 +178,15 @@ export default function TelephoneObservability() {
                 updated.llm_duration_ms = event.metadata?.duration_ms as
                   | number
                   | undefined;
+                updated.streamed = event.metadata?.streamed as
+                  | boolean
+                  | undefined;
+                updated.first_token_ms = event.metadata?.first_token_ms as
+                  | number
+                  | undefined;
+                updated.first_sentence_ms = event.metadata?.first_sentence_ms as
+                  | number
+                  | undefined;
               }
               if (event.type === 'tts_first_audio') {
                 updated.first_audio_ms = event.metadata?.ttfa_ms as
@@ -222,6 +231,20 @@ export default function TelephoneObservability() {
                 | string
                 | undefined;
               newTurn.settle_ms = event.metadata?.settle_ms as
+                | number
+                | undefined;
+            }
+            if (event.type === 'agent_response') {
+              newTurn.llm_duration_ms = event.metadata?.duration_ms as
+                | number
+                | undefined;
+              newTurn.streamed = event.metadata?.streamed as
+                | boolean
+                | undefined;
+              newTurn.first_token_ms = event.metadata?.first_token_ms as
+                | number
+                | undefined;
+              newTurn.first_sentence_ms = event.metadata?.first_sentence_ms as
                 | number
                 | undefined;
             }
@@ -376,6 +399,19 @@ export default function TelephoneObservability() {
                     {t.release_reason === 'speech_final_settle'
                       ? `Early release (${t.settle_ms}ms)`
                       : 'Normal release'}
+                  </span>
+                )}
+                {t.streamed && (
+                  <span className="text-cyan-400">Streamed</span>
+                )}
+                {t.first_token_ms != null && (
+                  <span className="text-cyan-300">
+                    TTFT: {(t.first_token_ms / 1000).toFixed(2)}s
+                  </span>
+                )}
+                {t.first_sentence_ms != null && (
+                  <span className="text-cyan-200">
+                    First sentence: {(t.first_sentence_ms / 1000).toFixed(2)}s
                   </span>
                 )}
                 {t.llm_duration_ms != null && (
