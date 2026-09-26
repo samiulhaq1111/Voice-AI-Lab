@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from app.providers.types import LLMMessage, LLMResponse
+from app.providers.types import LLMResponse, StreamChunk
 from app.services.sentence_buffer import SentenceBuffer
 
 
@@ -71,8 +71,9 @@ class TestTelephonyStreamingIntegration:
         assert remaining == "Partial text"
 
     @pytest.mark.asyncio
-    async def test_tool_call_detection_falls_back(self) -> None:
-        """Tool calls in LLM response trigger fallback to non-streaming."""
+    async def test_tool_call_executes_without_redundant_llm(self) -> None:
+        """Streamed tool calls execute directly — no second LLM detection call."""
+        from app.providers.types import LLMResponse
         from app.services.telnyx_agent import TelephonyAgentSession
         from app.services.telnyx_deepgram import Utterance
 
@@ -84,24 +85,40 @@ class TestTelephonyStreamingIntegration:
             websocket=None,
         )
 
-        # Mock LLM that returns tool calls
-        agent._llm = AsyncMock()
-        agent._llm.close = AsyncMock()
-        agent._llm.chat = AsyncMock(
-            return_value=LLMResponse(
-                content=None,
+        stream_chat_called = 0
+        chat_called = 0
+
+        mock_llm = AsyncMock()
+        mock_llm.close = AsyncMock()
+
+        async def mock_stream_chat(*args, **kwargs):
+            nonlocal stream_chat_called
+            stream_chat_called += 1
+            yield StreamChunk(
                 tool_calls=[
                     {
+                        "index": 0,
                         "id": "call_1",
                         "function": {
                             "name": "get_weather",
                             "arguments": '{"location": "Islamabad"}',
                         },
+                        "type": "function",
                     }
-                ],
-                usage={"prompt_tokens": 10, "completion_tokens": 5},
+                ]
             )
-        )
+
+        async def mock_chat(*args, **kwargs):
+            nonlocal chat_called
+            chat_called += 1
+            return LLMResponse(
+                content="The weather is sunny!",
+                tool_calls=None,
+                usage={"prompt_tokens": 20, "completion_tokens": 5},
+            )
+
+        mock_llm.stream_chat = mock_stream_chat
+        mock_llm.chat = mock_chat
 
         # Create utterance
         now = time.monotonic()
@@ -114,23 +131,357 @@ class TestTelephonyStreamingIntegration:
         await queue.put(utterance)
         await queue.put(None)
 
-        # Mock AgentRuntime for tool execution
-        with patch("app.services.telnyx_agent.AgentRuntime") as mock_runtime:
-            mock_runtime.return_value.run = AsyncMock(
-                return_value=AsyncMock(
-                    response="The weather is sunny!",
-                    tool_calls=[{"function": {"name": "get_weather"}}],
-                    usage={},
-                    iterations=2,
-                )
-            )
-            mock_runtime.return_value.state.messages = []
+        # Mock LLM provider and tool registry
+        mock_tool = AsyncMock()
+        mock_tool.name = "get_weather"
+        mock_tool.enabled = True
+        mock_tool.handler = AsyncMock(return_value={"weather": "sunny"})
+        mock_tool.timeout_seconds = 10
+
+        with (
+            patch(
+                "app.services.telnyx_agent.get_llm_provider",
+                return_value=mock_llm,
+            ),
+            patch(
+                "app.services.telnyx_agent.get_tool_registry"
+            ) as mock_get_registry,
+        ):
+            from unittest.mock import MagicMock
+            mock_registry = MagicMock()
+            mock_registry.get.return_value = mock_tool
+            mock_registry.get_schemas.return_value = []
+            mock_get_registry.return_value = mock_registry
 
             await agent.start()
             await agent._worker_task
 
-        # Verify tool call path was taken
+        # Verify: stream_chat() called exactly once (no redundant call)
+        assert stream_chat_called == 1
+        # Verify: chat() called exactly once (final LLM only, NOT re-detection)
+        assert chat_called == 1
+        # Verify: turn completed
         assert agent.turn == 1
+        # Verify: conversation history has correct messages
+        assert len(agent.history) == 4
+        assert agent.history[0].role == "user"
+        assert agent.history[1].role == "assistant"
+        assert agent.history[1].tool_calls is not None
+        assert agent.history[2].role == "tool"
+        assert agent.history[3].role == "assistant"
+        assert agent.history[3].content == "The weather is sunny!"
+
+    @pytest.mark.asyncio
+    async def test_streamed_tool_args_assembled_from_deltas(self) -> None:
+        """Tool call arguments are fully assembled from incremental deltas."""
+        from app.providers.types import LLMResponse
+        from app.services.telnyx_agent import TelephonyAgentSession
+        from app.services.telnyx_deepgram import Utterance
+
+        queue: asyncio.Queue[Utterance | None] = asyncio.Queue()
+        agent = TelephonyAgentSession(
+            call_control_id="cc_test",
+            utterance_queue=queue,
+            tts_service=None,
+            websocket=None,
+        )
+
+        mock_llm = AsyncMock()
+        mock_llm.close = AsyncMock()
+        received_args = ""
+
+        async def mock_stream_chat(*args, **kwargs):
+            # Simulate incremental argument streaming
+            yield StreamChunk(
+                tool_calls=[{
+                    "index": 0,
+                    "id": "call_1",
+                    "function": {"name": "get_employee", "arguments": ""},
+                    "type": "function",
+                }]
+            )
+            yield StreamChunk(
+                tool_calls=[{
+                    "index": 0,
+                    "function": {"arguments": '{"employee_id"'},
+                }]
+            )
+            yield StreamChunk(
+                tool_calls=[{
+                    "index": 0,
+                    "function": {"arguments": ': "E001"}'},
+                }]
+            )
+
+        async def mock_chat(*args, **kwargs):
+            return LLMResponse(
+                content="Employee E001 details...",
+                tool_calls=None,
+                usage={},
+            )
+
+        mock_llm.stream_chat = mock_stream_chat
+        mock_llm.chat = mock_chat
+
+        now = time.monotonic()
+        utterance = Utterance(
+            text="Tell me about E001",
+            speech_final_at=now,
+            utterance_end_at=now + 0.5,
+            last_word_end=0.5,
+        )
+        await queue.put(utterance)
+        await queue.put(None)
+
+        mock_tool = AsyncMock()
+        mock_tool.name = "get_employee"
+        mock_tool.enabled = True
+        mock_tool.handler = AsyncMock(return_value={"name": "John"})
+        mock_tool.timeout_seconds = 10
+
+        with (
+            patch(
+                "app.services.telnyx_agent.get_llm_provider",
+                return_value=mock_llm,
+            ),
+            patch(
+                "app.services.telnyx_agent.get_tool_registry"
+            ) as mock_get_registry,
+        ):
+            from unittest.mock import MagicMock
+            mock_registry = MagicMock()
+            mock_registry.get.return_value = mock_tool
+            mock_registry.get_schemas.return_value = []
+            mock_get_registry.return_value = mock_registry
+
+            # Capture the arguments passed to execute_from_json
+            from app.tools.executor import ToolExecutor
+
+            async def capture_execute(self_exec, tool_name, arguments_json):
+                nonlocal received_args
+                received_args = arguments_json
+                return {"name": "John"}
+
+            with patch.object(
+                ToolExecutor, "execute_from_json", capture_execute
+            ):
+                await agent.start()
+                await agent._worker_task
+
+        # Verify arguments were fully assembled before execution
+        assert received_args == '{"employee_id": "E001"}'
+
+    @pytest.mark.asyncio
+    async def test_normal_turn_unchanged(self) -> None:
+        """Normal (non-tool) streaming turns remain unchanged."""
+        from app.services.telnyx_agent import TelephonyAgentSession
+        from app.services.telnyx_deepgram import Utterance
+
+        queue: asyncio.Queue[Utterance | None] = asyncio.Queue()
+        agent = TelephonyAgentSession(
+            call_control_id="cc_test",
+            utterance_queue=queue,
+            tts_service=None,
+            websocket=None,
+        )
+
+        mock_llm = AsyncMock()
+        mock_llm.close = AsyncMock()
+
+        async def mock_stream_chat(*args, **kwargs):
+            yield StreamChunk(content="Hello")
+            yield StreamChunk(content=" world!")
+
+        mock_llm.stream_chat = mock_stream_chat
+
+        now = time.monotonic()
+        utterance = Utterance(
+            text="Hi",
+            speech_final_at=now,
+            utterance_end_at=now + 0.5,
+            last_word_end=0.5,
+        )
+        await queue.put(utterance)
+        await queue.put(None)
+
+        with patch(
+            "app.services.telnyx_agent.get_llm_provider",
+            return_value=mock_llm,
+        ):
+            await agent.start()
+            await agent._worker_task
+
+        assert agent.turn == 1
+        # Normal turn: user + assistant in history
+        assert len(agent.history) == 2
+        assert agent.history[0].role == "user"
+        assert agent.history[1].role == "assistant"
+        assert agent.history[1].content == "Hello world!"
+
+    @pytest.mark.asyncio
+    async def test_tool_execution_failure_handled(self) -> None:
+        """Tool execution failure does not crash the call."""
+        from app.providers.types import LLMResponse
+        from app.services.telnyx_agent import TelephonyAgentSession
+        from app.services.telnyx_deepgram import Utterance
+
+        queue: asyncio.Queue[Utterance | None] = asyncio.Queue()
+        agent = TelephonyAgentSession(
+            call_control_id="cc_test",
+            utterance_queue=queue,
+            tts_service=None,
+            websocket=None,
+        )
+
+        mock_llm = AsyncMock()
+        mock_llm.close = AsyncMock()
+
+        async def mock_stream_chat(*args, **kwargs):
+            yield StreamChunk(
+                tool_calls=[{
+                    "index": 0,
+                    "id": "call_1",
+                    "function": {
+                        "name": "broken_tool",
+                        "arguments": "{}",
+                    },
+                    "type": "function",
+                }]
+            )
+
+        async def mock_chat(*args, **kwargs):
+            return LLMResponse(
+                content="Sorry, the tool failed.",
+                tool_calls=None,
+                usage={},
+            )
+
+        mock_llm.stream_chat = mock_stream_chat
+        mock_llm.chat = mock_chat
+
+        now = time.monotonic()
+        utterance = Utterance(
+            text="Use broken tool",
+            speech_final_at=now,
+            utterance_end_at=now + 0.5,
+            last_word_end=0.5,
+        )
+        await queue.put(utterance)
+        await queue.put(None)
+
+        mock_tool = AsyncMock()
+        mock_tool.name = "broken_tool"
+        mock_tool.enabled = True
+        mock_tool.handler = AsyncMock(side_effect=RuntimeError("boom"))
+        mock_tool.timeout_seconds = 10
+
+        with (
+            patch(
+                "app.services.telnyx_agent.get_llm_provider",
+                return_value=mock_llm,
+            ),
+            patch(
+                "app.services.telnyx_agent.get_tool_registry"
+            ) as mock_get_registry,
+        ):
+            from unittest.mock import MagicMock
+            mock_registry = MagicMock()
+            mock_registry.get.return_value = mock_tool
+            mock_registry.get_schemas.return_value = []
+            mock_get_registry.return_value = mock_registry
+
+            await agent.start()
+            await agent._worker_task
+
+        # Should not crash — turn completes
+        assert agent.turn == 1
+        # Final response should still be generated
+        assert agent.history[-1].role == "assistant"
+        assert agent.history[-1].content == "Sorry, the tool failed."
+
+    @pytest.mark.asyncio
+    async def test_tool_turn_metrics_correct(self) -> None:
+        """Tool turn timing metrics are correctly computed."""
+        from app.providers.types import LLMResponse
+        from app.services.telnyx_agent import TelephonyAgentSession
+        from app.services.telnyx_deepgram import Utterance
+
+        queue: asyncio.Queue[Utterance | None] = asyncio.Queue()
+        agent = TelephonyAgentSession(
+            call_control_id="cc_test",
+            utterance_queue=queue,
+            tts_service=None,
+            websocket=None,
+        )
+
+        mock_llm = AsyncMock()
+        mock_llm.close = AsyncMock()
+
+        async def mock_stream_chat(*args, **kwargs):
+            await asyncio.sleep(0.05)  # simulate LLM delay
+            yield StreamChunk(
+                tool_calls=[{
+                    "index": 0,
+                    "id": "call_1",
+                    "function": {
+                        "name": "get_weather",
+                        "arguments": '{"location": "Islamabad"}',
+                    },
+                    "type": "function",
+                }]
+            )
+
+        async def mock_chat(*args, **kwargs):
+            await asyncio.sleep(0.02)
+            return LLMResponse(
+                content="Sunny!",
+                tool_calls=None,
+                usage={"prompt_tokens": 10, "completion_tokens": 2},
+            )
+
+        mock_llm.stream_chat = mock_stream_chat
+        mock_llm.chat = mock_chat
+
+        now = time.monotonic()
+        utterance = Utterance(
+            text="Weather?",
+            speech_final_at=now,
+            utterance_end_at=now + 0.5,
+            last_word_end=0.5,
+        )
+        await queue.put(utterance)
+        await queue.put(None)
+
+        mock_tool = AsyncMock()
+        mock_tool.name = "get_weather"
+        mock_tool.enabled = True
+        mock_tool.handler = AsyncMock(return_value={"weather": "sunny"})
+        mock_tool.timeout_seconds = 10
+
+        with (
+            patch(
+                "app.services.telnyx_agent.get_llm_provider",
+                return_value=mock_llm,
+            ),
+            patch(
+                "app.services.telnyx_agent.get_tool_registry"
+            ) as mock_get_registry,
+        ):
+            from unittest.mock import MagicMock
+            mock_registry = MagicMock()
+            mock_registry.get.return_value = mock_tool
+            mock_registry.get_schemas.return_value = []
+            mock_get_registry.return_value = mock_registry
+
+            await agent.start()
+            await agent._worker_task
+
+        assert agent.turn == 1
+        # Verify history structure
+        assert len(agent.history) == 4
+        assert agent.history[1].tool_calls is not None
+        assert agent.history[2].role == "tool"
+        assert agent.history[3].content == "Sunny!"
 
     @pytest.mark.asyncio
     async def test_streaming_timing_metrics(self) -> None:
@@ -160,11 +511,11 @@ class TestTelephonyStreamingIntegration:
         # Simulate streaming with delay
         async def mock_stream_chat(*args, **kwargs):
             await asyncio.sleep(0.05)  # Simulate first token delay
-            yield "Hello"
+            yield StreamChunk(content="Hello")
             await asyncio.sleep(0.02)
-            yield " world"
+            yield StreamChunk(content=" world")
             await asyncio.sleep(0.01)
-            yield ". "
+            yield StreamChunk(content=". ")
 
         agent._llm.stream_chat = mock_stream_chat
 

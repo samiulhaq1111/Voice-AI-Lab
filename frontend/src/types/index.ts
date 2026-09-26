@@ -623,9 +623,22 @@ export interface TelephonyTurnInfo {
   turn: number;
   transcript?: string;
   response?: string;
-  llm_duration_ms?: number;
-  tts_duration_ms?: number;
-  first_audio_ms?: number;
+  // LLM metrics (initial streaming LLM)
+  llm_ttft_ms?: number;
+  llm_first_sentence_ms?: number;
+  llm_total_ms?: number;
+  // Tool-turn metrics
+  initial_llm_total_ms?: number;
+  tool_execution_ms?: number;
+  tool_detection_ms?: number;
+  final_llm_total_ms?: number;
+  // TTS metrics
+  tts_ttfa_ms?: number;
+  tts_total_ms?: number;
+  // End-to-end metrics
+  speech_to_first_audio_ms?: number;
+  turn_total_ms?: number;
+  // Diagnostic
   audio_bytes?: number;
   audio_chunks?: number;
   speech_final_to_utterance_end_ms?: number;
@@ -633,8 +646,5 @@ export interface TelephonyTurnInfo {
   speech_final_to_agent_ms?: number;
   release_reason?: string;
   settle_ms?: number;
-  // Streaming metrics
   streamed?: boolean;
-  first_token_ms?: number;
-  first_sentence_ms?: number;
 }

@@ -65,3 +65,16 @@ class ToolSchema:
     name: str
     description: str
     parameters: dict[str, Any]
+
+
+@dataclass
+class StreamChunk:
+    """A single chunk from a streaming LLM response.
+
+    Yields either text content or tool call deltas, matching the
+    OpenAI-compatible SSE streaming protocol.
+    """
+
+    content: str | None = None
+    tool_calls: list[dict[str, Any]] | None = None
+    finish_reason: str | None = None

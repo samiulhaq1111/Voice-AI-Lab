@@ -99,7 +99,7 @@ class TelnyxTTSService:
         websocket: WebSocket,
         *,
         call_id: str = "",
-    ) -> bool:
+    ) -> dict[str, Any]:
         """Speak `text` to the caller as early as possible.
 
         Streams ElevenLabs mu-law 8kHz audio straight into the Telnyx media
@@ -114,7 +114,11 @@ class TelnyxTTSService:
             call_id: Telnyx call_control_id for observability events.
 
         Returns:
-            True if audio was sent successfully, False on failure.
+            Dict with timing metrics:
+                - success: bool
+                - tts_start: monotonic timestamp
+                - first_audio_sent_at: monotonic timestamp or None
+                - tts_complete_at: monotonic timestamp
         """
         if not text or self._tts is None:
             if self._tts is None:
@@ -122,9 +126,15 @@ class TelnyxTTSService:
                     "[VOICE:TELNYX:TTS] turn=%d skipped — no TTS provider",
                     turn,
                 )
-            return False
+            return {
+                "success": False,
+                "first_audio_sent_at": None,
+                "tts_start": None,
+                "tts_complete_at": None,
+            }
 
         tts_start = time.monotonic()
+        first_audio_sent_at: float | None = None
         logger.info(
             "[VOICE:TELNYX:TTS] turn=%d tts_start text_length=%d "
             "mode=stream format=%s",
@@ -145,9 +155,11 @@ class TelnyxTTSService:
         )
 
         try:
-            return await self._stream_to_telnyx(
+            stream_result = await self._stream_to_telnyx(
                 text, turn, websocket, call_id, tts_start
             )
+            ok = stream_result["success"]
+            first_audio_sent_at = stream_result.get("first_audio_sent_at")
         except _StreamingUnavailableError as e:
             logger.info(
                 "[VOICE:TELNYX:TTS] turn=%d streaming_unavailable reason=%s "
@@ -155,9 +167,18 @@ class TelnyxTTSService:
                 turn,
                 e,
             )
-            return await self._send_buffered(
+            buffered_result = await self._send_buffered(
                 text, turn, websocket, call_id, tts_start
             )
+            ok = buffered_result["success"]
+            first_audio_sent_at = buffered_result.get("first_audio_sent_at")
+
+        return {
+            "success": ok,
+            "tts_start": tts_start,
+            "first_audio_sent_at": first_audio_sent_at,
+            "tts_complete_at": time.monotonic(),
+        }
 
     async def stream_sentences(
         self,
@@ -184,6 +205,7 @@ class TelnyxTTSService:
             Dict with timing metrics:
                 - tts_start: monotonic timestamp when TTS started
                 - first_audio_ms: time from tts_start to first audio frame
+                - first_audio_sent_at: absolute monotonic timestamp of first audio
                 - total_sentences: number of sentences processed
                 - total_frames: total PCMU frames sent
                 - total_bytes: total bytes sent
@@ -199,6 +221,7 @@ class TelnyxTTSService:
 
         tts_start = time.monotonic()
         first_audio_ms: float | None = None
+        first_audio_sent_at: float | None = None
         total_sentences = 0
         total_frames = 0
         total_bytes = 0
@@ -254,6 +277,7 @@ class TelnyxTTSService:
                             first_audio_ms = (
                                 time.monotonic() - tts_start
                             ) * 1000
+                            first_audio_sent_at = time.monotonic()
                             await self._announce_first_audio(
                                 turn,
                                 call_id,
@@ -317,6 +341,7 @@ class TelnyxTTSService:
         return {
             "tts_start": tts_start,
             "first_audio_ms": first_audio_ms,
+            "first_audio_sent_at": first_audio_sent_at,
             "total_sentences": total_sentences,
             "total_frames": total_frames,
             "total_bytes": total_bytes,
@@ -354,8 +379,11 @@ class TelnyxTTSService:
         websocket: WebSocket,
         call_id: str,
         tts_start: float,
-    ) -> bool:
-        """Forward provider mu-law chunks to Telnyx as they arrive."""
+    ) -> dict[str, Any]:
+        """Forward provider mu-law chunks to Telnyx as they arrive.
+
+        Returns dict with success, first_audio_sent_at, frames_sent.
+        """
         stream = self._open_stream(text)
 
         pending = bytearray()
@@ -363,6 +391,7 @@ class TelnyxTTSService:
         sent_bytes = 0
         frames_sent = 0
         first_audio_ms: float | None = None
+        first_audio_sent_at: float | None = None
         provider_done_ms: float | None = None
         stream_error: str | None = None
 
@@ -381,12 +410,17 @@ class TelnyxTTSService:
                     del pending[:_PCMU_FRAME_BYTES]
 
                     if not await self._send_frame(frame, turn, websocket):
-                        return False
+                        return {
+                            "success": False,
+                            "first_audio_sent_at": first_audio_sent_at,
+                            "frames_sent": frames_sent,
+                        }
 
                     frames_sent += 1
                     sent_bytes += len(frame)
                     if first_audio_ms is None:
                         first_audio_ms = (time.monotonic() - tts_start) * 1000
+                        first_audio_sent_at = time.monotonic()
                         await self._announce_first_audio(
                             turn, call_id, first_audio_ms, _TELEPHONY_OUTPUT_FORMAT
                         )
@@ -439,7 +473,11 @@ class TelnyxTTSService:
             sent_bytes=sent_bytes,
             audio_format=_TELEPHONY_OUTPUT_FORMAT,
         )
-        return True
+        return {
+            "success": True,
+            "first_audio_sent_at": first_audio_sent_at,
+            "frames_sent": frames_sent,
+        }
 
     # --- buffered fallback path ----------------------------------------
 
@@ -450,8 +488,11 @@ class TelnyxTTSService:
         websocket: WebSocket,
         call_id: str,
         tts_start: float,
-    ) -> bool:
-        """Legacy path: full MP3 first, then ffmpeg → PCMU, then paced send."""
+    ) -> dict[str, Any]:
+        """Legacy path: full MP3 first, then ffmpeg → PCMU, then paced send.
+
+        Returns dict with success, first_audio_sent_at, frames_sent.
+        """
         try:
             tts_result = await self._tts.synthesize(text=text)
         except Exception as e:
@@ -464,7 +505,7 @@ class TelnyxTTSService:
                 str(e),
                 tts_ms,
             )
-            return False
+            return {"success": False, "first_audio_sent_at": None, "frames_sent": 0}
 
         provider_done_ms = (time.monotonic() - tts_start) * 1000
         logger.info(
@@ -484,26 +525,32 @@ class TelnyxTTSService:
                 turn,
                 str(e),
             )
-            return False
+            return {"success": False, "first_audio_sent_at": None, "frames_sent": 0}
 
         if not pcmu_data:
             logger.warning(
                 "[VOICE:TELNYX:TTS] turn=%d conversion produced empty audio",
                 turn,
             )
-            return False
+            return {"success": False, "first_audio_sent_at": None, "frames_sent": 0}
 
         # Split into 20ms chunks and send via WebSocket with real-time pacing.
         # Telnyx expects media at ~real-time pace (1 chunk per 20ms).
         chunks = pcmu_chunks_from_bytes(pcmu_data)
         total_bytes = 0
         first_audio_ms: float | None = None
+        first_audio_sent_at: float | None = None
         for chunk in chunks:
             if not await self._send_frame(chunk, turn, websocket):
-                return False
+                return {
+                    "success": False,
+                    "first_audio_sent_at": first_audio_sent_at,
+                    "frames_sent": total_bytes // _PCMU_FRAME_BYTES,
+                }
             total_bytes += len(chunk)
             if first_audio_ms is None:
                 first_audio_ms = (time.monotonic() - tts_start) * 1000
+                first_audio_sent_at = time.monotonic()
                 await self._announce_first_audio(
                     turn, call_id, first_audio_ms, "pcmu_8000_buffered"
                 )
@@ -528,7 +575,11 @@ class TelnyxTTSService:
             sent_bytes=total_bytes,
             audio_format="pcmu_8000_buffered",
         )
-        return True
+        return {
+            "success": True,
+            "first_audio_sent_at": first_audio_sent_at,
+            "frames_sent": len(chunks),
+        }
 
     # --- shared helpers --------------------------------------------------
 
@@ -602,7 +653,11 @@ class TelnyxTTSService:
         sent_bytes: int,
         audio_format: str,
     ) -> None:
-        """Emit the terminal tts_completed / turn_completed events."""
+        """Emit the terminal tts_completed event.
+
+        Note: turn_completed is emitted by _agent_worker() with all
+        end-to-end metrics.
+        """
         total_ms = (time.monotonic() - tts_start) * 1000
         playback_ms = sent_bytes / _ULAW_BYTES_PER_SECOND * 1000
 
@@ -612,20 +667,13 @@ class TelnyxTTSService:
             "Voice generated",
             turn=turn,
             metadata={
-                "duration_ms": round(provider_done_ms or total_ms),
+                "tts_total_ms": round(provider_done_ms or total_ms),
                 "bytes": sent_bytes,
                 "chunks": frames_sent,
-                "ttfa_ms": round(first_audio_ms) if first_audio_ms else None,
+                "tts_ttfa_ms": round(first_audio_ms) if first_audio_ms else None,
                 "playback_ms": round(playback_ms),
                 "format": audio_format,
             },
-        )
-        await broadcast_telephony_event(
-            "turn_completed",
-            call_id,
-            f"Turn {turn} completed",
-            turn=turn,
-            metadata={"total_ms": round(total_ms)},
         )
         logger.info(
             "[VOICE:TELNYX:TTS] turn=%d completed ttfa_ms=%s total_ms=%.0f "

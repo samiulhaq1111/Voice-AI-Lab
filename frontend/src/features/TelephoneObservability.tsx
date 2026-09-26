@@ -175,26 +175,36 @@ export default function TelephoneObservability() {
                   | undefined;
               }
               if (event.type === 'agent_response') {
-                updated.llm_duration_ms = event.metadata?.duration_ms as
-                  | number
-                  | undefined;
                 updated.streamed = event.metadata?.streamed as
                   | boolean
                   | undefined;
-                updated.first_token_ms = event.metadata?.first_token_ms as
+                updated.llm_ttft_ms = event.metadata?.llm_ttft_ms as
                   | number
                   | undefined;
-                updated.first_sentence_ms = event.metadata?.first_sentence_ms as
+                updated.llm_first_sentence_ms = event.metadata?.llm_first_sentence_ms as
                   | number
                   | undefined;
-              }
-              if (event.type === 'tts_first_audio') {
-                updated.first_audio_ms = event.metadata?.ttfa_ms as
+                updated.llm_total_ms = event.metadata?.llm_total_ms as
+                  | number
+                  | undefined;
+                updated.initial_llm_total_ms = event.metadata?.initial_llm_total_ms as
+                  | number
+                  | undefined;
+                updated.tool_execution_ms = event.metadata?.tool_execution_ms as
+                  | number
+                  | undefined;
+                updated.tool_detection_ms = event.metadata?.tool_detection_ms as
+                  | number
+                  | undefined;
+                updated.final_llm_total_ms = event.metadata?.final_llm_total_ms as
                   | number
                   | undefined;
               }
               if (event.type === 'tts_completed') {
-                updated.tts_duration_ms = event.metadata?.duration_ms as
+                updated.tts_ttfa_ms = event.metadata?.tts_ttfa_ms as
+                  | number
+                  | undefined;
+                updated.tts_total_ms = event.metadata?.tts_total_ms as
                   | number
                   | undefined;
                 updated.audio_bytes = event.metadata?.bytes as
@@ -203,6 +213,42 @@ export default function TelephoneObservability() {
                 updated.audio_chunks = event.metadata?.chunks as
                   | number
                   | undefined;
+              }
+              if (event.type === 'turn_completed') {
+                updated.speech_to_first_audio_ms = event.metadata?.speech_to_first_audio_ms as
+                  | number
+                  | undefined;
+                updated.turn_total_ms = event.metadata?.turn_total_ms as
+                  | number
+                  | undefined;
+                // Also capture LLM/TTS metrics if not already set
+                if (updated.llm_ttft_ms == null) {
+                  updated.llm_ttft_ms = event.metadata?.llm_ttft_ms as number | undefined;
+                }
+                if (updated.llm_first_sentence_ms == null) {
+                  updated.llm_first_sentence_ms = event.metadata?.llm_first_sentence_ms as number | undefined;
+                }
+                if (updated.llm_total_ms == null) {
+                  updated.llm_total_ms = event.metadata?.llm_total_ms as number | undefined;
+                }
+                if (updated.tts_ttfa_ms == null) {
+                  updated.tts_ttfa_ms = event.metadata?.tts_ttfa_ms as number | undefined;
+                }
+                if (updated.tts_total_ms == null) {
+                  updated.tts_total_ms = event.metadata?.tts_total_ms as number | undefined;
+                }
+                if (updated.tool_execution_ms == null) {
+                  updated.tool_execution_ms = event.metadata?.tool_execution_ms as number | undefined;
+                }
+                if (updated.tool_detection_ms == null) {
+                  updated.tool_detection_ms = event.metadata?.tool_detection_ms as number | undefined;
+                }
+                if (updated.final_llm_total_ms == null) {
+                  updated.final_llm_total_ms = event.metadata?.final_llm_total_ms as number | undefined;
+                }
+                if (updated.initial_llm_total_ms == null) {
+                  updated.initial_llm_total_ms = event.metadata?.initial_llm_total_ms as number | undefined;
+                }
               }
               return prev.map((t) =>
                 t.turn === event.turn ? updated : t,
@@ -235,18 +281,79 @@ export default function TelephoneObservability() {
                 | undefined;
             }
             if (event.type === 'agent_response') {
-              newTurn.llm_duration_ms = event.metadata?.duration_ms as
-                | number
-                | undefined;
               newTurn.streamed = event.metadata?.streamed as
                 | boolean
                 | undefined;
-              newTurn.first_token_ms = event.metadata?.first_token_ms as
+              newTurn.llm_ttft_ms = event.metadata?.llm_ttft_ms as
                 | number
                 | undefined;
-              newTurn.first_sentence_ms = event.metadata?.first_sentence_ms as
+              newTurn.llm_first_sentence_ms = event.metadata?.llm_first_sentence_ms as
                 | number
                 | undefined;
+              newTurn.llm_total_ms = event.metadata?.llm_total_ms as
+                | number
+                | undefined;
+              newTurn.initial_llm_total_ms = event.metadata?.initial_llm_total_ms as
+                | number
+                | undefined;
+              newTurn.tool_execution_ms = event.metadata?.tool_execution_ms as
+                | number
+                | undefined;
+              newTurn.tool_detection_ms = event.metadata?.tool_detection_ms as
+                | number
+                | undefined;
+              newTurn.final_llm_total_ms = event.metadata?.final_llm_total_ms as
+                | number
+                | undefined;
+            }
+            if (event.type === 'tts_completed') {
+              newTurn.tts_ttfa_ms = event.metadata?.tts_ttfa_ms as
+                | number
+                | undefined;
+              newTurn.tts_total_ms = event.metadata?.tts_total_ms as
+                | number
+                | undefined;
+              newTurn.audio_bytes = event.metadata?.bytes as
+                | number
+                | undefined;
+              newTurn.audio_chunks = event.metadata?.chunks as
+                | number
+                | undefined;
+            }
+            if (event.type === 'turn_completed') {
+              newTurn.speech_to_first_audio_ms = event.metadata?.speech_to_first_audio_ms as
+                | number
+                | undefined;
+              newTurn.turn_total_ms = event.metadata?.turn_total_ms as
+                | number
+                | undefined;
+              if (newTurn.llm_ttft_ms == null) {
+                newTurn.llm_ttft_ms = event.metadata?.llm_ttft_ms as number | undefined;
+              }
+              if (newTurn.llm_first_sentence_ms == null) {
+                newTurn.llm_first_sentence_ms = event.metadata?.llm_first_sentence_ms as number | undefined;
+              }
+              if (newTurn.llm_total_ms == null) {
+                newTurn.llm_total_ms = event.metadata?.llm_total_ms as number | undefined;
+              }
+              if (newTurn.tts_ttfa_ms == null) {
+                newTurn.tts_ttfa_ms = event.metadata?.tts_ttfa_ms as number | undefined;
+              }
+              if (newTurn.tts_total_ms == null) {
+                newTurn.tts_total_ms = event.metadata?.tts_total_ms as number | undefined;
+              }
+              if (newTurn.tool_execution_ms == null) {
+                newTurn.tool_execution_ms = event.metadata?.tool_execution_ms as number | undefined;
+              }
+              if (newTurn.tool_detection_ms == null) {
+                newTurn.tool_detection_ms = event.metadata?.tool_detection_ms as number | undefined;
+              }
+              if (newTurn.final_llm_total_ms == null) {
+                newTurn.final_llm_total_ms = event.metadata?.final_llm_total_ms as number | undefined;
+              }
+              if (newTurn.initial_llm_total_ms == null) {
+                newTurn.initial_llm_total_ms = event.metadata?.initial_llm_total_ms as number | undefined;
+              }
             }
             return [...prev, newTurn];
           });
@@ -361,31 +468,95 @@ export default function TelephoneObservability() {
               className="bg-gray-900 border border-gray-800 rounded-lg p-3"
             >
               <div className="text-xs text-blue-400 font-medium mb-1">
-                TURN {t.turn}
+                TURN {t.turn}{t.tool_execution_ms != null ? ' \u00B7 Tool' : ''}
               </div>
               {t.transcript && (
-                <div className="text-sm text-gray-300 mb-1">
+                <div className="text-sm text-gray-300 mb-2">
                   <span className="text-gray-500">Caller: </span>
                   {t.transcript}
                 </div>
               )}
-              <div className="flex gap-4 text-xs text-gray-500 mt-1">
+              {/* Key metrics - structured display */}
+              {t.tool_execution_ms != null ? (
+                /* Tool turn: 6-metric layout */
+                <div className="grid grid-cols-2 md:grid-cols-6 gap-2 text-xs">
+                  <div className="bg-gray-800 rounded p-2">
+                    <div className="text-gray-500 mb-0.5">{'\u26A1'} Initial LLM total</div>
+                    <div className="text-cyan-300 font-mono">
+                      {t.initial_llm_total_ms != null ? `${(t.initial_llm_total_ms / 1000).toFixed(2)}s` : (t.llm_ttft_ms != null ? `${(t.llm_ttft_ms / 1000).toFixed(2)}s` : '--')}
+                    </div>
+                  </div>
+                  <div className="bg-gray-800 rounded p-2">
+                    <div className="text-gray-500 mb-0.5">{'\u{1F527}'} Tool execution</div>
+                    <div className="text-orange-300 font-mono">
+                      {t.tool_execution_ms != null ? `${(t.tool_execution_ms / 1000).toFixed(2)}s` : '--'}
+                    </div>
+                  </div>
+                  <div className="bg-gray-800 rounded p-2">
+                    <div className="text-gray-500 mb-0.5">{'\u{1F9E0}'} Final LLM total</div>
+                    <div className="text-blue-300 font-mono">
+                      {t.final_llm_total_ms != null ? `${(t.final_llm_total_ms / 1000).toFixed(2)}s` : '--'}
+                    </div>
+                  </div>
+                  <div className="bg-gray-800 rounded p-2">
+                    <div className="text-gray-500 mb-0.5">{'\u{1F50A}'} TTS first audio</div>
+                    <div className="text-purple-300 font-mono">
+                      {t.tts_ttfa_ms != null ? `${(t.tts_ttfa_ms / 1000).toFixed(2)}s` : '--'}
+                    </div>
+                  </div>
+                  <div className="bg-gray-800 rounded p-2">
+                    <div className="text-gray-500 mb-0.5">{'\u{1F4DE}'} Speech {'\u2192'} audio</div>
+                    <div className="text-green-300 font-mono">
+                      {t.speech_to_first_audio_ms != null ? `${(t.speech_to_first_audio_ms / 1000).toFixed(2)}s` : '--'}
+                    </div>
+                  </div>
+                  <div className="bg-gray-800 rounded p-2">
+                    <div className="text-gray-500 mb-0.5">{'\u23F1'} Total turn</div>
+                    <div className="text-yellow-300 font-mono">
+                      {t.turn_total_ms != null ? `${(t.turn_total_ms / 1000).toFixed(2)}s` : '--'}
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                /* Normal turn: 5-metric layout */
+                <div className="grid grid-cols-2 md:grid-cols-5 gap-2 text-xs">
+                  <div className="bg-gray-800 rounded p-2">
+                    <div className="text-gray-500 mb-0.5">LLM TTFT</div>
+                    <div className="text-cyan-300 font-mono">
+                      {t.llm_ttft_ms != null ? `${(t.llm_ttft_ms / 1000).toFixed(2)}s` : '--'}
+                    </div>
+                  </div>
+                  <div className="bg-gray-800 rounded p-2">
+                    <div className="text-gray-500 mb-0.5">First sentence</div>
+                    <div className="text-cyan-200 font-mono">
+                      {t.llm_first_sentence_ms != null ? `${(t.llm_first_sentence_ms / 1000).toFixed(2)}s` : '--'}
+                    </div>
+                  </div>
+                  <div className="bg-gray-800 rounded p-2">
+                    <div className="text-gray-500 mb-0.5">TTS first audio</div>
+                    <div className="text-purple-300 font-mono">
+                      {t.tts_ttfa_ms != null ? `${(t.tts_ttfa_ms / 1000).toFixed(2)}s` : '--'}
+                    </div>
+                  </div>
+                  <div className="bg-gray-800 rounded p-2">
+                    <div className="text-gray-500 mb-0.5">Speech {'\u2192'} audio</div>
+                    <div className="text-green-300 font-mono">
+                      {t.speech_to_first_audio_ms != null ? `${(t.speech_to_first_audio_ms / 1000).toFixed(2)}s` : '--'}
+                    </div>
+                  </div>
+                  <div className="bg-gray-800 rounded p-2">
+                    <div className="text-gray-500 mb-0.5">Total turn</div>
+                    <div className="text-yellow-300 font-mono">
+                      {t.turn_total_ms != null ? `${(t.turn_total_ms / 1000).toFixed(2)}s` : '--'}
+                    </div>
+                  </div>
+                </div>
+              )}
+              {/* Diagnostic details */}
+              <div className="flex flex-wrap gap-3 text-xs text-gray-500 mt-2">
                 {t.speech_final_to_utterance_end_ms != null && (
-                  <span className="text-yellow-400">
-                    Speech→UtteranceEnd:{' '}
-                    {(t.speech_final_to_utterance_end_ms / 1000).toFixed(2)}s
-                  </span>
-                )}
-                {t.utterance_end_to_agent_ms != null && (
                   <span>
-                    UtteranceEnd→Agent:{' '}
-                    {(t.utterance_end_to_agent_ms / 1000).toFixed(2)}s
-                  </span>
-                )}
-                {t.speech_final_to_agent_ms != null && (
-                  <span className="text-blue-400">
-                    Total STT delay:{' '}
-                    {(t.speech_final_to_agent_ms / 1000).toFixed(2)}s
+                    Speech→UtteranceEnd: {(t.speech_final_to_utterance_end_ms / 1000).toFixed(2)}s
                   </span>
                 )}
                 {t.release_reason && (
@@ -404,33 +575,17 @@ export default function TelephoneObservability() {
                 {t.streamed && (
                   <span className="text-cyan-400">Streamed</span>
                 )}
-                {t.first_token_ms != null && (
-                  <span className="text-cyan-300">
-                    TTFT: {(t.first_token_ms / 1000).toFixed(2)}s
-                  </span>
+                {t.tool_detection_ms != null && (
+                  <span className="text-orange-400">Tool detect: {(t.tool_detection_ms / 1000).toFixed(2)}s</span>
                 )}
-                {t.first_sentence_ms != null && (
-                  <span className="text-cyan-200">
-                    First sentence: {(t.first_sentence_ms / 1000).toFixed(2)}s
-                  </span>
+                {t.llm_total_ms != null && (
+                  <span>LLM total: {(t.llm_total_ms / 1000).toFixed(2)}s</span>
                 )}
-                {t.llm_duration_ms != null && (
-                  <span>LLM: {(t.llm_duration_ms / 1000).toFixed(2)}s</span>
-                )}
-                {t.first_audio_ms != null && (
-                  <span className="text-green-400">
-                    First audio:{' '}
-                    {(t.first_audio_ms / 1000).toFixed(2)}s
-                  </span>
-                )}
-                {t.tts_duration_ms != null && (
-                  <span>TTS: {(t.tts_duration_ms / 1000).toFixed(2)}s</span>
+                {t.tts_total_ms != null && (
+                  <span>TTS total: {(t.tts_total_ms / 1000).toFixed(2)}s</span>
                 )}
                 {t.audio_bytes != null && (
                   <span>Audio: {(t.audio_bytes / 1024).toFixed(0)} KB</span>
-                )}
-                {t.audio_chunks != null && (
-                  <span>Frames: {t.audio_chunks}</span>
                 )}
               </div>
             </div>
@@ -458,14 +613,11 @@ export default function TelephoneObservability() {
             const time = formatTime(ev.timestamp);
             const meta = ev.metadata
               ? Object.entries(ev.metadata)
-                  .filter(([k]) => k !== 'text')
+                  .filter(([k, v]) => k !== 'text' && v !== null)
                   .map(([k, v]) => {
-                    if (k === 'duration_ms' && typeof v === 'number')
-                      return `${(v / 1000).toFixed(2)}s`;
-                    if (k === 'total_ms' && typeof v === 'number')
-                      return `${(v / 1000).toFixed(1)}s`;
-                    if (k === 'ttfa_ms' && typeof v === 'number')
-                      return `first audio ${(v / 1000).toFixed(2)}s`;
+                    // Duration metrics (milliseconds)
+                    if (k.endsWith('_ms') && typeof v === 'number')
+                      return `${k.replace(/_ms$/, '')}: ${(v / 1000).toFixed(2)}s`;
                     if (k === 'playback_ms' && typeof v === 'number')
                       return `${(v / 1000).toFixed(1)}s voice`;
                     if (k === 'bytes' && typeof v === 'number')

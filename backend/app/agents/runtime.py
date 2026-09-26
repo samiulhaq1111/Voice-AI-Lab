@@ -50,6 +50,7 @@ class AgentResult:
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     usage: dict[str, int] = field(default_factory=dict)
     iterations: int = 0
+    timing: dict[str, Any] = field(default_factory=dict)
 
 
 # Type alias for tool-call event callbacks used by voice/external observers.
@@ -187,13 +188,20 @@ class AgentRuntime:
         """Run the LLM call loop, handling tool calls until a final text response.
 
         Returns:
-            AgentResult with response, accumulated tool calls, usage, and iteration count.
+            AgentResult with response, accumulated tool calls, usage, iteration count,
+            and timing metadata for observability.
         """
         tool_schemas = self._tool_registry.get_schemas()
         all_tool_calls: list[dict[str, Any]] = []
         total_usage: dict[str, int] = {}
         iterations = 0
         loop_start = time.monotonic()
+
+        # Timing metadata for observability
+        tool_execution_total_ms: float = 0
+        tool_details: list[dict[str, Any]] = []
+        final_llm_start: float | None = None
+        final_llm_complete_ms: float | None = None
 
         for round_num in range(self._config.max_tool_rounds):
             iterations += 1
@@ -231,13 +239,20 @@ class AgentRuntime:
                 iter_ms,
             )
 
-            # If no tool calls, return the text response
+            # If no tool calls, this is the final LLM response
             if not response.tool_calls:
+                final_llm_complete_ms = (time.monotonic() - iter_start) * 1000
                 return AgentResult(
                     response=response.content or "",
                     tool_calls=all_tool_calls,
                     usage=total_usage,
                     iterations=iterations,
+                    timing={
+                        "tool_execution_total_ms": tool_execution_total_ms,
+                        "tool_details": tool_details,
+                        "final_llm_start_at": final_llm_start,
+                        "final_llm_complete_ms": final_llm_complete_ms,
+                    },
                 )
 
             # Handle tool calls
@@ -264,15 +279,24 @@ class AgentRuntime:
                 logger.debug("[AGENT] tool executing name=%s", tool_name)
                 raw_result, duration_ms = await self._execute_tool_call(tool_call)
                 tool_ms = (time.monotonic() - tool_start) * 1000
+                tool_execution_total_ms += tool_ms
+                tool_success = not (
+                    isinstance(raw_result, dict) and "error" in raw_result
+                )
+                tool_details.append({
+                    "name": tool_name,
+                    "execution_ms": round(tool_ms),
+                    "success": tool_success,
+                })
                 logger.info(
                     "[AGENT] tool=%s duration_ms=%.0f success=%s",
                     tool_name,
                     tool_ms,
-                    not (isinstance(raw_result, dict) and "error" in raw_result),
+                    tool_success,
                 )
                 result_dict: dict[str, Any] = {
                     "name": tool_call.get("function", {}).get("name", ""),
-                    "success": not (isinstance(raw_result, dict) and "error" in raw_result),
+                    "success": tool_success,
                     "output": raw_result,
                     "duration_ms": duration_ms,
                 }
@@ -295,6 +319,9 @@ class AgentRuntime:
                     )
                 )
 
+            # Mark the start of the next LLM call (final or another tool round)
+            final_llm_start = time.monotonic()
+
         # Safety: max rounds exceeded
         total_ms = (time.monotonic() - loop_start) * 1000
         logger.warning(
@@ -309,6 +336,12 @@ class AgentRuntime:
             tool_calls=all_tool_calls,
             usage=total_usage,
             iterations=iterations,
+            timing={
+                "tool_execution_total_ms": tool_execution_total_ms,
+                "tool_details": tool_details,
+                "final_llm_start_at": final_llm_start,
+                "final_llm_complete_ms": final_llm_complete_ms,
+            },
         )
 
     async def _execute_tool_call(self, tool_call: dict[str, Any]) -> tuple[Any, float | None]:

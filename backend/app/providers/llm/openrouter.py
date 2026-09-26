@@ -1,5 +1,6 @@
 """OpenRouter LLM adapter implementing LLMInterface."""
 
+import json
 import time
 from collections.abc import AsyncIterator
 
@@ -8,7 +9,7 @@ import httpx
 from app.core.config import settings
 from app.core.logging import logger
 from app.providers.llm.interface import LLMInterface
-from app.providers.types import LLMMessage, LLMResponse, ToolSchema
+from app.providers.types import LLMMessage, LLMResponse, StreamChunk, ToolSchema
 
 _OPENROUTER_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
 
@@ -135,11 +136,11 @@ class OpenRouterAdapter(LLMInterface):
         tools: list[ToolSchema] | None = None,
         temperature: float = 0.7,
         max_tokens: int | None = None,
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[StreamChunk]:
         """Stream chat completion chunks from OpenRouter.
 
-        Yields text content chunks. Tool calls during streaming
-        are not yielded as text; use chat() for tool-call support.
+        Yields StreamChunk objects with either text content or tool call
+        deltas, matching the OpenAI-compatible SSE streaming protocol.
         """
         resolved_model = model or self._default_model
         payload = self._build_payload(
@@ -165,15 +166,22 @@ class OpenRouterAdapter(LLMInterface):
                     if data_str.strip() == "[DONE]":
                         break
 
-                    import json
-
                     chunk = json.loads(data_str)
                     choices = chunk.get("choices", [])
-                    if choices:
-                        delta = choices[0].get("delta", {})
-                        content = delta.get("content")
-                        if content:
-                            yield content
+                    if not choices:
+                        continue
+
+                    delta = choices[0].get("delta", {})
+                    finish = choices[0].get("finish_reason")
+                    content = delta.get("content")
+                    tool_calls = delta.get("tool_calls")
+
+                    if content or tool_calls or finish:
+                        yield StreamChunk(
+                            content=content,
+                            tool_calls=tool_calls,
+                            finish_reason=finish,
+                        )
 
         except httpx.HTTPStatusError as e:
             logger.error("OpenRouter stream error: HTTP %d", e.response.status_code)

@@ -3,7 +3,7 @@
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 
-from app.providers.types import LLMMessage, LLMResponse, ToolSchema
+from app.providers.types import LLMMessage, LLMResponse, StreamChunk, ToolSchema
 
 
 class LLMInterface(ABC):
@@ -50,8 +50,8 @@ class LLMInterface(ABC):
         tools: list[ToolSchema] | None = None,
         temperature: float = 0.7,
         max_tokens: int | None = None,
-    ) -> AsyncIterator[str]:
-        """Stream a chat completion, yielding text chunks.
+    ) -> AsyncIterator[StreamChunk]:
+        """Stream a chat completion, yielding structured chunks.
 
         Args:
             messages: Conversation history.
@@ -61,7 +61,7 @@ class LLMInterface(ABC):
             max_tokens: Maximum tokens in response.
 
         Yields:
-            Text chunks of the response.
+            StreamChunk with content or tool_calls.
         """
 
     @abstractmethod
