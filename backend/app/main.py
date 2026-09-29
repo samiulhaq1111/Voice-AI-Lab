@@ -11,6 +11,7 @@ from app.api.benchmarks import router as benchmarks_router
 from app.api.chat import router as chat_router
 from app.api.health import router as health_router
 from app.api.providers import router as providers_router
+from app.api.retell import router as retell_router
 from app.api.tools import router as tools_router
 from app.api.voice import router as voice_router
 from app.api.voice_realtime import router as voice_realtime_router
@@ -128,6 +129,7 @@ def create_app() -> FastAPI:
     app.include_router(voice_router)
     app.include_router(voice_realtime_router)
     app.include_router(voice_telephony_router)
+    app.include_router(retell_router, prefix="/api/v1")
 
     return app
 
