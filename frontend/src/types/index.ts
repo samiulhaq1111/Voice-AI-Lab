@@ -242,6 +242,7 @@ export type RealtimeEventType =
   | 'agent_response'
   | 'tts_processing'
   | 'audio'
+  | 'turn_metrics'
   | 'completed'
   | 'error';
 
@@ -289,6 +290,56 @@ export interface RealtimeAudio {
   type: 'audio';
   format: string;
   data: string; // base64
+  /** Phase 6G: server turn number, used to correlate the playback report. */
+  turn?: number;
+  /** Phase 6H: 1-based sentence segment index within the turn (plays in order). */
+  segment?: number;
+  /** Phase 6G: server wall-clock (epoch ms) when the audio message was sent. */
+  sent_epoch_ms?: number;
+}
+
+/** Per-turn latency metrics from the server (one per utterance). */
+export interface RealtimeTurnMetrics {
+  turn: number;
+  // Calculated durations (ms) — all from server monotonic clock
+  utterance_end_to_agent_ms: number | null;
+  agent_processing_ms: number | null;
+  tts_duration_ms: number | null;
+  utterance_end_to_audio_sent_ms: number | null;
+  // Phase 6G: release / LLM / TTS sub-stage durations (all optional)
+  utterance_end_to_release_ms?: number | null;
+  release_to_agent_ms?: number | null;
+  agent_to_llm_request_ms?: number | null;
+  llm_request_to_first_token_ms?: number | null;
+  llm_first_token_to_first_sentence_ms?: number | null;
+  llm_request_to_first_sentence_ms?: number | null;
+  llm_request_to_complete_ms?: number | null;
+  first_sentence_to_tts_start_ms?: number | null;
+  /** Null on the realtime path: complete-MP3 synthesis has no first-byte event. */
+  tts_start_to_first_audio_ms?: number | null;
+  tts_start_to_complete_ms?: number | null;
+  audio_encode_send_ms?: number | null;
+  utterance_to_first_audio_ms?: number | null;
+  llm_sentence_count?: number | null;
+  streamed_tokens?: number | null;
+  /** Reason tts_start_to_first_audio_ms is unavailable (e.g. 'unavailable_complete_mp3'). */
+  tts_first_audio_reason?: string | null;
+  // Raw offsets from session start (ms) — for debugging
+  utterance_end_offset_ms: number | null;
+  utterance_released_offset_ms?: number | null;
+  agent_start_offset_ms: number | null;
+  llm_request_offset_ms?: number | null;
+  llm_first_token_offset_ms?: number | null;
+  llm_first_sentence_offset_ms?: number | null;
+  llm_completed_offset_ms: number | null;
+  tts_started_offset_ms: number | null;
+  tts_completed_offset_ms: number | null;
+  audio_sent_offset_ms: number | null;
+}
+
+export interface RealtimeTurnMetricsEvent {
+  type: 'turn_metrics';
+  data: RealtimeTurnMetrics;
 }
 
 /** Server-side diagnostic timings for one realtime session. */
@@ -328,6 +379,7 @@ export type RealtimeEvent =
   | RealtimeAgentResponse
   | RealtimeTTSProcessing
   | RealtimeAudio
+  | RealtimeTurnMetricsEvent
   | RealtimeCompleted
   | RealtimeError;
 
@@ -347,10 +399,21 @@ export interface RealtimeStartMessage {
 
 export type RealtimeConnectionState = 'disconnected' | 'connecting' | 'connected';
 
+/** Phase 6G: client → server report sent once playback of a turn starts.
+ * Lets the backend log the full utterance → playing latency breakdown. */
+export interface RealtimeBrowserTimingMessage {
+  type: 'browser_timing';
+  turn: number;
+  /** Date.now() − sent_epoch_ms at WS receipt (null when not measurable). */
+  ws_transit_ms: number | null;
+  /** WS receipt → audio element 'playing' (same measurement already shown in UI). */
+  received_to_playing_ms: number;
+}
+
 /** One entry in the realtime event log UI. */
 export interface RealtimeLogEntry {
   time: string;
-  type: RealtimeEventType | 'mic' | 'ws';
+  type: RealtimeEventType | 'mic' | 'ws' | 'browser_timing';
   detail: string;
 }
 

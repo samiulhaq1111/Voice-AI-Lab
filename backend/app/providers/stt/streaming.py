@@ -39,7 +39,10 @@ class StreamConfig:
     encoding: str = "linear16"
     interim_results: bool = True
     endpointing_ms: int = 300
-    utterance_end_ms: int = 1000
+    # Phase 6E: 2000 ms (was 1000) — a natural thinking pause inside one
+    # sentence must not split the conversational turn. Deepgram's UtteranceEnd
+    # requires this gap between word timings before it fires.
+    utterance_end_ms: int = 2000
 
     def __post_init__(self) -> None:
         if self.model is None:
@@ -58,6 +61,11 @@ class StreamConfig:
             return f"Only mono audio is supported, got channels={self.channels}"
         if not (100 <= self.endpointing_ms <= 3000):
             return f"endpointing_ms out of range (100-3000): {self.endpointing_ms}"
+        if not (1000 <= self.utterance_end_ms <= 5000):
+            return (
+                f"utterance_end_ms out of range (1000-5000): "
+                f"{self.utterance_end_ms}"
+            )
         return None
 
 

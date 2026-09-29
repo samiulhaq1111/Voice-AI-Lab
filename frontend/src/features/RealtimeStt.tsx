@@ -17,16 +17,32 @@
  *                    | completed | error
  */
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
 import type {
   ProviderAvailability,
+  RealtimeBrowserTimingMessage,
   RealtimeConnectionState,
   RealtimeEvent,
   RealtimeLogEntry,
   RealtimeStartMessage,
   RealtimeTimings,
+  RealtimeTurnMetrics,
 } from '../types';
 import { getProviders } from '../services/api';
+import {
+  conversationReducer,
+  createConversationState,
+  currentTurnText,
+} from './realtimeTurnModel';
+import {
+  beginNextSegment,
+  clearAudioQueue,
+  createAudioQueueState,
+  endCurrentSegment,
+  enqueueSegment,
+  markTurnReported,
+} from './realtimeAudioQueue';
+import type { AudioQueueState } from './realtimeAudioQueue';
 
 const WS_BASE = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000').replace(
   'http',
@@ -34,19 +50,59 @@ const WS_BASE = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000').r
 );
 const REALTIME_WS_URL = `${WS_BASE}/api/v1/voice/realtime/ws`;
 
-/** AudioWorklet source: converts Float32 mic frames to Int16 PCM. */
+/** AudioWorklet source: converts Float32 mic frames to Int16 PCM and
+ * batches them into ~50 ms frames before posting to the main thread.
+ *
+ * The Web Audio render quantum stays 128 samples. Samples are accumulated
+ * across process() callbacks and a frame is posted the moment it is full —
+ * no timers. At 48 kHz: 2400 samples = 4800 bytes per frame (~20 frames/s),
+ * replacing the previous 256-byte frame per 2.67 ms (~375 messages/s). */
 const PCM_WORKLET_CODE = `
 class PCMProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.frameSamples = Math.round(sampleRate * 0.05); // ~50 ms @ native rate
+    this.durationMs = Math.round((this.frameSamples / sampleRate) * 1000);
+    this.buffer = new Int16Array(this.frameSamples);
+    this.offset = 0;
+    this.quanta = 0;
+    this.frames = 0;
+    // STOP path: the main thread sends {type:'reset'} before disconnecting
+    // so a partially accumulated frame is discarded, never flushed.
+    this.port.onmessage = (event) => {
+      if (event.data && event.data.type === 'reset') {
+        this.offset = 0;
+      }
+    };
+  }
+
   process(inputs) {
     const input = inputs[0];
-    if (input && input[0]) {
-      const f32 = input[0];
-      const i16 = new Int16Array(f32.length);
-      for (let i = 0; i < f32.length; i++) {
-        const s = Math.max(-1, Math.min(1, f32[i]));
-        i16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+    if (!input || !input[0] || input[0].length === 0) return true;
+
+    const f32 = input[0];
+    this.quanta += 1;
+    for (let i = 0; i < f32.length; i++) {
+      const s = Math.max(-1, Math.min(1, f32[i]));
+      this.buffer[this.offset++] = s < 0 ? s * 0x8000 : s * 0x7fff;
+      if (this.offset === this.frameSamples) {
+        const frame = this.buffer;
+        this.frames += 1;
+        this.port.postMessage(
+          {
+            type: 'pcm_frame',
+            buffer: frame.buffer,
+            samples: this.frameSamples,
+            bytes: frame.byteLength,
+            durationMs: this.durationMs,
+            quanta: this.quanta,
+            frame: this.frames,
+          },
+          [frame.buffer],
+        );
+        this.buffer = new Int16Array(this.frameSamples);
+        this.offset = 0;
       }
-      this.port.postMessage(i16.buffer, [i16.buffer]);
     }
     return true;
   }
@@ -54,29 +110,52 @@ class PCMProcessor extends AudioWorkletProcessor {
 registerProcessor('pcm-processor', PCMProcessor);
 `;
 
+/** One ~50 ms Int16 PCM frame posted by the PCM worklet. */
+interface PcmFrameMessage {
+  type: 'pcm_frame';
+  /** Raw mono Int16 PCM at the native AudioContext sample rate. */
+  buffer: ArrayBuffer;
+  samples: number;
+  bytes: number;
+  durationMs: number;
+  /** Cumulative render quanta consumed when the frame was posted. */
+  quanta: number;
+  /** Cumulative frame counter (1-based). */
+  frame: number;
+}
+
 const MAX_LOG_ENTRIES = 50;
 
 export default function RealtimeStt() {
   const [providers, setProviders] = useState<ProviderAvailability | null>(null);
   const [connState, setConnState] = useState<RealtimeConnectionState>('disconnected');
   const [micActive, setMicActive] = useState(false);
-  const [partialText, setPartialText] = useState('');
-  const [finalText, setFinalText] = useState('');
+  // Phase 6E: conversation state lives in a pure reducer — the current user
+  // turn evolves in place while speaking and commits ONCE on dispatch.
+  const [conversation, dispatchConversation] = useReducer(
+    conversationReducer,
+    undefined,
+    createConversationState,
+  );
   const [sessionId, setSessionId] = useState<string | null>(null);
-  const [agentProcessing, setAgentProcessing] = useState(false);
-  const [agentResponse, setAgentResponse] = useState<string | null>(null);
-  const [agentToolCalls, setAgentToolCalls] = useState(0);
-  const [agentIterations, setAgentIterations] = useState(0);
   const [ttsProcessing, setTtsProcessing] = useState(false);
   const [log, setLog] = useState<RealtimeLogEntry[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [timings, setTimings] = useState<RealtimeTimings | null>(null);
+  const [turnMetrics, setTurnMetrics] = useState<RealtimeTurnMetrics | null>(null);
+  const [browserPlaybackLatencyMs, setBrowserPlaybackLatencyMs] = useState<number | null>(
+    null,
+  );
 
   // LLM provider/model selection
   const [selectedLLMProvider, setSelectedLLMProvider] = useState('openrouter');
   const [llmModel, setLlmModel] = useState('');
 
   const wsRef = useRef<WebSocket | null>(null);
+  // Generation counter: incremented on every startRealtime(). Socket
+  // callbacks from an old generation are ignored so a previous session can
+  // never update the state of a new one.
+  const sessionEpochRef = useRef(0);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const workletNodeRef = useRef<AudioWorkletNode | null>(null);
   const silentSinkRef = useRef<GainNode | null>(null);
@@ -85,6 +164,10 @@ export default function RealtimeStt() {
   const stopTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const closingRef = useRef(false);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  // Phase 6H: ordered playback queue for sentence audio segments; the first
+  // segment of a turn starts as soon as it arrives, later segments play in
+  // strict sentence order via the <audio> 'ended' handler.
+  const audioQueueRef = useRef<AudioQueueState>(createAudioQueueState());
 
   // Load providers on mount
   useEffect(() => {
@@ -99,10 +182,14 @@ export default function RealtimeStt() {
   // Cleanup on unmount — release everything
   useEffect(() => {
     return () => {
+      // Invalidate this component instance: no stale WebSocket callback may
+      // act after unmount/remount, and all session resources are released.
+      sessionEpochRef.current += 1;
       closingRef.current = true;
       if (stopTimeoutRef.current) clearTimeout(stopTimeoutRef.current);
       teardownAudio();
       wsRef.current?.close();
+      wsRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -110,6 +197,15 @@ export default function RealtimeStt() {
   /** Stop mic tracks, disconnect worklet, close AudioContext. */
   const teardownAudio = useCallback(() => {
     if (workletNodeRef.current) {
+      // STOP path: detach the frame handler first (no frame is forwarded
+      // after STOP), then reset the worklet PCM accumulator. The node is
+      // disconnected below, so no partial frame is ever sent.
+      workletNodeRef.current.port.onmessage = null;
+      try {
+        workletNodeRef.current.port.postMessage({ type: 'reset' });
+      } catch {
+        // Port already closed — the accumulator dies with the worklet node.
+      }
       workletNodeRef.current.disconnect();
       workletNodeRef.current = null;
     }
@@ -129,8 +225,110 @@ export default function RealtimeStt() {
       URL.revokeObjectURL(workletUrlRef.current);
       workletUrlRef.current = null;
     }
+    // Stop any queued/playing session audio and drop stale media handlers so
+    // a previous session's TTS can never keep playing or update this UI.
+    const audioEl = audioRef.current;
+    if (audioEl) {
+      audioEl.onplaying = null;
+      audioEl.onended = null;
+      audioEl.onerror = null;
+      audioEl.pause();
+      if (audioEl.src) {
+        URL.revokeObjectURL(audioEl.src);
+        audioEl.removeAttribute('src');
+      }
+    }
+    // Phase 6H: drop every queued sentence segment (and its object URL) so a
+    // stopped session can never play stale audio from earlier sentences.
+    const cleared = clearAudioQueue(audioQueueRef.current);
+    audioQueueRef.current = cleared.state;
+    for (const url of cleared.revokeUrls) {
+      URL.revokeObjectURL(url);
+    }
     setMicActive(false);
   }, []);
+
+  /** Phase 6H: play the next queued sentence segment (strict order).
+   *
+   * Declared as a named function expression so the 'ended'/'error'/blocked
+   * handlers can safely re-invoke it. Every handler first checks that its
+   * segment is still current, so a double failure signal (e.g. onerror plus
+   * a rejected play()) can never skip or kill a later segment.
+   */
+  const playNextSegment = useCallback(
+    function playNext(): void {
+      const audioEl = audioRef.current;
+      if (!audioEl) return;
+      const promoted = beginNextSegment(audioQueueRef.current);
+      audioQueueRef.current = promoted.state;
+      const segment = promoted.next;
+      if (!segment) return;
+
+      if (audioEl.src) {
+        URL.revokeObjectURL(audioEl.src);
+      }
+      audioEl.src = segment.url;
+
+      const finishSegment = (logLine: string) => {
+        // Ignore stale signals: the element may already be playing another
+        // segment (onerror + rejected play() can both fire for one broken
+        // segment — only the first signal advances the queue).
+        if (audioQueueRef.current.current !== segment) return;
+        const finished = endCurrentSegment(audioQueueRef.current);
+        audioQueueRef.current = finished.state;
+        if (finished.revokeUrl) {
+          URL.revokeObjectURL(finished.revokeUrl);
+        }
+        if (logLine) addLog('audio', logLine);
+        playNext();
+      };
+
+      // Capture actual audio playback start (browser-local measurement)
+      audioEl.onplaying = () => {
+        if (audioQueueRef.current.current !== segment) return;
+        const playingAt = performance.now();
+        const latency = Math.round(playingAt - segment.receivedAt);
+        setBrowserPlaybackLatencyMs(latency);
+        console.log(
+          `[VOICE:UI] audio_playing browser_playback_latency_ms=${latency}`,
+        );
+        addLog('audio', `playing (browser latency=${latency}ms)`);
+        // Phase 6G: report WS-received → playing back to the backend so it
+        // can log the full utterance → playing breakdown for this turn.
+        // Phase 6H: only the FIRST playing segment of a turn reports.
+        if (segment.turn !== null) {
+          const claim = markTurnReported(audioQueueRef.current, segment.turn);
+          audioQueueRef.current = claim.state;
+          if (!claim.first) return;
+          const ws = wsRef.current;
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            const report: RealtimeBrowserTimingMessage = {
+              type: 'browser_timing',
+              turn: segment.turn,
+              ws_transit_ms: segment.wsTransitMs,
+              received_to_playing_ms: latency,
+            };
+            ws.send(JSON.stringify(report));
+            addLog(
+              'browser_timing',
+              `turn=${segment.turn} transit=${segment.wsTransitMs ?? 'n/a'}ms playing_in=${latency}ms`,
+            );
+          }
+        }
+      };
+      audioEl.onended = () => finishSegment('segment ended');
+      audioEl.onerror = () => {
+        addLog('error', 'Audio segment playback failed');
+        finishSegment('');
+      };
+      audioEl.play().catch((e) => {
+        console.error('[REALTIME] Audio playback failed:', e);
+        addLog('error', `Audio playback blocked: ${e.message}`);
+        finishSegment('');
+      });
+    },
+    [addLog],
+  );
 
   const handleServerEvent = useCallback(
     (event: RealtimeEvent) => {
@@ -144,32 +342,32 @@ export default function RealtimeStt() {
           );
           break;
         case 'transcript_partial':
-          setPartialText(event.text);
+          // One evolving current turn: partials replace in place and are
+          // never committed as conversation messages.
+          dispatchConversation({ type: 'partial', text: event.text });
           addLog('transcript_partial', `"${event.text}"`);
           break;
         case 'transcript_final':
-          // Accumulate into the session transcript. Deepgram emits one final
-          // per endpointed segment, so continuous speech produces several
-          // finals — earlier segments must NOT be replaced by newer ones.
-          setFinalText((prev) => (prev ? `${prev} ${event.text}` : event.text));
-          setPartialText('');
+          // Finalized segments accumulate into the same turn; the turn is
+          // committed only when the backend dispatches it (agent_processing).
+          dispatchConversation({ type: 'final', text: event.text });
           addLog('transcript_final', `"${event.text}"`);
           break;
         case 'utterance_end':
           addLog('utterance_end', '');
           break;
         case 'agent_processing':
-          setAgentProcessing(true);
-          setAgentResponse(null);
-          setAgentToolCalls(0);
-          setAgentIterations(0);
+          // The turn was released by the backend: commit ONE user message.
+          dispatchConversation({ type: 'agent_processing' });
           addLog('agent_processing', '');
           break;
         case 'agent_response':
-          setAgentProcessing(false);
-          setAgentResponse(event.text);
-          setAgentToolCalls(event.tool_calls);
-          setAgentIterations(event.iterations);
+          dispatchConversation({
+            type: 'agent_response',
+            text: event.text,
+            toolCalls: event.tool_calls,
+            iterations: event.iterations,
+          });
           addLog(
             'agent_response',
             `text="${event.text.slice(0, 50)}${event.text.length > 50 ? '…' : ''}" tools=${event.tool_calls} iterations=${event.iterations}`,
@@ -181,7 +379,14 @@ export default function RealtimeStt() {
           break;
         case 'audio': {
           setTtsProcessing(false);
-          // Decode base64 audio and play
+          // Phase 6G: capture the backend turn + server send timestamp so the
+          // playback-start report below can be correlated server-side.
+          const audioTurn = typeof event.turn === 'number' ? event.turn : null;
+          const wsTransitMs =
+            typeof event.sent_epoch_ms === 'number'
+              ? Math.max(0, Math.round(Date.now() - event.sent_epoch_ms))
+              : null;
+          // Decode base64 audio segment
           const binary = atob(event.data);
           const bytes = new Uint8Array(binary.length);
           for (let i = 0; i < binary.length; i++) {
@@ -189,26 +394,36 @@ export default function RealtimeStt() {
           }
           const blob = new Blob([bytes], { type: event.format || 'audio/mpeg' });
           const url = URL.createObjectURL(blob);
-          addLog('audio', `format=${event.format} size=${bytes.length}B`);
+          const segmentNo = typeof event.segment === 'number' ? event.segment : 1;
+          addLog(
+            'audio',
+            `segment=${segmentNo} format=${event.format} size=${bytes.length}B`,
+          );
 
           // Create or reuse audio element for playback
           if (!audioRef.current) {
             audioRef.current = new Audio();
           }
-          const audioEl = audioRef.current;
-          // Clean up previous URL
-          if (audioEl.src) {
-            URL.revokeObjectURL(audioEl.src);
-          }
-          audioEl.src = url;
-          audioEl.onended = () => {
-            URL.revokeObjectURL(url);
-            addLog('audio', 'playback ended');
-          };
-          audioEl.play().catch((e) => {
-            console.error('[REALTIME] Audio playback failed:', e);
-            addLog('error', `Audio playback blocked: ${e.message}`);
+          // Phase 6H: segments are queued and played strictly in sentence
+          // order; the first segment of a turn starts as soon as it arrives.
+          audioQueueRef.current = enqueueSegment(audioQueueRef.current, {
+            url,
+            turn: audioTurn,
+            wsTransitMs,
+            receivedAt: performance.now(),
           });
+          playNextSegment();
+          break;
+        }
+        case 'turn_metrics': {
+          setTurnMetrics(event.data);
+          const d = event.data;
+          addLog(
+            'turn_metrics',
+            `turn=${d.turn} utterance_to_agent=${d.utterance_end_to_agent_ms ?? 'N/A'}ms ` +
+              `agent=${d.agent_processing_ms ?? 'N/A'}ms tts=${d.tts_duration_ms ?? 'N/A'}ms ` +
+              `total=${d.utterance_end_to_audio_sent_ms ?? 'N/A'}ms`,
+          );
           break;
         }
         case 'completed':
@@ -226,7 +441,7 @@ export default function RealtimeStt() {
           wsRef.current?.close();
           break;
         case 'error':
-          setAgentProcessing(false);
+          dispatchConversation({ type: 'agent_failed' });
           setTtsProcessing(false);
           setError(event.message);
           addLog('error', `${event.stage ? `[${event.stage}] ` : ''}${event.message}`);
@@ -234,20 +449,21 @@ export default function RealtimeStt() {
           break;
       }
     },
-    [addLog, teardownAudio],
+    [addLog, teardownAudio, playNextSegment],
   );
 
   const startRealtime = useCallback(async () => {
     if (wsRef.current || connState !== 'disconnected') return; // prevent duplicates
+    // New session generation: invalidates every callback from a previous
+    // socket or audio graph that is still unwinding in the background.
+    const epoch = ++sessionEpochRef.current;
     setError(null);
-    setPartialText('');
-    setFinalText('');
+    dispatchConversation({ type: 'reset' });
     setSessionId(null);
-    setAgentProcessing(false);
-    setAgentResponse(null);
-    setAgentToolCalls(0);
-    setAgentIterations(0);
     setTimings(null);
+    setTurnMetrics(null);
+    setBrowserPlaybackLatencyMs(null);
+    audioQueueRef.current = createAudioQueueState();
     setLog([]);
     closingRef.current = false;
 
@@ -294,6 +510,7 @@ export default function RealtimeStt() {
       ws.binaryType = 'arraybuffer';
 
       ws.onopen = () => {
+        if (sessionEpochRef.current !== epoch) return;
         const startMsg: RealtimeStartMessage = {
           type: 'start',
           sample_rate: audioCtx.sampleRate,
@@ -314,10 +531,24 @@ export default function RealtimeStt() {
           `START sent sample_rate=${audioCtx.sampleRate} llm=${selectedLLMProvider}/${llmModel || 'default'}`,
         );
 
-        // 5. Worklet PCM frames → WS binary frames
-        worklet.port.onmessage = (e: MessageEvent<ArrayBuffer>) => {
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.send(e.data);
+        // 5. Worklet PCM frames → WS binary frames.
+        // The worklet batches ~50 ms Int16 frames (2400 samples / 4800 bytes
+        // @ 48 kHz, ~20 msg/s). One binary WS message per full frame; the
+        // backend protocol is unchanged.
+        worklet.port.onmessage = (e: MessageEvent<PcmFrameMessage>) => {
+          if (sessionEpochRef.current !== epoch) return;
+          const msg = e.data;
+          if (!msg || msg.type !== 'pcm_frame') return;
+          if (ws.readyState !== WebSocket.OPEN) return;
+          ws.send(msg.buffer);
+          // Temporary diagnostics — first frames, then every 100th (~5 s)
+          if (msg.frame <= 3 || msg.frame % 100 === 0) {
+            const line =
+              `pcm_batch samples=${msg.samples} bytes=${msg.bytes} ` +
+              `duration_ms=${msg.durationMs} quanta_received=${msg.quanta} ` +
+              `frames_sent=${msg.frame}`;
+            console.log(`[VOICE:UI] ${line}`);
+            addLog('mic', line);
           }
         };
         // Silent sink keeps the audio graph pulled without audible output
@@ -330,6 +561,7 @@ export default function RealtimeStt() {
       };
 
       ws.onmessage = (e) => {
+        if (sessionEpochRef.current !== epoch) return;
         try {
           handleServerEvent(JSON.parse(e.data as string) as RealtimeEvent);
         } catch {
@@ -338,17 +570,24 @@ export default function RealtimeStt() {
       };
 
       ws.onerror = () => {
+        if (sessionEpochRef.current !== epoch) return;
         setError('Realtime WebSocket connection error');
         addLog('error', 'WebSocket connection error');
       };
 
       ws.onclose = () => {
+        if (sessionEpochRef.current !== epoch) {
+          // Socket of a previous session — never touch current state.
+          return;
+        }
         setConnState('disconnected');
         teardownAudio();
         if (!closingRef.current) {
           addLog('ws', 'closed');
         }
-        wsRef.current = null;
+        if (wsRef.current === ws) {
+          wsRef.current = null;
+        }
       };
     } catch (err: unknown) {
       teardownAudio();
@@ -495,45 +734,69 @@ export default function RealtimeStt() {
       <div className="px-4 pb-4 grid grid-cols-1 md:grid-cols-2 gap-4">
         {/* Left: transcripts + agent response */}
         <div className="space-y-2 min-w-0">
-          <div className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 min-h-[3rem]">
-            <div className="text-xs text-gray-500 mb-1 font-medium uppercase">
-              Live transcript
-            </div>
-            <div className="text-sm text-yellow-200 break-words min-h-[1.25rem]">
-              {partialText || <span className="text-gray-600">…</span>}
-            </div>
-          </div>
+          {/* Conversation — ChatGPT-style: the current user turn evolves in
+              place while speaking and is committed ONCE on dispatch. Every
+              raw event stays visible in the Events panel on the right. */}
           <div className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2">
             <div className="text-xs text-gray-500 mb-1 font-medium uppercase">
-              User utterance
-            </div>
-            <div className="text-sm text-green-200 break-words min-h-[1.25rem]">
-              {finalText || <span className="text-gray-600">—</span>}
-            </div>
-          </div>
-          {/* Agent response */}
-          <div className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2">
-            <div className="text-xs text-gray-500 mb-1 font-medium uppercase">
-              Assistant response
-              {agentProcessing && (
-                <span className="ml-2 text-yellow-400 animate-pulse">processing…</span>
+              Conversation
+              {conversation.agentProcessing && (
+                <span className="ml-2 text-yellow-400 animate-pulse">thinking…</span>
+              )}
+              {!conversation.agentProcessing && ttsProcessing && (
+                <span className="ml-2 text-green-400 animate-pulse">speaking…</span>
               )}
             </div>
-            <div className="text-sm text-blue-200 break-words min-h-[1.25rem]">
-              {agentResponse || (agentProcessing ? '' : <span className="text-gray-600">—</span>)}
+            <div className="space-y-2 max-h-80 overflow-y-auto">
+              {conversation.entries.length === 0 &&
+                !currentTurnText(conversation) && (
+                  <div className="text-sm text-gray-600">—</div>
+                )}
+              {conversation.entries.map((entry, i) => (
+                <div key={i} className="text-sm break-words">
+                  <span
+                    className={
+                      entry.role === 'user'
+                        ? 'text-green-400 font-semibold'
+                        : 'text-blue-400 font-semibold'
+                    }
+                  >
+                    {entry.role === 'user' ? 'USER' : 'ASSISTANT'}:
+                  </span>{' '}
+                  <span
+                    className={
+                      entry.role === 'user' ? 'text-green-100' : 'text-blue-100'
+                    }
+                  >
+                    {entry.text}
+                  </span>
+                  {entry.role === 'assistant' &&
+                    ((entry.toolCalls ?? 0) > 0 ||
+                      (entry.iterations ?? 0) > 0) && (
+                      <span className="ml-2 text-xs text-gray-500">
+                        {(entry.toolCalls ?? 0) > 0 && (
+                          <span>tools: {entry.toolCalls} </span>
+                        )}
+                        {(entry.iterations ?? 0) > 0 && (
+                          <span>iterations: {entry.iterations}</span>
+                        )}
+                      </span>
+                    )}
+                </div>
+              ))}
             </div>
-            {agentResponse && (agentToolCalls > 0 || agentIterations > 0) && (
-              <div className="text-xs text-gray-500 mt-1">
-                {agentToolCalls > 0 && <span>tools: {agentToolCalls} </span>}
-                {agentIterations > 0 && <span>iterations: {agentIterations}</span>}
-              </div>
-            )}
-            {ttsProcessing && (
-              <div className="text-xs text-green-400 mt-1 animate-pulse">
-                Speaking…
-              </div>
-            )}
           </div>
+          {/* Current turn — ONE evolving message while the user speaks. */}
+          {currentTurnText(conversation) && (
+            <div className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2">
+              <div className="text-xs text-gray-500 mb-1 font-medium uppercase">
+                Current turn
+              </div>
+              <div className="text-sm text-yellow-200 break-words min-h-[1.25rem]">
+                {currentTurnText(conversation)}
+              </div>
+            </div>
+          )}
           {timings && (
             <div className="bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-xs font-mono space-y-1">
               <div className="text-gray-500 uppercase font-sans font-medium">
@@ -575,6 +838,54 @@ export default function RealtimeStt() {
               </div>
             </div>
           )}
+          {/* Per-turn latency metrics — server durations clearly separated from browser */}
+          {turnMetrics && (
+            <div className="bg-gray-900 border border-indigo-800 rounded-lg px-3 py-2 text-xs font-mono space-y-1">
+              <div className="text-indigo-400 uppercase font-sans font-medium">
+                Turn {turnMetrics.turn} latency (server)
+              </div>
+              <div className="flex justify-between">
+                <span className="text-gray-500">utterance_end → agent</span>
+                <span className="text-gray-200">
+                  {turnMetrics.utterance_end_to_agent_ms != null
+                    ? `${Math.round(turnMetrics.utterance_end_to_agent_ms)} ms`
+                    : 'N/A'}
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-gray-500">agent processing</span>
+                <span className="text-gray-200">
+                  {turnMetrics.agent_processing_ms != null
+                    ? `${Math.round(turnMetrics.agent_processing_ms)} ms`
+                    : 'N/A'}
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-gray-500">TTS duration</span>
+                <span className="text-gray-200">
+                  {turnMetrics.tts_duration_ms != null
+                    ? `${Math.round(turnMetrics.tts_duration_ms)} ms`
+                    : 'N/A'}
+                </span>
+              </div>
+              <div className="flex justify-between border-t border-gray-800 pt-1">
+                <span className="text-indigo-400">utterance_end → audio sent</span>
+                <span className="text-indigo-200 font-semibold">
+                  {turnMetrics.utterance_end_to_audio_sent_ms != null
+                    ? `${Math.round(turnMetrics.utterance_end_to_audio_sent_ms)} ms`
+                    : 'N/A'}
+                </span>
+              </div>
+              {browserPlaybackLatencyMs != null && (
+                <div className="flex justify-between border-t border-gray-800 pt-1">
+                  <span className="text-amber-500">audio receive → playing (browser)</span>
+                  <span className="text-amber-300">
+                    {browserPlaybackLatencyMs} ms
+                  </span>
+                </div>
+              )}
+            </div>
+          )}
         </div>
 
         {/* Right: event log */}
@@ -591,15 +902,17 @@ export default function RealtimeStt() {
                     className={
                       entry.type === 'error'
                         ? 'text-red-400'
-                        : entry.type === 'agent_response'
-                          ? 'text-blue-300'
-                          : entry.type === 'agent_processing'
-                            ? 'text-yellow-400'
-                            : entry.type === 'transcript_final'
-                              ? 'text-green-300'
-                              : entry.type === 'transcript_partial'
-                                ? 'text-yellow-300'
-                                : 'text-gray-400'
+                        : entry.type === 'turn_metrics'
+                          ? 'text-indigo-300'
+                          : entry.type === 'agent_response'
+                            ? 'text-blue-300'
+                            : entry.type === 'agent_processing'
+                              ? 'text-yellow-400'
+                              : entry.type === 'transcript_final'
+                                ? 'text-green-300'
+                                : entry.type === 'transcript_partial'
+                                  ? 'text-yellow-300'
+                                  : 'text-gray-400'
                     }
                   >
                     {entry.type}

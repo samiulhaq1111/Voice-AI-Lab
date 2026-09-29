@@ -284,7 +284,7 @@ class TestStreamUrl:
             "channels=1",
             "interim_results=true",
             "endpointing=300",
-            "utterance_end_ms=1000",
+            "utterance_end_ms=2000",
             "smart_format=true",
         ):
             assert param in url

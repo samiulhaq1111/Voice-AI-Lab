@@ -282,16 +282,18 @@ class DeepgramStreamingSession(StreamingSTTSession):
         if self._closed:
             return
         self._closed = True
-        if self._ws is not None:
+        ws = self._ws
+        # Detach first so a racing send_audio()/finish() can no longer use
+        # the connection while the close handshake is in flight.
+        self._ws = None
+        if ws is not None:
             try:
-                await self._ws.close()
+                await ws.close()
             except Exception as e:
                 logger.warning(
                     "[VOICE:REALTIME] Deepgram close error error_type=%s",
                     type(e).__name__,
                 )
-            finally:
-                self._ws = None
         logger.info("[VOICE:REALTIME] deepgram_closed")
 
     @staticmethod
