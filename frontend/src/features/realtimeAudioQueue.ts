@@ -13,6 +13,10 @@ export interface AudioSegment {
   url: string;
   /** Turn this segment belongs to (null when the server did not label it). */
   turn: number | null;
+  /** Segment index within the turn (1-based). Purely diagnostic — lets a
+   *  queued segment name the predecessor it waited behind ("queued behind
+   *  segment N") instead of mislabeling the FIFO wait as latency. */
+  segmentNo?: number | null;
   /** Date.now() − sent_epoch_ms at WS receipt (null when not measurable). */
   wsTransitMs: number | null;
   /** performance.now() when the segment message was received. */

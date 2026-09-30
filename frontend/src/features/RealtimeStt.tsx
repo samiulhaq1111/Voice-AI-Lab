@@ -168,6 +168,13 @@ export default function RealtimeStt() {
   // segment of a turn starts as soon as it arrives, later segments play in
   // strict sentence order via the <audio> 'ended' handler.
   const audioQueueRef = useRef<AudioQueueState>(createAudioQueueState());
+  // Phase 6K.1: the last segment that actually started playing, so a later
+  // segment can name the predecessor it FIFO-waited behind instead of
+  // mislabeling that intentional wait as "browser latency". Purely diagnostic.
+  const lastPlayedSegmentRef = useRef<{
+    turn: number | null;
+    segmentNo: number | null;
+  } | null>(null);
 
   // Load providers on mount
   useEffect(() => {
@@ -250,6 +257,10 @@ export default function RealtimeStt() {
 
   /** Phase 6H: play the next queued sentence segment (strict order).
    *
+   * Phase 6K.1: onplaying reports true first-segment startup latency when
+   * nothing played before it, and the intentional FIFO queue wait behind the
+   * previous segment otherwise — never mislabeled as "browser latency".
+   *
    * Declared as a named function expression so the 'ended'/'error'/blocked
    * handlers can safely re-invoke it. Every handler first checks that its
    * segment is still current, so a double failure signal (e.g. onerror plus
@@ -283,35 +294,74 @@ export default function RealtimeStt() {
         playNext();
       };
 
-      // Capture actual audio playback start (browser-local measurement)
+      // Capture actual audio playback start (browser-local measurement).
+      // Phase 6K.1: the same WS-received → playing clock measurement gets an
+      // honest label per segment — true startup latency when nothing played
+      // before it, and the intentional FIFO queue wait behind a predecessor
+      // otherwise. Only the FIRST playing segment of a turn updates the UI
+      // latency field and reports to the backend.
       audioEl.onplaying = () => {
         if (audioQueueRef.current.current !== segment) return;
         const playingAt = performance.now();
-        const latency = Math.round(playingAt - segment.receivedAt);
-        setBrowserPlaybackLatencyMs(latency);
-        console.log(
-          `[VOICE:UI] audio_playing browser_playback_latency_ms=${latency}`,
-        );
-        addLog('audio', `playing (browser latency=${latency}ms)`);
-        // Phase 6G: report WS-received → playing back to the backend so it
-        // can log the full utterance → playing breakdown for this turn.
-        // Phase 6H: only the FIRST playing segment of a turn reports.
+        const elapsedMs = Math.round(playingAt - segment.receivedAt);
+        const previous = lastPlayedSegmentRef.current;
+        lastPlayedSegmentRef.current = {
+          turn: segment.turn,
+          segmentNo: segment.segmentNo ?? null,
+        };
+        let firstOfTurn = true;
         if (segment.turn !== null) {
           const claim = markTurnReported(audioQueueRef.current, segment.turn);
           audioQueueRef.current = claim.state;
-          if (!claim.first) return;
+          firstOfTurn = claim.first;
+        } else {
+          firstOfTurn = previous === null;
+        }
+        const predecessor =
+          previous === null
+            ? null
+            : previous.segmentNo == null
+              ? 'previous segment'
+              : previous.turn !== null && previous.turn === segment.turn
+                ? `segment ${previous.segmentNo}`
+                : `turn ${previous.turn} segment ${previous.segmentNo}`;
+        if (predecessor === null) {
+          console.log(
+            `[VOICE:UI] audio_playing first_segment_playback_latency_ms=${elapsedMs}`,
+          );
+          addLog('audio', `playing (first-segment playback latency=${elapsedMs}ms)`);
+        } else if (firstOfTurn) {
+          // First audio of a new turn that still waited behind the previous
+          // turn's tail — honest label, but it owns this turn's report/UI.
+          console.log(`[VOICE:UI] audio_playing queue_wait_ms=${elapsedMs}`);
+          addLog(
+            'audio',
+            `playing (first of turn, queued behind ${predecessor}, wait=${elapsedMs}ms)`,
+          );
+        } else {
+          console.log(`[VOICE:UI] audio_playing queue_wait_ms=${elapsedMs}`);
+          addLog('audio', `playing (queued behind ${predecessor}, wait=${elapsedMs}ms)`);
+        }
+        if (firstOfTurn) {
+          setBrowserPlaybackLatencyMs(elapsedMs);
+        }
+        // Phase 6G: report WS-received → playing back to the backend so it
+        // can log the full utterance → playing breakdown for this turn.
+        // Phase 6H/6K.1: only the FIRST playing segment of a turn reports —
+        // later segments only waited in the FIFO queue, by design.
+        if (firstOfTurn && segment.turn !== null) {
           const ws = wsRef.current;
           if (ws && ws.readyState === WebSocket.OPEN) {
             const report: RealtimeBrowserTimingMessage = {
               type: 'browser_timing',
               turn: segment.turn,
               ws_transit_ms: segment.wsTransitMs,
-              received_to_playing_ms: latency,
+              received_to_playing_ms: elapsedMs,
             };
             ws.send(JSON.stringify(report));
             addLog(
               'browser_timing',
-              `turn=${segment.turn} transit=${segment.wsTransitMs ?? 'n/a'}ms playing_in=${latency}ms`,
+              `turn=${segment.turn} transit=${segment.wsTransitMs ?? 'n/a'}ms playing_in=${elapsedMs}ms`,
             );
           }
         }
@@ -406,9 +456,12 @@ export default function RealtimeStt() {
           }
           // Phase 6H: segments are queued and played strictly in sentence
           // order; the first segment of a turn starts as soon as it arrives.
+          // Phase 6K.1: the segment index rides along purely for queue-wait
+          // diagnostics ("queued behind segment N").
           audioQueueRef.current = enqueueSegment(audioQueueRef.current, {
             url,
             turn: audioTurn,
+            segmentNo,
             wsTransitMs,
             receivedAt: performance.now(),
           });
@@ -464,6 +517,7 @@ export default function RealtimeStt() {
     setTurnMetrics(null);
     setBrowserPlaybackLatencyMs(null);
     audioQueueRef.current = createAudioQueueState();
+    lastPlayedSegmentRef.current = null;
     setLog([]);
     closingRef.current = false;
 
@@ -878,7 +932,7 @@ export default function RealtimeStt() {
               </div>
               {browserPlaybackLatencyMs != null && (
                 <div className="flex justify-between border-t border-gray-800 pt-1">
-                  <span className="text-amber-500">audio receive → playing (browser)</span>
+                  <span className="text-amber-500">first audio playback (browser)</span>
                   <span className="text-amber-300">
                     {browserPlaybackLatencyMs} ms
                   </span>

@@ -42,7 +42,9 @@ Server → Client protocol:
 
 Phase 6H: the TTS branch synthesizes one ordered audio segment per completed
 LLM sentence — the first sentence is synthesized and delivered while the LLM
-is still streaming the remainder of the response.
+is still streaming the remainder of the response. Phase 6K: sentence TTS
+pre-generates with bounded concurrency while earlier segments are sent, and
+segments are still delivered strictly in sentence order.
 """
 
 import asyncio
@@ -94,6 +96,13 @@ _SPEECH_FINAL_RELEASE_SETTLE_MS = 600
 # instead of releasing immediately — any new transcript evidence (partial or
 # final) within the window cancels the pending release.
 _TURN_RELEASE_SETTLE_MS = 800
+
+# Phase 6K: maximum simultaneous per-sentence TTS syntheses. Sentence N+1
+# pre-generates while segment N is being sent (and played back by the
+# browser); completed audio waits in an ordered buffer and segments are
+# still delivered strictly by sentence index. Bounded so STOP/disconnect
+# cancellation and provider rate limits stay manageable.
+_TTS_SENTENCE_CONCURRENCY = 2
 
 
 @dataclass
@@ -1379,15 +1388,17 @@ async def _tts_sentence_consumer(
 ) -> dict[str, Any]:
     """Consume complete LLM sentences and deliver ordered audio segments.
 
-    Phase 6H: runs concurrently with ``_stream_llm_response`` — the first
-    complete sentence is synthesized and sent while the LLM is still
-    streaming the remaining sentences. Segments are strictly sequential:
-    sentence N+1 synthesis starts only after segment N was handed to the
-    socket, so audio order always matches sentence order. One failed
+    Phase 6K: sentence synthesis pre-generates with bounded concurrency
+    (``_TTS_SENTENCE_CONCURRENCY``) — sentence N+1's TTS runs while segment
+    N is being sent (and played by the browser). Completed audio is retained
+    in an ordered buffer and segments are handed to the socket strictly by
+    sentence index: segment N+1 is never sent before segment N. One failed
     sentence is logged and counted, never fatal to the turn or session.
 
     Runs as a session-owned task (``state.tts_task``); STOP/disconnect
-    cancels it via ``_stop_session_tasks``.
+    cancels it via ``_stop_session_tasks``. In-flight sentence synthesis
+    tasks are cancelled and reaped by this consumer's ``finally`` — asyncio
+    does not cancel child tasks automatically.
 
     Returns:
         Summary dict: sentences, segments_sent, failures, chunks, and
@@ -1401,13 +1412,106 @@ async def _tts_sentence_consumer(
         "first_error": None,
     }
     segment_no = 0
-    while True:
-        sentence = await sentence_sink.queue.get()
-        if sentence is None:
-            break
+    # Phase 6K ordered-concurrency state: synthesis outcomes by sentence
+    # index, in-flight synthesis tasks by sentence index, sentences waiting
+    # for a free slot, and the next sentence index the sender may send.
+    outcomes: dict[int, dict[str, Any]] = {}
+    tasks: dict[int, asyncio.Task] = {}
+    pending: list[tuple[int, str]] = []
+    next_to_send = 1
+
+    async def _synthesize(sentence_no: int, sentence: str) -> dict[str, Any]:
+        """Synthesize one sentence; never raises (cancellation excepted)."""
+        started_at = time.monotonic()
+        logger.info(
+            "[REALTIME:TTS] segment_tts_started turn=%d sentence=%d chars=%d",
+            turn,
+            sentence_no,
+            len(sentence),
+        )
+        try:
+            audio_data, content_type, chunks, mode = (
+                await _synthesize_sentence_segment(state.tts, sentence, turn_timing)
+            )
+        except Exception as e:
+            return {
+                "sentence_no": sentence_no,
+                "ok": False,
+                "error": str(e),
+                "error_type": type(e).__name__,
+            }
+        completed_at = time.monotonic()
+        turn_timing.tts_completed_at = completed_at
+        if turn_timing.tts_mode is None:
+            # Mode of the first successfully synthesized sentence.
+            turn_timing.tts_mode = mode
+        if sentence_no == 1:
+            turn_timing.tts_first_sentence_completed_at = completed_at
+        turn_timing.tts_sentence_count += 1
+        turn_timing.tts_audio_chunks += chunks
+        logger.info(
+            "[REALTIME:TTS] segment_tts_completed turn=%d sentence=%d "
+            "bytes=%d chunks=%d mode=%s synthesis_ms=%.0f",
+            turn,
+            sentence_no,
+            len(audio_data),
+            chunks,
+            mode,
+            (completed_at - started_at) * 1000,
+        )
+        return {
+            "sentence_no": sentence_no,
+            "ok": True,
+            "audio": audio_data,
+            "content_type": content_type,
+            "chunks": chunks,
+            "mode": mode,
+            "chars": len(sentence),
+            "started_at": started_at,
+            "completed_at": completed_at,
+        }
+
+    def _record(task: asyncio.Task) -> None:
+        """Fold one finished synthesis task into the ordered outcome map."""
+        outcome = task.result()
+        sentence_no = outcome["sentence_no"]
+        tasks.pop(sentence_no, None)
+        outcomes[sentence_no] = outcome
+        if outcome["ok"]:
+            return
+        # One failed sentence must not kill the turn or the session: log,
+        # count, and let the ordered sender advance past the missing segment.
+        summary["failures"] += 1
+        turn_timing.tts_sentence_failures += 1
+        if summary["first_error"] is None:
+            summary["first_error"] = outcome["error"]
+        logger.error(
+            "[REALTIME:TTS] sentence_synthesis_failed turn=%d sentence=%d "
+            "error_type=%s error=%s",
+            turn,
+            sentence_no,
+            outcome["error_type"],
+            outcome["error"],
+        )
+
+    def _start_task(sentence_no: int, sentence: str) -> None:
+        tasks[sentence_no] = asyncio.create_task(
+            _synthesize(sentence_no, sentence),
+            name=f"realtime_tts_sentence_{turn}_{sentence_no}",
+        )
+
+    def _schedule(sentence_no: int, sentence: str) -> None:
+        """Start one sentence synthesis now, or hold it for a free slot."""
+        if len(tasks) < _TTS_SENTENCE_CONCURRENCY:
+            _start_task(sentence_no, sentence)
+        else:
+            pending.append((sentence_no, sentence))
+
+    async def _handle_sentence(sentence: str) -> None:
+        """Open the TTS stage / schedule synthesis for one new sentence."""
+        nonlocal ws_dead
         summary["sentences"] += 1
         sentence_no = summary["sentences"]
-
         if state.stopping or state.closed or state.stop_requested:
             logger.info(
                 "[REALTIME:TTS] sentence_skipped turn=%d sentence=%d "
@@ -1415,84 +1519,127 @@ async def _tts_sentence_consumer(
                 turn,
                 sentence_no,
             )
-            continue
-
+            outcomes[sentence_no] = {
+                "sentence_no": sentence_no,
+                "ok": False,
+                "skipped": True,
+            }
+            return
         if sentence_no == 1:
             # The TTS stage opens with the first sentence; sent from here
             # (not the worker) so it precedes the first audio frame while
             # the worker is still awaiting the LLM stream.
             if not await _safe_ws_send(ws, state, {"type": "tts_processing"}):
-                break
-            turn_timing.tts_started_at = time.monotonic()
-            turn_timing.tts_first_sentence_started_at = turn_timing.tts_started_at
+                ws_dead = True
+                return
+            started = time.monotonic()
+            turn_timing.tts_started_at = started
+            turn_timing.tts_first_sentence_started_at = started
             logger.info("[REALTIME] tts_processing turn=%d", turn)
+        _schedule(sentence_no, sentence)
 
-        try:
-            audio_data, content_type, chunks, mode = (
-                await _synthesize_sentence_segment(state.tts, sentence, turn_timing)
-            )
-        except Exception as e:
-            # One failed sentence must not kill the turn or the session:
-            # log, count, and continue with the next sentence.
-            summary["failures"] += 1
-            if summary["first_error"] is None:
-                summary["first_error"] = str(e)
-            turn_timing.tts_sentence_failures += 1
-            logger.error(
-                "[REALTIME:TTS] sentence_synthesis_failed turn=%d sentence=%d "
-                "error_type=%s error=%s",
+    async def _drain() -> None:
+        """Send every segment that is ready and next in sentence order."""
+        nonlocal segment_no, next_to_send, ws_dead
+        while not ws_dead and next_to_send in outcomes:
+            outcome = outcomes.pop(next_to_send)
+            sentence_no = next_to_send
+            next_to_send += 1
+            if not outcome["ok"]:
+                # Failed or skipped sentence: no segment; the sender just
+                # advances so later sentences keep their turn order.
+                continue
+            audio_data = outcome["audio"]
+            segment_no += 1
+            audio_b64 = base64.b64encode(audio_data).decode("ascii")
+            if not await _safe_ws_send(
+                ws,
+                state,
+                {
+                    "type": "audio",
+                    "format": outcome["content_type"],
+                    "data": audio_b64,
+                    "turn": turn,
+                    "segment": segment_no,
+                    "sent_epoch_ms": int(time.time() * 1000),
+                },
+            ):
+                # Session is stopping/closed — later segments could never
+                # be heard; stop consuming.
+                ws_dead = True
+                return
+            sent_at = time.monotonic()
+            if turn_timing.first_audio_sent_at is None:
+                turn_timing.first_audio_sent_at = sent_at
+            turn_timing.audio_sent_at = sent_at
+            summary["segments_sent"] += 1
+            summary["chunks"] += outcome["chunks"]
+            timings.tts_response_count += 1
+            timings.tts_audio_bytes += len(audio_data)
+            timings.tts_characters += outcome["chars"]
+            logger.info(
+                "[REALTIME] audio_segment_sent turn=%d segment=%d sentence=%d "
+                "bytes=%d chunks=%d mode=%s synthesis_ms=%.0f held_ms=%.0f",
                 turn,
+                segment_no,
                 sentence_no,
-                type(e).__name__,
-                str(e),
+                len(audio_data),
+                outcome["chunks"],
+                outcome["mode"],
+                (outcome["completed_at"] - outcome["started_at"]) * 1000,
+                max(0.0, (sent_at - outcome["completed_at"]) * 1000),
             )
-            continue
 
-        turn_timing.tts_completed_at = time.monotonic()
-        if turn_timing.tts_mode is None:
-            # Mode of the first successfully synthesized sentence.
-            turn_timing.tts_mode = mode
-        if sentence_no == 1:
-            turn_timing.tts_first_sentence_completed_at = turn_timing.tts_completed_at
-        turn_timing.tts_sentence_count += 1
-        turn_timing.tts_audio_chunks += chunks
-
-        segment_no += 1
-        audio_b64 = base64.b64encode(audio_data).decode("ascii")
-        if not await _safe_ws_send(
-            ws,
-            state,
-            {
-                "type": "audio",
-                "format": content_type,
-                "data": audio_b64,
-                "turn": turn,
-                "segment": segment_no,
-                "sent_epoch_ms": int(time.time() * 1000),
-            },
-        ):
-            # Session is stopping/closed — later segments could never be
-            # heard; stop consuming.
-            break
-        sent_at = time.monotonic()
-        if turn_timing.first_audio_sent_at is None:
-            turn_timing.first_audio_sent_at = sent_at
-        turn_timing.audio_sent_at = sent_at
-        summary["segments_sent"] += 1
-        summary["chunks"] += chunks
-        timings.tts_response_count += 1
-        timings.tts_audio_bytes += len(audio_data)
-        timings.tts_characters += len(sentence)
-        logger.info(
-            "[REALTIME] audio_segment_sent turn=%d segment=%d sentence=%d "
-            "bytes=%d chunks=%d mode=%s",
-            turn,
-            segment_no,
-            sentence_no,
-            len(audio_data),
-            chunks,
-            mode,
-        )
+    get_task: asyncio.Task | None = asyncio.ensure_future(sentence_sink.queue.get())
+    sentinel_seen = False
+    ws_dead = False
+    try:
+        while True:
+            if ws_dead:
+                break
+            # Launch every held sentence that now fits the concurrency bound.
+            while pending and len(tasks) < _TTS_SENTENCE_CONCURRENCY:
+                held_no, held_sentence = pending.pop(0)
+                _start_task(held_no, held_sentence)
+            # Normal exit: end-of-response seen, nothing in flight or held,
+            # and every ready segment has been sent.
+            if sentinel_seen and not pending and not tasks and not outcomes:
+                break
+            wait_set: set[asyncio.Task] = set(tasks.values())
+            if not sentinel_seen and get_task is not None:
+                wait_set.add(get_task)
+            if not wait_set:
+                break
+            done, _ = await asyncio.wait(
+                wait_set, return_when=asyncio.FIRST_COMPLETED
+            )
+            completed_get: asyncio.Task | None = None
+            if get_task is not None and get_task in done:
+                completed_get = get_task
+                get_task = None
+                sentence = completed_get.result()
+                if sentence is None:
+                    sentinel_seen = True
+                else:
+                    await _handle_sentence(sentence)
+                if not sentinel_seen and not ws_dead and get_task is None:
+                    get_task = asyncio.ensure_future(sentence_sink.queue.get())
+            for finished in done:
+                if finished is completed_get:
+                    continue
+                _record(finished)
+            await _drain()
+    finally:
+        # STOP/disconnect/dead socket: cancel and reap every task this
+        # consumer created so no synthesis outlives the session and no task
+        # is left pending on the event loop.
+        stranded = list(tasks.values())
+        if get_task is not None and not get_task.done():
+            stranded.append(get_task)
+        for stranded_task in stranded:
+            stranded_task.cancel()
+        if stranded:
+            await asyncio.gather(*stranded, return_exceptions=True)
     logger.info(
         "[REALTIME:TTS] consumer_exit turn=%d sentences=%d segments=%d "
         "failures=%d chunks=%d",
