@@ -84,6 +84,8 @@ from app.services.realtime_voice_service import (
     process_realtime_utterance,
 )
 from app.services.sentence_buffer import SentenceBuffer
+from app.services.tool_service import get_tool_registry
+from app.tools.executor import ToolExecutor
 
 router = APIRouter()
 
@@ -1262,19 +1264,25 @@ async def _stream_llm_response(
     model: str | None,
     sentence_sink: _SentenceSink | None = None,
 ) -> dict:
-    """Stream LLM response for conversational (no-tool) path.
+    """Stream LLM response with inline tool-call detection.
 
     Builds messages (system prompt + history + user message), calls
-    stream_chat(), accumulates tokens into a SentenceBuffer, and
-    captures first-token timing.
+    stream_chat() with the registered tool schemas, accumulates tokens into
+    a SentenceBuffer, and captures first-token timing.
 
     Phase 6H: every complete sentence is pushed to ``sentence_sink`` the
     moment SentenceBuffer yields it — the concurrent TTS consumer can start
     on sentence 1 while this stream is still producing sentences.
 
+    Tool calls (OpenAI-compatible streaming protocol): deltas are
+    accumulated by tool-call index; when a turn calls tools the streamed
+    filler is discarded and ``_complete_streamed_tool_turn`` executes the
+    tools, runs a final chat() follow-up and streams the final answer
+    through the same sink.
+
     Returns:
-        Dict with response, tool_calls (empty), usage, iterations,
-        first_token_ms, streamed_tokens and the absolute Phase 6G marks
+        Dict with response, tool_calls, usage, iterations, first_token_ms,
+        streamed_tokens and the absolute Phase 6G marks
         (llm_request_started_at, llm_first_token_at, llm_first_sentence_at,
         llm_completed_at, sentence_count).
     """
@@ -1291,10 +1299,16 @@ async def _stream_llm_response(
         LLMMessage(role="user", content=transcript),
     ]
 
+    # Tool schemas for function calling: the registered tools (including
+    # Employee Details) ride along on the streaming request; an empty
+    # registry keeps the pre-tool payload (tools=None).
+    tool_schemas = get_tool_registry().get_schemas()
+
     logger.info(
-        "[REALTIME:STREAM] llm_stream_start model=%s history_len=%d",
+        "[REALTIME:STREAM] llm_stream_start model=%s history_len=%d tools=%d",
         model or "default",
         len(history),
+        len(tool_schemas),
     )
 
     first_token_at: float | None = None
@@ -1304,14 +1318,47 @@ async def _stream_llm_response(
     buffer = SentenceBuffer()
     sentences: list[str] = []
 
+    # Tool-call streaming state: deltas arrive split across chunks and are
+    # accumulated by tool-call index (OpenAI streaming protocol).
+    tool_detected = False
+    tool_call_deltas: dict[int, dict[str, Any]] = {}
+
     stream_start = time.monotonic()
     try:
         async for chunk in llm.stream_chat(
             messages=messages,
             model=model,
-            tools=None,  # No tools for streaming path
+            tools=tool_schemas if tool_schemas else None,
             temperature=0.7,
         ):
+            # Accumulate tool call deltas from the stream; a turn that calls
+            # tools discards any streamed filler in favour of the final
+            # follow-up answer.
+            if chunk.tool_calls:
+                if not tool_detected:
+                    tool_detected = True
+                    logger.info(
+                        "[REALTIME:STREAM] tool_calls detected in stream — "
+                        "accumulating"
+                    )
+                for tc_delta in chunk.tool_calls:
+                    idx = tc_delta.get("index", 0)
+                    if idx not in tool_call_deltas:
+                        tool_call_deltas[idx] = {
+                            "id": "",
+                            "type": "function",
+                            "function": {"name": "", "arguments": ""},
+                        }
+                    assembled = tool_call_deltas[idx]
+                    if tc_delta.get("id"):
+                        assembled["id"] = tc_delta["id"]
+                    func = tc_delta.get("function", {})
+                    if func.get("name"):
+                        assembled["function"]["name"] = func["name"]
+                    if func.get("arguments"):
+                        assembled["function"]["arguments"] += func["arguments"]
+                continue
+
             if chunk.content:
                 if first_token_at is None:
                     first_token_at = time.monotonic()
@@ -1336,14 +1383,16 @@ async def _stream_llm_response(
         )
         raise RealtimeVoiceError(f"LLM streaming failed: {e}") from e
 
-    # Flush any remaining text from buffer
-    remaining = buffer.flush()
-    if remaining:
-        if first_sentence_at is None:
-            first_sentence_at = time.monotonic()
-        sentences.append(remaining)
-        if sentence_sink is not None:
-            sentence_sink.put(remaining)
+    # Flush any remaining text from buffer (only when no tool calls were
+    # detected — a tool turn discards the streamed filler text).
+    if not tool_detected:
+        remaining = buffer.flush()
+        if remaining:
+            if first_sentence_at is None:
+                first_sentence_at = time.monotonic()
+            sentences.append(remaining)
+            if sentence_sink is not None:
+                sentence_sink.put(remaining)
 
     stream_completed_at = time.monotonic()
     stream_ms = (stream_completed_at - stream_start) * 1000
@@ -1364,6 +1413,24 @@ async def _stream_llm_response(
         chunk_count,
         len(sentences),
     )
+
+    # Tool calls detected: execute them and generate the final spoken answer
+    # via a non-streaming chat() follow-up (streaming+tools pattern).
+    if tool_detected:
+        return await _complete_streamed_tool_turn(
+            db=db,
+            voice_session_id=voice_session_id,
+            transcript=transcript,
+            llm=llm,
+            model=model,
+            sentence_sink=sentence_sink,
+            history=history,
+            tool_call_deltas=tool_call_deltas,
+            streamed_text=accumulated_text,
+            stream_start=stream_start,
+            first_token_at=first_token_at,
+            streamed_tokens=chunk_count,
+        )
 
     # Save messages to DB (user message + assistant response)
     voice_session = (
@@ -1396,6 +1463,262 @@ async def _stream_llm_response(
         "llm_first_token_at": first_token_at,
         "llm_first_sentence_at": first_sentence_at,
         "llm_completed_at": stream_completed_at,
+        "sentence_count": len(sentences),
+    }
+
+
+async def _complete_streamed_tool_turn(
+    *,
+    db: Session,
+    voice_session_id: str,
+    transcript: str,
+    llm: LLMInterface,
+    model: str | None,
+    sentence_sink: _SentenceSink | None,
+    history: list[LLMMessage],
+    tool_call_deltas: dict[int, dict[str, Any]],
+    streamed_text: str,
+    stream_start: float,
+    first_token_at: float | None,
+    streamed_tokens: int,
+) -> dict:
+    """Execute streamed tool calls and stream the final answer back.
+
+    Continues a turn whose initial stream_chat() request produced tool calls
+    (OpenAI streaming protocol): the accumulated deltas are assembled, every
+    tool runs through the shared ToolExecutor (same registry as the chat,
+    voice and telephony paths), the results are sent back with a single
+    non-streaming chat() follow-up without tool schemas, and the final answer
+    is pushed through SentenceBuffer -> sentence_sink so the TTS consumer
+    keeps streaming sentence by sentence.
+
+    Mirrors the proven streaming+tools flow of the Telnyx agent.
+
+    Returns:
+        Dict with the final response, detected tool calls, final usage,
+        iterations (initial stream + final chat) and the absolute Phase 6G
+        marks.
+    """
+    from app.models.voice_session import VoiceSession
+    from app.services.realtime_voice_service import _save_message, _save_tool_call
+
+    # Assemble complete tool calls from accumulated deltas
+    detected_tool_calls = [
+        {
+            "id": tool_call_deltas[idx]["id"],
+            "type": "function",
+            "function": {
+                "name": tool_call_deltas[idx]["function"]["name"],
+                "arguments": tool_call_deltas[idx]["function"]["arguments"],
+            },
+        }
+        for idx in sorted(tool_call_deltas.keys())
+    ]
+    logger.info(
+        "[REALTIME:TOOL] assembled %d tool call(s) from stream deltas",
+        len(detected_tool_calls),
+    )
+
+    # Execute each tool call with the shared executor
+    tool_executor = ToolExecutor(get_tool_registry())
+    tool_messages: list[LLMMessage] = []
+    tool_records: list[dict[str, Any]] = []
+    tool_execution_total_ms = 0.0
+
+    for tool_call in detected_tool_calls:
+        tool_name = tool_call["function"]["name"]
+        arguments_str = tool_call["function"]["arguments"]
+        tool_call_id = tool_call.get("id", "")
+        tool_start = time.monotonic()
+        logger.info(
+            "[REALTIME:TOOL] executing tool=%s args=%s",
+            tool_name,
+            arguments_str[:200],
+        )
+        tool_result = await tool_executor.execute_from_json(tool_name, arguments_str)
+        tool_ms = (time.monotonic() - tool_start) * 1000
+        tool_execution_total_ms += tool_ms
+        if tool_result.success:
+            raw_result = tool_result.output
+        else:
+            raw_result = {"error": tool_result.error}
+        result_content = (
+            json.dumps(raw_result)
+            if not isinstance(raw_result, str)
+            else raw_result
+        )
+        tool_messages.append(
+            LLMMessage(
+                role="tool",
+                content=result_content,
+                tool_call_id=tool_call_id,
+                name=tool_name,
+            )
+        )
+        tool_records.append(
+            {
+                "name": tool_name,
+                "arguments": arguments_str,
+                "id": tool_call_id,
+                "content": result_content,
+                "success": tool_result.success,
+                "error": tool_result.error,
+                "duration_ms": round(tool_ms),
+            }
+        )
+        logger.info(
+            "[REALTIME:TOOL] tool=%s duration_ms=%.0f success=%s",
+            tool_name,
+            tool_ms,
+            tool_result.success,
+        )
+
+    # Final LLM call: conversation + tool results, no tool schemas — one
+    # tool round per turn keeps latency bounded.
+    final_messages: list[LLMMessage] = [
+        LLMMessage(role="system", content=_REALTIME_DEFAULT_SYSTEM_PROMPT),
+        *history,
+        LLMMessage(role="user", content=transcript),
+        LLMMessage(
+            role="assistant",
+            content=streamed_text or None,
+            tool_calls=detected_tool_calls,
+        ),
+        *tool_messages,
+    ]
+    final_llm_start = time.monotonic()
+    logger.info(
+        "[REALTIME:TOOL] final_llm_start messages=%d",
+        len(final_messages),
+    )
+    try:
+        final_response = await llm.chat(
+            messages=final_messages,
+            model=model,
+        )
+    except Exception as e:
+        logger.error(
+            "[REALTIME:TOOL] final_llm_failed error=%s",
+            str(e),
+        )
+        raise RealtimeVoiceError(f"LLM tool follow-up failed: {e}") from e
+    final_llm_completed_at = time.monotonic()
+    final_ms = (final_llm_completed_at - final_llm_start) * 1000
+    final_text = final_response.content or ""
+    logger.info(
+        "[REALTIME:TOOL] final_llm_complete duration_ms=%.0f response_length=%d",
+        final_ms,
+        len(final_text),
+    )
+
+    # Stream the final answer through the same sentence pipeline as the
+    # no-tool path so the TTS consumer starts per sentence.
+    final_buffer = SentenceBuffer()
+    final_sentences = final_buffer.add(final_text) if final_text else []
+    trailing = final_buffer.flush()
+    if trailing:
+        final_sentences = [*final_sentences, trailing]
+
+    sentences: list[str] = []
+    first_sentence_at: float | None = None
+    for sentence in final_sentences:
+        if first_sentence_at is None:
+            first_sentence_at = time.monotonic()
+        sentences.append(sentence)
+        if sentence_sink is not None:
+            sentence_sink.put(sentence)
+
+    # Persist the turn: user + assistant tool call + tool results + final
+    # answer (llm_data keeps the full shape for history reload).
+    voice_session = (
+        db.query(VoiceSession).filter(VoiceSession.id == voice_session_id).first()
+    )
+    if voice_session:
+        seq = voice_session.message_count
+        _save_message(db, voice_session_id, "user", transcript, seq)
+        _save_message(
+            db,
+            voice_session_id,
+            "assistant",
+            streamed_text or None,
+            seq + 1,
+            llm_data={
+                "role": "assistant",
+                "content": streamed_text or None,
+                "tool_calls": detected_tool_calls,
+                "tool_call_id": None,
+                "name": None,
+            },
+        )
+        for offset, record in enumerate(tool_records):
+            _save_message(
+                db,
+                voice_session_id,
+                "tool",
+                record["content"],
+                seq + 2 + offset,
+                llm_data={
+                    "role": "tool",
+                    "content": record["content"],
+                    "tool_calls": None,
+                    "tool_call_id": record["id"],
+                    "name": record["name"],
+                },
+            )
+        _save_message(
+            db,
+            voice_session_id,
+            "assistant",
+            final_text,
+            seq + 2 + len(tool_records),
+            token_count=(final_response.usage or {}).get("total_tokens"),
+            llm_data={
+                "role": "assistant",
+                "content": final_text,
+                "tool_calls": None,
+                "tool_call_id": None,
+                "name": None,
+            },
+        )
+        voice_session.message_count = seq + 3 + len(tool_records)
+        db.commit()
+
+    # Persist tool call records (same table used by chat/voice paths)
+    for record in tool_records:
+        _save_tool_call(
+            db,
+            voice_session_id,
+            record["name"],
+            record["arguments"],
+            record["content"],
+            "success" if record["success"] else "error",
+            error_message=record["error"],
+            duration_ms=record["duration_ms"],
+        )
+
+    logger.info(
+        "[REALTIME:TOOL] turn_complete tool_calls=%d tool_ms=%.0f final_ms=%.0f",
+        len(detected_tool_calls),
+        tool_execution_total_ms,
+        final_ms,
+    )
+    return {
+        "response": final_text,
+        "tool_calls": detected_tool_calls,
+        "usage": final_response.usage or {},
+        "iterations": 2,  # initial stream + final chat
+        "streamed": False,
+        "first_token_ms": (
+            (first_token_at - stream_start) * 1000 if first_token_at else None
+        ),
+        "streamed_tokens": streamed_tokens,
+        "sentences": sentences,
+        # Phase 6G marks: the initial stream start anchors the turn's LLM
+        # request; llm_completed_at covers tool execution + final chat.
+        "llm_request_started_at": stream_start,
+        "llm_first_token_at": first_token_at,
+        "llm_first_sentence_at": first_sentence_at,
+        "llm_completed_at": final_llm_completed_at,
         "sentence_count": len(sentences),
     }
 
@@ -1907,7 +2230,7 @@ async def _agent_worker(
                 )
                 continue
 
-            # Process utterance via streaming LLM (no-tool conversational path)
+            # Process utterance via streaming LLM (inline tool detection)
             resolved_model = (
                 voice_session.llm_model
                 or settings.default_llm_model
