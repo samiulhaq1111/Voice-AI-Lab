@@ -7,12 +7,12 @@
  *     cd frontend && node --test tests/pcm-batching.test.mjs
  *
  * The worklet processor ships as a template literal inside
- * src/features/RealtimeStt.tsx (loaded at runtime via a Blob URL). This test
+ * src/features/useRealtimeVoice.ts (loaded at runtime via a Blob URL). This test
  * extracts that exact source and evaluates it against minimal stubs of
  * AudioWorkletGlobalScope, so the real shipped batching code is exercised.
  *
  * Limitation: the main-thread side (handler detach + ws.send guard in
- * RealtimeStt.tsx) is DOM-dependent and not covered here; only the worklet
+ * useRealtimeVoice.ts) is DOM-dependent and not covered here; only the worklet
  * batching/accumulator logic is unit-tested.
  */
 import { test } from 'node:test';
@@ -22,7 +22,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const SOURCE_PATH = join(HERE, '..', 'src', 'features', 'RealtimeStt.tsx');
+const SOURCE_PATH = join(HERE, '..', 'src', 'features', 'useRealtimeVoice.ts');
 
 const FRAME_SAMPLES = 2400; // 50 ms @ 48 kHz
 const FRAME_BYTES = 4800; // 2400 samples x Int16
@@ -30,7 +30,7 @@ const FRAME_BYTES = 4800; // 2400 samples x Int16
 function extractWorkletSource() {
   const tsx = readFileSync(SOURCE_PATH, 'utf8');
   const match = tsx.match(/const PCM_WORKLET_CODE = `([\s\S]*?)`;/);
-  assert.ok(match, 'PCM_WORKLET_CODE template literal not found in RealtimeStt.tsx');
+  assert.ok(match, 'PCM_WORKLET_CODE template literal not found in useRealtimeVoice.ts');
   return match[1];
 }
 
