@@ -10,7 +10,8 @@ Realtime voice path with AgentRuntime integration:
         ↓
     transcript_partial / transcript_final / utterance_end events
         ↓
-    AgentRuntime (on released utterance turn — UtteranceEnd + settle window)
+    AgentRuntime (on released turn — speech_final early release with a short
+    debounce; UtteranceEnd + settle window remains the fallback trigger)
         ↓
     agent_response event → browser
 
@@ -18,7 +19,7 @@ Client → Server protocol:
     {"type": "start", "sample_rate": 16000, "channels": 1,
      "encoding": "linear16", "language": "en", "model": "nova-3",
      "llm_provider": "openrouter", "llm_model": "openai/gpt-4o-mini",
-     "utterance_end_ms": 2000}
+     "utterance_end_ms": 1000}
     <binary PCM audio chunks>
     {"type": "browser_timing", "turn": 1, "ws_transit_ms": 3.0,
      "received_to_playing_ms": 15.0}  (Phase 6G playback report)
@@ -77,14 +78,21 @@ from app.services.sentence_buffer import SentenceBuffer
 
 router = APIRouter()
 
-# Turn-release settle window (Phase 6E).
+# Turn-release settle windows.
 #
-# Deepgram's UtteranceEnd event only states that a >= utterance_end_ms word
-# gap was detected — the speaker may still continue (e.g. a thinking pause in
-# "…employee ID. [pause] E zero zero one."). UtteranceEnd therefore only
-# *schedules* a turn release after this settle window instead of releasing
-# immediately; any new transcript evidence (partial or final) within the
-# window cancels the pending release and the utterance keeps accumulating.
+# Primary early release (turn-finalization v2): a final transcript with
+# speech_final=True is Deepgram's endpointing proof that the speaker stopped,
+# so the turn is released after this short debounce. Any new speech evidence
+# (partial or final) inside the window cancels the release and the utterance
+# keeps accumulating — keeping transcript_final -> agent_processing ~1 s.
+_SPEECH_FINAL_RELEASE_SETTLE_MS = 600
+#
+# Fallback release (Phase 6E): Deepgram's UtteranceEnd only states that a
+# >= utterance_end_ms word gap was detected (e.g. a thinking pause in
+# "…employee ID. [pause] E zero zero one."). It is used when no speech_final
+# final released the turn; it *schedules* a release after this settle window
+# instead of releasing immediately — any new transcript evidence (partial or
+# final) within the window cancels the pending release.
 _TURN_RELEASE_SETTLE_MS = 800
 
 
@@ -105,12 +113,21 @@ class UtteranceTimings:
     sentence; on the buffered fallback (provider cannot stream)
     ``tts_first_audio_at`` stays None and ``tts_first_audio_reason``
     records why — the metric is reported as unavailable.
+
+    Turn-finalization v2 adds the early-release marks: ``speech_final_at``
+    (Deepgram endpointing proof of speech stop) and ``last_final_at`` (most
+    recent final transcript of the turn), plus ``release_reason`` naming the
+    trigger path.
     """
 
     turn: int = 0
     utterance_end_at: float | None = None
     utterance_released_at: float | None = None
     agent_processing_started_at: float | None = None
+    # Turn-finalization v2: early speech_final-based release marks
+    speech_final_at: float | None = None
+    last_final_at: float | None = None
+    release_reason: str | None = None
     llm_request_started_at: float | None = None
     llm_first_token_at: float | None = None
     llm_first_sentence_at: float | None = None
@@ -156,6 +173,14 @@ class UtteranceTimings:
             "utterance_end_to_agent_ms": _elapsed(
                 self.utterance_end_at, self.agent_processing_started_at
             ),
+            # Turn-finalization v2: early speech_final-based release marks
+            "speech_final_to_agent_ms": _elapsed(
+                self.speech_final_at, self.agent_processing_started_at
+            ),
+            "transcript_final_to_agent_ms": _elapsed(
+                self.last_final_at, self.agent_processing_started_at
+            ),
+            "release_reason": self.release_reason,
             "llm_first_token_ms": _elapsed(
                 self.agent_processing_started_at, self.llm_first_token_at
             ),
@@ -254,6 +279,13 @@ def _fmt_ms(value: Any) -> str:
     return f"{value:.1f}"
 
 
+def _ms_since(mark: float | None, anchor: float) -> str:
+    """Format a mark -> anchor gap in whole milliseconds ("n/a" when missing)."""
+    if mark is None:
+        return "n/a"
+    return f"{(anchor - mark) * 1000:.0f}"
+
+
 def _as_ms(value: Any) -> float | None:
     """Coerce a browser-reported millisecond value; reject bools/negatives."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -330,6 +362,23 @@ def _log_turn_latency_breakdown(
         m.get("tts_sentence_count") or "n/a",
         m.get("tts_mode") or "n/a",
     )
+
+
+@dataclass
+class ReleasedTurn:
+    """One finalized utterance handed from the release path to the worker.
+
+    Carries the turn-finalization v2 marks alongside the transcript so the
+    worker can report speech_final / transcript_final -> agent_processing
+    without racing the pump's state resets.
+    """
+
+    transcript: str
+    utterance_end_at: float
+    released_at: float
+    speech_final_at: float | None = None
+    last_final_at: float | None = None
+    release_reason: str = "utterance_end"
 
 
 @dataclass
@@ -419,17 +468,21 @@ class RealtimeSessionState:
     current_utterance_text: str = ""
     utterance_finalized: bool = False  # True after final transcript received
     agent_processing: bool = False  # True while AgentRuntime is running
-    # Turn release state (Phase 6E) — UtteranceEnd schedules a settle release;
+    # Turn release state (Phase 6E + v2) — a final with speech_final=True (or,
+    # as fallback, UtteranceEnd) schedules a short-debounce settle release;
     # newer transcript evidence cancels it. The release task is session-owned.
     speech_final_at: float | None = None  # last final with speech_final=True
+    last_final_at: float | None = None  # most recent final transcript mark
     pending_release: bool = False  # a settle release is scheduled
     release_task: asyncio.Task | None = None  # session-owned release task
     pending_release_turn: int = 0  # turn number the pending release will become
+    pending_release_reason: str = ""  # "speech_final" | "utterance_end"
     utterance_generation: int = 0  # bumped on schedule/cancel; guards stragglers
-    pending_utterance_end_at: float | None = None  # UE time of pending release
+    # UE time — or, on the speech_final path, the release-schedule time
+    pending_utterance_end_at: float | None = None
     # Queue-based serialized utterance processing
-    # Items are (transcript, utterance_end_ts, released_ts) or None (sentinel)
-    utterance_queue: asyncio.Queue[tuple[str, float, float] | None] = field(
+    # Items are ReleasedTurn or None (sentinel)
+    utterance_queue: asyncio.Queue[ReleasedTurn | None] = field(
         default_factory=lambda: asyncio.Queue()
     )
     # Phase 6G: completed-turn metrics awaiting the browser's playback report
@@ -483,7 +536,8 @@ def _parse_start_message(msg: dict) -> tuple[StreamConfig, str, str | None]:
     language = msg.get("language", "en")
     model = msg.get("model") or None
     # Optional turn-gap override (Phase 6E); the browser UI never sends it —
-    # the StreamConfig default (2000 ms) applies unless explicitly provided.
+    # the StreamConfig default (1000 ms fallback gap) applies unless
+    # explicitly provided.
     utterance_end_ms = msg.get("utterance_end_ms")
 
     # LLM configuration (optional)
@@ -585,6 +639,7 @@ def _cancel_pending_release(
         return None
     state.pending_release = False
     state.release_task = None
+    state.pending_release_reason = ""
     state.pending_utterance_end_at = None
     state.utterance_generation += 1  # invalidate any straggler
     if task is not None and not task.done():
@@ -606,26 +661,38 @@ def _schedule_turn_release(
     state: RealtimeSessionState,
     *,
     last_word_end: float | None = None,
+    settle_ms: int | None = None,
+    reason: str = "utterance_end",
 ) -> None:
     """Schedule the session-owned turn release after the settle window.
+
+    Turn-finalization v2: ``reason="speech_final"`` with the short 600 ms
+    debounce is the primary path; ``reason="utterance_end"`` with the longer
+    fallback settle is used when no speech_final final released the turn.
 
     The task handle is kept on the session state so it can never be garbage
     collected and is always cancellable/awaitable by ``_stop_session_tasks``.
     """
+    # Resolve the fallback settle at call time so the module constant is
+    # honored (never bind it as a default argument).
+    if settle_ms is None:
+        settle_ms = _TURN_RELEASE_SETTLE_MS
     state.utterance_generation += 1
     generation = state.utterance_generation
     state.pending_release = True
     state.pending_release_turn = timings.agent_response_count + 1
+    state.pending_release_reason = reason
     state.pending_utterance_end_at = time.monotonic()
     state.release_task = asyncio.create_task(
-        _release_turn_after_settle(timings, state, generation),
+        _release_turn_after_settle(timings, state, generation, settle_ms),
         name="realtime_turn_release",
     )
     logger.info(
-        "[REALTIME] utterance_release_scheduled turn=%d settle_ms=%d "
-        "last_word_end=%s speech_final=%s accumulated='%s'",
+        "[REALTIME] utterance_release_scheduled turn=%d reason=%s "
+        "settle_ms=%d last_word_end=%s speech_final=%s accumulated='%s'",
         state.pending_release_turn,
-        _TURN_RELEASE_SETTLE_MS,
+        reason,
+        settle_ms,
         last_word_end,
         state.speech_final_at is not None,
         state.current_utterance_text[:120],
@@ -636,6 +703,7 @@ async def _release_turn_after_settle(
     timings: RealtimeTimings,
     state: RealtimeSessionState,
     generation: int,
+    settle_ms: int,
 ) -> None:
     """Release the accumulated utterance after the settle window elapses.
 
@@ -645,7 +713,7 @@ async def _release_turn_after_settle(
     ran can never race the enqueue.
     """
     try:
-        await asyncio.sleep(_TURN_RELEASE_SETTLE_MS / 1000.0)
+        await asyncio.sleep(settle_ms / 1000.0)
     except asyncio.CancelledError:
         raise
     turn = timings.agent_response_count + 1
@@ -654,6 +722,7 @@ async def _release_turn_after_settle(
     if state.stopping or state.closed or state.stop_requested:
         state.pending_release = False
         state.release_task = None
+        state.pending_release_reason = ""
         state.pending_utterance_end_at = None
         state.utterance_generation += 1
         logger.info(
@@ -663,12 +732,18 @@ async def _release_turn_after_settle(
         return
     transcript = state.current_utterance_text.strip()
     utterance_end_at = state.pending_utterance_end_at or time.monotonic()
+    # Capture the v2 release marks before resetting the per-turn state.
+    release_reason = state.pending_release_reason or "utterance_end"
+    speech_final_at = state.speech_final_at
+    last_final_at = state.last_final_at
     state.pending_release = False
     state.release_task = None
+    state.pending_release_reason = ""
     state.pending_utterance_end_at = None
     state.current_utterance_text = ""
     state.utterance_finalized = False
     state.speech_final_at = None
+    state.last_final_at = None
     if not transcript:
         logger.info(
             "[REALTIME] utterance_release_reason turn=%d reason=empty_buffer",
@@ -677,9 +752,10 @@ async def _release_turn_after_settle(
         return
     logger.info(
         "[REALTIME] utterance_release_reason turn=%d "
-        "reason=utterance_end_settle settle_ms=%d",
+        "reason=%s settle_ms=%d",
         turn,
-        _TURN_RELEASE_SETTLE_MS,
+        release_reason,
+        settle_ms,
     )
     timings.turns_released += 1
     logger.info(
@@ -690,7 +766,14 @@ async def _release_turn_after_settle(
     )
     # Enqueue for the serialized agent worker (unbounded queue — never blocks).
     state.utterance_queue.put_nowait(
-        (transcript, utterance_end_at, time.monotonic())
+        ReleasedTurn(
+            transcript=transcript,
+            utterance_end_at=utterance_end_at,
+            released_at=time.monotonic(),
+            speech_final_at=speech_final_at,
+            last_final_at=last_final_at,
+            release_reason=release_reason,
+        )
     )
 
 
@@ -859,10 +942,11 @@ async def _pump_provider_events(
 ) -> None:
     """Forward provider transcript events to the client until the stream ends.
 
-    Turn finalization (Phase 6E): final segments keep accumulating; a
-    UtteranceEnd *schedules* a release after ``_TURN_RELEASE_SETTLE_MS``
-    (instead of releasing immediately), and any newer transcript evidence
-    cancels that pending release.
+    Turn finalization (v2): a final with ``speech_final=True`` schedules the
+    primary early release after ``_SPEECH_FINAL_RELEASE_SETTLE_MS``;
+    UtteranceEnd only schedules the fallback release (after
+    ``_TURN_RELEASE_SETTLE_MS``) when no speech_final final did. Any newer
+    transcript evidence cancels a pending release and accumulation continues.
 
     ``state.stop_requested`` distinguishes a normal post-STOP drain from a
     premature provider disconnect: the latter is reported to the client as an
@@ -923,18 +1007,20 @@ async def _pump_provider_events(
                     break
             elif event.type == "final":
                 timings.final_count += 1
+                final_at = time.monotonic()
                 if timings.first_final_at is None:
-                    timings.first_final_at = time.monotonic()
+                    timings.first_final_at = final_at
                 # New transcript evidence — a scheduled release is stale.
                 _cancel_pending_release(
                     state, "new_final_evidence", event_type="final"
                 )
-                # speech_final is evidence (endpointing silence was seen), not
-                # a dispatch trigger — the turn is released only via
-                # UtteranceEnd + settle below.
+                # Turn-finalization v2: speech_final=True proves the
+                # endpointing silence closed this segment, so the segment is
+                # the primary early-release signal (short debounce below).
                 speech_final = bool((event.metadata or {}).get("speech_final"))
+                state.last_final_at = final_at
                 if speech_final:
-                    state.speech_final_at = time.monotonic()
+                    state.speech_final_at = final_at
                 # Accumulate final transcript for the current utterance; other
                 # finalized segments of the same turn must never be replaced.
                 prev = state.current_utterance_text
@@ -960,6 +1046,21 @@ async def _pump_provider_events(
                     },
                 ):
                     break
+                if (
+                    speech_final
+                    and not state.stop_requested
+                    and not state.stopping
+                ):
+                    # Early release: ~600 ms after the endpointing final the
+                    # turn is handed to the agent. New speech evidence inside
+                    # the window cancels it and accumulation continues — one
+                    # turn, one agent call.
+                    _schedule_turn_release(
+                        timings,
+                        state,
+                        settle_ms=_SPEECH_FINAL_RELEASE_SETTLE_MS,
+                        reason="speech_final",
+                    )
             elif event.type == "utterance_end":
                 timings.utterance_end_count += 1
                 if timings.first_utterance_end_at is None:
@@ -1002,12 +1103,16 @@ async def _pump_provider_events(
                         timings.agent_response_count + 1,
                     )
                     continue
-                # UtteranceEnd means the turn MAY be complete: schedule a
-                # session-owned release after the settle window. Any new
-                # partial/final evidence within the window cancels it and
-                # accumulation continues — one turn, one agent call.
+                # Fallback trigger (v2): UtteranceEnd only releases the turn
+                # when no speech_final final scheduled/released it already.
+                # Schedule a session-owned release after the fallback settle
+                # window; any new partial/final evidence within the window
+                # cancels it and accumulation continues — one turn, one call.
                 _schedule_turn_release(
-                    timings, state, last_word_end=last_word_end
+                    timings,
+                    state,
+                    last_word_end=last_word_end,
+                    reason="utterance_end",
                 )
             elif event.type == "error":
                 if not await _safe_ws_send(
@@ -1434,8 +1539,8 @@ async def _agent_worker(
             logger.info("[REALTIME:WORKER] Worker received shutdown sentinel")
             break
 
-        # Unpack transcript + timestamps from the pump
-        transcript, utterance_end_ts, released_at = item
+        # Unpack the released turn from the release path
+        transcript = item.transcript
 
         # Guard: do not start new processing if STOP was received
         if state.stop_requested:
@@ -1449,11 +1554,14 @@ async def _agent_worker(
         utterance_start = time.monotonic()
         turn = timings.agent_response_count + 1
 
-        # Create per-utterance timing record
+        # Create per-utterance timing record (v2 marks carried by ReleasedTurn)
         turn_timing = UtteranceTimings(
             turn=turn,
-            utterance_end_at=utterance_end_ts,
-            utterance_released_at=released_at,
+            utterance_end_at=item.utterance_end_at,
+            utterance_released_at=item.released_at,
+            speech_final_at=item.speech_final_at,
+            last_final_at=item.last_final_at,
+            release_reason=item.release_reason,
         )
 
         # Phase 6H: browser playback reports for this turn may arrive while
@@ -1477,6 +1585,20 @@ async def _agent_worker(
             if not await _safe_ws_send(ws, state, {"type": "agent_processing"}):
                 break
             turn_timing.agent_processing_started_at = time.monotonic()
+            logger.info(
+                "[REALTIME:TURN] turn=%d speech_final_to_agent=%sms "
+                "transcript_to_agent=%sms release_reason=%s",
+                turn,
+                _ms_since(
+                    turn_timing.speech_final_at,
+                    turn_timing.agent_processing_started_at,
+                ),
+                _ms_since(
+                    turn_timing.last_final_at,
+                    turn_timing.agent_processing_started_at,
+                ),
+                turn_timing.release_reason,
+            )
 
             if state.db is None or state.voice_session_id is None:
                 logger.error(

@@ -39,10 +39,10 @@ class StreamConfig:
     encoding: str = "linear16"
     interim_results: bool = True
     endpointing_ms: int = 300
-    # Phase 6E: 2000 ms (was 1000) — a natural thinking pause inside one
-    # sentence must not split the conversational turn. Deepgram's UtteranceEnd
-    # requires this gap between word timings before it fires.
-    utterance_end_ms: int = 2000
+    # Turn-finalization v2: UtteranceEnd is only the fallback trigger (the
+    # primary path releases on Deepgram's speech_final endpointing flag with a
+    # short debounce), so the fallback word-gap is back to the 1000 ms minimum.
+    utterance_end_ms: int = 1000
 
     def __post_init__(self) -> None:
         if self.model is None:
