@@ -242,6 +242,7 @@ export type RealtimeEventType =
   | 'agent_response'
   | 'tts_processing'
   | 'audio'
+  | 'tts_text'
   | 'turn_metrics'
   | 'completed'
   | 'error';
@@ -284,6 +285,18 @@ export interface RealtimeAgentResponse {
 
 export interface RealtimeTTSProcessing {
   type: 'tts_processing';
+}
+
+/** Phase 6L: browser-mode TTS — one complete assistant sentence as text.
+ * Sent instead of `audio` events; the browser speaks it locally via
+ * speechSynthesis. */
+export interface RealtimeTtsText {
+  type: 'tts_text';
+  /** Server turn number, used for diagnostics. */
+  turn?: number;
+  /** 1-based sentence segment index within the turn (spoken in order). */
+  segment?: number;
+  text: string;
 }
 
 export interface RealtimeAudio {
@@ -379,9 +392,21 @@ export type RealtimeEvent =
   | RealtimeAgentResponse
   | RealtimeTTSProcessing
   | RealtimeAudio
+  | RealtimeTtsText
   | RealtimeTurnMetricsEvent
   | RealtimeCompleted
   | RealtimeError;
+
+/** Phase 6L: realtime response TTS mode. 'elevenlabs' (default) keeps the
+ * server-side MP3 pipeline; 'browser' speaks tts_text events locally. */
+export type RealtimeTtsMode = 'elevenlabs' | 'browser';
+
+/** Phase 6L: client → server mid-session TTS mode switch. The backend
+ * applies it to the NEXT turn's TTS consumer. */
+export interface RealtimeTtsModeMessage {
+  type: 'tts_mode';
+  mode: RealtimeTtsMode;
+}
 
 /** START message sent by the client (then binary PCM chunks, then stop). */
 export interface RealtimeStartMessage {
@@ -395,6 +420,9 @@ export interface RealtimeStartMessage {
   llm_provider?: string;
   /** LLM model override (optional). */
   llm_model?: string;
+  /** Phase 6L: response TTS mode — 'elevenlabs' (server MP3, default) or
+   * 'browser' (tts_text events spoken via speechSynthesis). */
+  tts_mode?: RealtimeTtsMode;
 }
 
 export type RealtimeConnectionState = 'disconnected' | 'connecting' | 'connected';
@@ -413,7 +441,7 @@ export interface RealtimeBrowserTimingMessage {
 /** One entry in the realtime event log UI. */
 export interface RealtimeLogEntry {
   time: string;
-  type: RealtimeEventType | 'mic' | 'ws' | 'browser_timing';
+  type: RealtimeEventType | 'mic' | 'ws' | 'browser_timing' | 'browser_tts';
   detail: string;
 }
 

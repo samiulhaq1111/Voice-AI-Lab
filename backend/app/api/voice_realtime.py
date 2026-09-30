@@ -19,10 +19,13 @@ Client → Server protocol:
     {"type": "start", "sample_rate": 16000, "channels": 1,
      "encoding": "linear16", "language": "en", "model": "nova-3",
      "llm_provider": "openrouter", "llm_model": "openai/gpt-4o-mini",
-     "utterance_end_ms": 1000}
+     "utterance_end_ms": 1000, "tts_mode": "elevenlabs"|"browser"}
     <binary PCM audio chunks>
     {"type": "browser_timing", "turn": 1, "ws_transit_ms": 3.0,
      "received_to_playing_ms": 15.0}  (Phase 6G playback report)
+    {"type": "tts_mode", "mode": "elevenlabs"|"browser"}  (Phase 6L switch;
+     applied to the NEXT turn — elevenlabs keeps server audio, browser
+     forwards tts_text and the browser speaks it via speechSynthesis)
     {"type": "stop"}
 
 Server → Client protocol:
@@ -35,7 +38,9 @@ Server → Client protocol:
     {"type": "agent_response", "text": "...", "tool_calls": 0, "iterations": 1}
     {"type": "tts_processing"}
     {"type": "audio", "format": "audio/mpeg", "data": "...", "turn": 1,
-     "segment": 1, "sent_epoch_ms": 1727000000000}
+     "segment": 1, "sent_epoch_ms": 1727000000000}  (elevenlabs mode)
+    {"type": "tts_text", "turn": 1, "segment": 1, "text": "..."}
+     (Phase 6L browser mode — sentence text for speechSynthesis; no audio)
     {"type": "turn_metrics", "data": {...}}
     {"type": "completed", "timings": {...}}
     {"type": "error", "stage": "stt"|"agent", "message": "..."}
@@ -44,7 +49,9 @@ Phase 6H: the TTS branch synthesizes one ordered audio segment per completed
 LLM sentence — the first sentence is synthesized and delivered while the LLM
 is still streaming the remainder of the response. Phase 6K: sentence TTS
 pre-generates with bounded concurrency while earlier segments are sent, and
-segments are still delivered strictly in sentence order.
+segments are still delivered strictly in sentence order. Phase 6L: in browser
+TTS mode the same sentence stream is forwarded as tts_text events instead —
+no ElevenLabs request, no MP3, no base64 audio.
 """
 
 import asyncio
@@ -500,6 +507,14 @@ class RealtimeSessionState:
     completed_turn_metrics: dict[int, dict] = field(default_factory=dict)
     # Phase 6H: per-turn sentence-streaming TTS consumer (session-owned task)
     tts_task: asyncio.Task | None = None
+    # Phase 6L: response TTS mode for this session. "elevenlabs" (default)
+    # synthesizes MP3 audio server-side; "browser" forwards sentence text
+    # (tts_text events) and the browser speaks it via speechSynthesis — no
+    # ElevenL request, no MP3, no base64 audio. Set from the START message
+    # and switchable mid-session via the tts_mode control message; each
+    # turn's consumer reads it at creation, so a switch applies to the next
+    # turn (an in-flight response is never interrupted).
+    tts_mode: str = "elevenlabs"
     # Turn currently owned by the agent worker (0 = none). Audio segments are
     # delivered mid-turn, so a browser report for this turn may arrive before
     # the metrics payload exists.
@@ -530,11 +545,13 @@ def _register_turn_metrics(
         _log_turn_latency_breakdown(turn, metrics, report)
 
 
-def _parse_start_message(msg: dict) -> tuple[StreamConfig, str, str | None]:
+def _parse_start_message(msg: dict) -> tuple[StreamConfig, str, str | None, str]:
     """Parse and validate a START message.
 
     Returns:
-        Tuple of (StreamConfig, llm_provider, llm_model).
+        Tuple of (StreamConfig, llm_provider, llm_model, tts_mode).
+
+        tts_mode (Phase 6L) is "elevenlabs" (default) or "browser".
 
     Raises:
         ValueError: When invalid.
@@ -552,6 +569,9 @@ def _parse_start_message(msg: dict) -> tuple[StreamConfig, str, str | None]:
     # LLM configuration (optional)
     llm_provider = msg.get("llm_provider", "") or ""
     llm_model = msg.get("llm_model", "") or None
+    # Phase 6L: response TTS mode — "elevenlabs" (server MP3 audio, the
+    # existing pipeline) or "browser" (tts_text events + speechSynthesis).
+    tts_mode = msg.get("tts_mode", "elevenlabs")
 
     if not isinstance(sample_rate, int):
         raise ValueError("sample_rate must be an integer")
@@ -563,6 +583,8 @@ def _parse_start_message(msg: dict) -> tuple[StreamConfig, str, str | None]:
         isinstance(utterance_end_ms, bool) or not isinstance(utterance_end_ms, int)
     ):
         raise ValueError("utterance_end_ms must be an integer")
+    if tts_mode not in ("elevenlabs", "browser"):
+        raise ValueError("tts_mode must be 'elevenlabs' or 'browser'")
 
     cfg_kwargs: dict[str, Any] = {
         "model": model,
@@ -577,7 +599,7 @@ def _parse_start_message(msg: dict) -> tuple[StreamConfig, str, str | None]:
     error = cfg.validate()
     if error:
         raise ValueError(error)
-    return cfg, llm_provider, llm_model
+    return cfg, llm_provider, llm_model, tts_mode
 
 
 async def _safe_ws_send(
@@ -1378,6 +1400,102 @@ async def _stream_llm_response(
     }
 
 
+async def _tts_text_consumer(
+    ws: WebSocket,
+    timings: RealtimeTimings,
+    state: RealtimeSessionState,
+    turn: int,
+    turn_timing: UtteranceTimings,
+    sentence_sink: _SentenceSink,
+) -> dict[str, Any]:
+    """Phase 6L browser TTS: deliver sentence TEXT, never audio.
+
+    Used when the session's TTS mode is ``"browser"``: the backend does not
+    call ElevenLabs, does not synthesize MP3, and does not emit base64
+    ``audio`` segments. Each complete LLM sentence is forwarded as a
+    ``tts_text`` event and the browser speaks it locally via
+    ``speechSynthesis``. Sentence order is inherent (one send per popped
+    sentence); STOP/disconnect cancels this consumer via
+    ``_stop_session_tasks`` exactly like the Phase 6K audio consumer.
+
+    Returns:
+        Same summary shape as ``_tts_sentence_consumer``: sentences,
+        segments_sent (text segments), failures, chunks (always 0), and
+        first_error.
+    """
+    summary: dict[str, Any] = {
+        "sentences": 0,
+        "segments_sent": 0,
+        "failures": 0,
+        "chunks": 0,
+        "first_error": None,
+    }
+    segment_no = 0
+    while True:
+        sentence = await sentence_sink.queue.get()
+        if sentence is None:
+            break
+        summary["sentences"] += 1
+        sentence_no = summary["sentences"]
+        if state.stopping or state.closed or state.stop_requested:
+            logger.info(
+                "[REALTIME:TTS] sentence_skipped turn=%d sentence=%d "
+                "reason=session_stopping",
+                turn,
+                sentence_no,
+            )
+            continue
+        if sentence_no == 1:
+            # Same contract as the audio path: the TTS stage opens with the
+            # first sentence so the browser UI flips to "speaking…".
+            if not await _safe_ws_send(ws, state, {"type": "tts_processing"}):
+                break
+            started = time.monotonic()
+            turn_timing.tts_started_at = started
+            turn_timing.tts_first_sentence_started_at = started
+            logger.info("[REALTIME] tts_processing turn=%d mode=browser", turn)
+        segment_no += 1
+        if not await _safe_ws_send(
+            ws,
+            state,
+            {"type": "tts_text", "turn": turn, "segment": segment_no, "text": sentence},
+        ):
+            break
+        sent_at = time.monotonic()
+        # Timing marks mirror the audio path so turn_metrics stays populated
+        # and comparable: "first audio sent" is the first tts_text handed to
+        # the browser — the mark after which the user can hear the response.
+        if turn_timing.first_audio_sent_at is None:
+            turn_timing.first_audio_sent_at = sent_at
+        turn_timing.audio_sent_at = sent_at
+        turn_timing.tts_completed_at = sent_at
+        if turn_timing.tts_mode is None:
+            turn_timing.tts_mode = "browser"
+        if sentence_no == 1:
+            turn_timing.tts_first_sentence_completed_at = sent_at
+        turn_timing.tts_sentence_count += 1
+        summary["segments_sent"] += 1
+        timings.tts_response_count += 1
+        timings.tts_characters += len(sentence)
+        logger.info(
+            "[REALTIME] tts_text_sent turn=%d segment=%d sentence=%d chars=%d",
+            turn,
+            segment_no,
+            sentence_no,
+            len(sentence),
+        )
+    logger.info(
+        "[REALTIME:TTS] consumer_exit turn=%d sentences=%d segments=%d "
+        "failures=%d chunks=%d",
+        turn,
+        summary["sentences"],
+        summary["segments_sent"],
+        summary["failures"],
+        summary["chunks"],
+    )
+    return summary
+
+
 async def _tts_sentence_consumer(
     ws: WebSocket,
     timings: RealtimeTimings,
@@ -1800,17 +1918,27 @@ async def _agent_worker(
                 turn,
                 resolved_model,
             )
-            if state.tts is not None:
+            if state.tts is not None or state.tts_mode == "browser":
                 # Phase 6H: the consumer runs concurrently with the LLM
                 # stream; the first complete sentence is synthesized while
-                # the LLM keeps generating the rest.
+                # the LLM keeps generating the rest. Phase 6L: in browser mode
+                # the sentence stream is forwarded as tts_text events by the
+                # text consumer — no ElevenLabs request, no audio segments.
                 sentence_sink = _SentenceSink()
-                tts_task = asyncio.create_task(
-                    _tts_sentence_consumer(
-                        ws, timings, state, turn, turn_timing, sentence_sink
-                    ),
-                    name=f"realtime_tts_consumer_turn_{turn}",
-                )
+                if state.tts_mode == "browser":
+                    tts_task = asyncio.create_task(
+                        _tts_text_consumer(
+                            ws, timings, state, turn, turn_timing, sentence_sink
+                        ),
+                        name=f"realtime_tts_text_consumer_turn_{turn}",
+                    )
+                else:
+                    tts_task = asyncio.create_task(
+                        _tts_sentence_consumer(
+                            ws, timings, state, turn, turn_timing, sentence_sink
+                        ),
+                        name=f"realtime_tts_consumer_turn_{turn}",
+                    )
                 state.tts_task = tts_task
             result = await _stream_llm_response(
                 db=state.db,
@@ -1889,7 +2017,10 @@ async def _agent_worker(
                         sentence_sink.put(sentence)
                 sentence_sink.queue.put_nowait(None)
 
-            if response_text and state.tts is not None and tts_task is not None:
+            # Phase 6L: browser mode may have no TTS provider (state.tts can
+            # be None) but does have a text consumer to await — gate on the
+            # task, not the provider.
+            if response_text and tts_task is not None:
                 tts_summary: dict[str, Any] | None = None
                 try:
                     tts_summary = await tts_task
@@ -2215,7 +2346,7 @@ async def _handle_realtime_session(ws: WebSocket) -> None:
                     continue
 
                 try:
-                    cfg, llm_provider, llm_model = _parse_start_message(msg)
+                    cfg, llm_provider, llm_model, tts_mode = _parse_start_message(msg)
                 except ValueError as e:
                     await _safe_ws_send(
                         ws, state, {"type": "error", "message": str(e)}
@@ -2253,6 +2384,10 @@ async def _handle_realtime_session(ws: WebSocket) -> None:
                     state.voice_session_id = voice_session.id
                     state.llm_provider = voice_session.llm_provider or ""
                     state.llm_model = voice_session.llm_model
+                    # Phase 6L: response TTS mode for this session ("elevenlabs"
+                    # keeps the Phase 6K audio pipeline; "browser" forwards
+                    # tts_text and the browser speaks it).
+                    state.tts_mode = tts_mode
 
                     # Pre-create LLM provider for reuse
                     if state.llm_provider:
@@ -2303,7 +2438,7 @@ async def _handle_realtime_session(ws: WebSocket) -> None:
                 logger.info(
                     "[VOICE:REALTIME] Session started connection_id=%s "
                     "voice_session_id=%s provider=%s model=%s sample_rate=%d "
-                    "llm_provider=%s llm_model=%s",
+                    "llm_provider=%s llm_model=%s tts_mode=%s",
                     connection_id,
                     state.voice_session_id,
                     state.stt_session.provider_name,
@@ -2311,6 +2446,7 @@ async def _handle_realtime_session(ws: WebSocket) -> None:
                     cfg.sample_rate,
                     state.llm_provider,
                     state.llm_model,
+                    state.tts_mode,
                 )
                 if not await _safe_ws_send(
                     ws,
@@ -2432,6 +2568,28 @@ async def _handle_realtime_session(ws: WebSocket) -> None:
                     connection_id,
                 )
 
+            elif msg_type == "tts_mode":
+                # Phase 6L: mid-session TTS mode switch. Each turn's consumer
+                # reads state.tts_mode at creation, so the change applies to
+                # the NEXT turn — an in-flight ElevenLabs response keeps
+                # playing; the browser cancels its own live speech on switch.
+                mode = msg.get("mode")
+                if mode not in ("elevenlabs", "browser"):
+                    await _safe_ws_send(
+                        ws,
+                        state,
+                        {
+                            "type": "error",
+                            "message": "tts_mode must be 'elevenlabs' or 'browser'",
+                        },
+                    )
+                elif mode != state.tts_mode:
+                    state.tts_mode = mode
+                    logger.info(
+                        "[VOICE:REALTIME] tts_mode_changed connection_id=%s mode=%s",
+                        connection_id,
+                        mode,
+                    )
             else:
                 await _safe_ws_send(
                     ws,

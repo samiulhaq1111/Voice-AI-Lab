@@ -10,11 +10,12 @@
  * server in the START message instead (Deepgram accepts 8–48 kHz linear16).
  *
  * Protocol (matches backend app/api/voice_realtime.py):
- *   client → server: {"type":"start",...,"llm_provider":"...","llm_model":"..."}
- *                    | binary PCM | {"type":"stop"}
+ *   client → server: {"type":"start",...,"llm_provider":"...","llm_model":"...",
+ *                     "tts_mode":"elevenlabs"|"browser"} | binary PCM
+ *                    | {"type":"tts_mode","mode":"browser"} | {"type":"stop"}
  *   server → client: session_started | transcript_partial | transcript_final
  *                    | utterance_end | agent_processing | agent_response
- *                    | completed | error
+ *                    | tts_text (Phase 6L browser TTS) | completed | error
  */
 
 import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
@@ -26,6 +27,8 @@ import type {
   RealtimeLogEntry,
   RealtimeStartMessage,
   RealtimeTimings,
+  RealtimeTtsMode,
+  RealtimeTtsModeMessage,
   RealtimeTurnMetrics,
 } from '../types';
 import { getProviders } from '../services/api';
@@ -126,6 +129,62 @@ interface PcmFrameMessage {
 
 const MAX_LOG_ENTRIES = 50;
 
+/** Phase 6L: Web Speech API availability, checked once at module load.
+ * When false the Browser TTS option is visibly disabled — never silently
+ * broken. */
+const BROWSER_TTS_SUPPORTED =
+  typeof window !== 'undefined' &&
+  'speechSynthesis' in window &&
+  typeof SpeechSynthesisUtterance !== 'undefined';
+
+/** Phase 6L: one queued browser-TTS sentence (from a tts_text event). */
+interface BrowserTtsItem {
+  turn: number | null;
+  segmentNo: number;
+  text: string;
+  /** performance.now() when the tts_text event was received. */
+  receivedAt: number;
+}
+
+/** Phase 6M: best available English voice, LOCAL (offline) voices first.
+ *
+ * Remote network voices (e.g. Chrome's "Google …" voices, localService=false)
+ * synthesize audio in the cloud, delaying onstart by hundreds of ms. Order:
+ * en-US local → any English local → en-US → any English → null (browser
+ * default). Never hard-codes a voice name; call only when speechSynthesis
+ * is available (BROWSER_TTS_SUPPORTED). */
+function pickBrowserVoice(): SpeechSynthesisVoice | null {
+  const voices = window.speechSynthesis.getVoices();
+  return (
+    voices.find((v) => v.localService && v.lang === 'en-US') ??
+    voices.find((v) => v.localService && v.lang?.startsWith('en')) ??
+    voices.find((v) => v.lang === 'en-US') ??
+    voices.find((v) => v.lang?.startsWith('en')) ??
+    null
+  );
+}
+
+/** Phase 6M: one-shot inaudible speechSynthesis warm-up.
+ *
+ * Chrome initializes its speech engine on the FIRST speak() of the page — a
+ * one-time cost that otherwise lands on the user's first real sentence
+ * (observed ~500-1000ms before onstart). Speaking a single space at volume
+ * 0 during a user gesture (Start click / Browser-mode switch) moves that
+ * engine init off the response critical path. Inaudible, not assistant
+ * text, never enters the conversation or the browser TTS queue, and runs at
+ * most once per component mount. STOP/teardown's speechSynthesis.cancel()
+ * clears it if the session ends first. */
+function warmUpBrowserSpeech(): void {
+  try {
+    const utterance = new SpeechSynthesisUtterance(' ');
+    utterance.volume = 0;
+    // Deliberately no handlers and no queue integration: warm-up is inert.
+    window.speechSynthesis.speak(utterance);
+  } catch {
+    // Warm-up is best-effort only.
+  }
+}
+
 export default function RealtimeStt() {
   const [providers, setProviders] = useState<ProviderAvailability | null>(null);
   const [connState, setConnState] = useState<RealtimeConnectionState>('disconnected');
@@ -150,6 +209,9 @@ export default function RealtimeStt() {
   // LLM provider/model selection
   const [selectedLLMProvider, setSelectedLLMProvider] = useState('openrouter');
   const [llmModel, setLlmModel] = useState('');
+  // Phase 6L: response TTS mode — 'elevenlabs' (server MP3, default) or
+  // 'browser' (tts_text events spoken locally via speechSynthesis).
+  const [ttsMode, setTtsMode] = useState<RealtimeTtsMode>('elevenlabs');
 
   const wsRef = useRef<WebSocket | null>(null);
   // Generation counter: incremented on every startRealtime(). Socket
@@ -175,10 +237,39 @@ export default function RealtimeStt() {
     turn: number | null;
     segmentNo: number | null;
   } | null>(null);
+  // Phase 6L: browser-native TTS queue — strictly sequential (one sentence
+  // speaks at a time), entirely separate from the ElevenLabs audio queue.
+  const browserTtsQueueRef = useRef<BrowserTtsItem[]>([]);
+  const browserTtsSpeakingRef = useRef(false);
+  // Sensible English voice for browser TTS (asynchronously populated in
+  // Chrome via onvoiceschanged); no voice-selection UI yet.
+  const browserVoiceRef = useRef<SpeechSynthesisVoice | null>(null);
+  // Phase 6M: one-shot engine warm-up guard (per component mount) and the
+  // last logged voice key, so the browser_tts_voice diagnostic line is not
+  // repeated for every segment.
+  const browserTtsWarmupDoneRef = useRef(false);
+  const lastVoiceLogKeyRef = useRef<string | null>(null);
 
   // Load providers on mount
   useEffect(() => {
     getProviders().then(setProviders).catch(() => {});
+  }, []);
+
+  // Phase 6L/6M: pick a sensible English voice for browser TTS — LOCAL
+  // (offline) voices first, because remote network voices delay onstart.
+  // Voices populate asynchronously in Chrome (onvoiceschanged); re-pick
+  // whenever they load. The first utterance also re-resolves synchronously
+  // if this is still null, so late voices are picked up without blocking.
+  useEffect(() => {
+    if (!BROWSER_TTS_SUPPORTED) return;
+    const refreshVoice = () => {
+      browserVoiceRef.current = pickBrowserVoice();
+    };
+    refreshVoice();
+    window.speechSynthesis.addEventListener('voiceschanged', refreshVoice);
+    return () => {
+      window.speechSynthesis.removeEventListener('voiceschanged', refreshVoice);
+    };
   }, []);
 
   const addLog = useCallback((type: RealtimeLogEntry['type'], detail: string) => {
@@ -252,6 +343,18 @@ export default function RealtimeStt() {
     for (const url of cleared.revokeUrls) {
       URL.revokeObjectURL(url);
     }
+    // Phase 6L: stop browser-native speech and drop every pending tts_text
+    // sentence — a stopped/old session must never speak stale text. Runs on
+    // STOP, completed, error, close and unmount (no-op in elevenlabs mode).
+    if (BROWSER_TTS_SUPPORTED) {
+      try {
+        window.speechSynthesis.cancel();
+      } catch {
+        // speechSynthesis not ready — nothing to cancel.
+      }
+    }
+    browserTtsQueueRef.current = [];
+    browserTtsSpeakingRef.current = false;
     setMicActive(false);
   }, []);
 
@@ -380,6 +483,109 @@ export default function RealtimeStt() {
     [addLog],
   );
 
+  /** Phase 6L: speak the next queued browser-TTS sentence (strict order).
+   *
+   * One sentence speaks at a time — sentence 2 never interrupts sentence 1:
+   * the next utterance is only built after the current one's onend/onerror
+   * advances the queue. The session-epoch guard makes stale utterances from
+   * an old session inert (teardown also cancels + clears the queue).
+   *
+   * Phase 6M: per-stage diagnostics decompose the tts_text → speech delay —
+   * queue_ms (our FIFO), engine_ms (speak() → onstart: the browser engine
+   * under investigation), startup_ms (receipt → onstart: the user-facing
+   * metric, renamed from start_latency) — and the resolved voice is logged
+   * once per distinct selection.
+   */
+  const speakNextBrowserTts = useCallback(
+    function speakNext(epoch: number): void {
+      if (!BROWSER_TTS_SUPPORTED) return;
+      if (browserTtsSpeakingRef.current) return;
+      const item = browserTtsQueueRef.current.shift();
+      if (!item) return;
+      browserTtsSpeakingRef.current = true;
+      // Phase 6M: voices may have finished loading since the last pick —
+      // resolve synchronously right before the utterance so the first
+      // sentence never falls back to the browser default voice needlessly.
+      // Never blocks: getVoices() just returns whatever is loaded.
+      if (browserVoiceRef.current === null) {
+        browserVoiceRef.current = pickBrowserVoice();
+      }
+      const voice = browserVoiceRef.current;
+      const preparedAt = performance.now();
+      const utterance = new SpeechSynthesisUtterance(item.text);
+      if (voice) {
+        utterance.voice = voice;
+      }
+      const turnLabel = item.turn ?? 'n/a';
+      addLog(
+        'browser_tts',
+        `browser_tts_prepare turn=${turnLabel} segment=${item.segmentNo}` +
+          ` queue_ms=${Math.round(preparedAt - item.receivedAt)}`,
+      );
+      const voiceKey = voice
+        ? `${voice.name}|${voice.lang}|${voice.localService}`
+        : 'default';
+      if (voiceKey !== lastVoiceLogKeyRef.current) {
+        lastVoiceLogKeyRef.current = voiceKey;
+        const voiceLine = voice
+          ? `browser_tts_voice name="${voice.name}" lang="${voice.lang}" localService=${voice.localService}`
+          : `browser_tts_voice name="(browser default)" lang="n/a" localService=n/a` +
+            ` voices_loaded=${window.speechSynthesis.getVoices().length}`;
+        addLog('browser_tts', voiceLine);
+        console.log(`[VOICE:UI] ${voiceLine}`);
+      }
+      addLog(
+        'browser_tts',
+        `browser_tts_speak_called turn=${turnLabel} segment=${item.segmentNo}`,
+      );
+      const speakCalledAt = performance.now();
+      let startedAt: number | null = null;
+      utterance.onstart = () => {
+        if (sessionEpochRef.current !== epoch) return;
+        startedAt = performance.now();
+        setTtsProcessing(false);
+        const startupMs = Math.round(startedAt - item.receivedAt);
+        const engineMs = Math.round(startedAt - speakCalledAt);
+        // tts_text received → speech actually started (NOT network latency).
+        console.log(
+          `[VOICE:UI] browser_tts_started turn=${turnLabel} segment=${item.segmentNo}` +
+            ` startup_ms=${startupMs} engine_ms=${engineMs}`,
+        );
+        addLog(
+          'browser_tts',
+          `browser_tts_started turn=${turnLabel} segment=${item.segmentNo}` +
+            ` startup_ms=${startupMs} engine_ms=${engineMs}`,
+        );
+      };
+      let finished = false;
+      const finish = (detail: string) => {
+        // onend + onerror can both fire for one utterance — advance once.
+        if (finished) return;
+        finished = true;
+        browserTtsSpeakingRef.current = false;
+        if (sessionEpochRef.current !== epoch) return;
+        addLog('browser_tts', detail);
+        speakNext(epoch);
+      };
+      utterance.onend = () => {
+        const durationMs =
+          startedAt != null ? Math.round(performance.now() - startedAt) : null;
+        finish(
+          `browser_tts_ended turn=${turnLabel} segment=${item.segmentNo}` +
+            (durationMs != null ? ` duration=${durationMs}ms` : ''),
+        );
+      };
+      utterance.onerror = (e) => {
+        finish(
+          `browser_tts_error turn=${turnLabel} segment=${item.segmentNo}` +
+            ` error=${e.error ?? 'unknown'}`,
+        );
+      };
+      window.speechSynthesis.speak(utterance);
+    },
+    [addLog],
+  );
+
   const handleServerEvent = useCallback(
     (event: RealtimeEvent) => {
       switch (event.type) {
@@ -427,6 +633,22 @@ export default function RealtimeStt() {
           setTtsProcessing(true);
           addLog('tts_processing', '');
           break;
+        case 'tts_text': {
+          // Phase 6L browser TTS: queue the sentence text; speechSynthesis
+          // speaks strictly in sentence order (one at a time). No audio
+          // events exist in this mode.
+          const turnNo = typeof event.turn === 'number' ? event.turn : null;
+          const segmentNo = typeof event.segment === 'number' ? event.segment : 1;
+          addLog('tts_text', `turn=${turnNo ?? 'n/a'} segment=${segmentNo}`);
+          browserTtsQueueRef.current.push({
+            turn: turnNo,
+            segmentNo,
+            text: event.text,
+            receivedAt: performance.now(),
+          });
+          speakNextBrowserTts(sessionEpochRef.current);
+          break;
+        }
         case 'audio': {
           setTtsProcessing(false);
           // Phase 6G: capture the backend turn + server send timestamp so the
@@ -502,7 +724,7 @@ export default function RealtimeStt() {
           break;
       }
     },
-    [addLog, teardownAudio, playNextSegment],
+    [addLog, teardownAudio, playNextSegment, speakNextBrowserTts],
   );
 
   const startRealtime = useCallback(async () => {
@@ -518,8 +740,31 @@ export default function RealtimeStt() {
     setBrowserPlaybackLatencyMs(null);
     audioQueueRef.current = createAudioQueueState();
     lastPlayedSegmentRef.current = null;
+    // Phase 6L: no stale browser speech may leak into the new session.
+    if (BROWSER_TTS_SUPPORTED) {
+      try {
+        window.speechSynthesis.cancel();
+      } catch {
+        // speechSynthesis not ready — nothing to cancel.
+      }
+    }
+    browserTtsQueueRef.current = [];
+    browserTtsSpeakingRef.current = false;
+    // Phase 6M: each session re-logs its resolved voice once.
+    lastVoiceLogKeyRef.current = null;
     setLog([]);
     closingRef.current = false;
+
+    // Phase 6M: warm the speech engine once, inside this Start user gesture,
+    // so Chrome's one-time engine initialization (~0.5-1s before onstart)
+    // does not land on the first real sentence of a browser-TTS session.
+    // Silent: a single space at volume 0, never queued, never shown as
+    // assistant text, at most once per component mount.
+    if (ttsMode === 'browser' && !browserTtsWarmupDoneRef.current) {
+      browserTtsWarmupDoneRef.current = true;
+      warmUpBrowserSpeech();
+      addLog('browser_tts', 'browser_tts_warmup (silent, volume=0)');
+    }
 
     if (!navigator.mediaDevices?.getUserMedia) {
       setError('Microphone not supported in this browser');
@@ -579,10 +824,13 @@ export default function RealtimeStt() {
         if (llmModel) {
           startMsg.llm_model = llmModel;
         }
+        // Phase 6L: response TTS mode — elevenlabs (server MP3) or browser
+        // (tts_text events + local speechSynthesis).
+        startMsg.tts_mode = ttsMode;
         ws.send(JSON.stringify(startMsg));
         addLog(
           'ws',
-          `START sent sample_rate=${audioCtx.sampleRate} llm=${selectedLLMProvider}/${llmModel || 'default'}`,
+          `START sent sample_rate=${audioCtx.sampleRate} llm=${selectedLLMProvider}/${llmModel || 'default'} tts=${ttsMode}`,
         );
 
         // 5. Worklet PCM frames → WS binary frames.
@@ -656,7 +904,7 @@ export default function RealtimeStt() {
         setError(`Realtime start failed: ${msg}`);
       }
     }
-  }, [addLog, connState, handleServerEvent, teardownAudio]);
+  }, [addLog, connState, handleServerEvent, teardownAudio, ttsMode]);
 
   const stopRealtime = useCallback(() => {
     closingRef.current = true;
@@ -682,6 +930,50 @@ export default function RealtimeStt() {
       setConnState('disconnected');
     }
   }, [addLog, teardownAudio]);
+
+  /** Phase 6L: switch the realtime response TTS mode.
+   *
+   * Browser speech is cancelled and its queue cleared on EVERY switch (no
+   * browser speech outlives the mode it belongs to). The backend applies
+   * the new mode from the NEXT turn — an already-playing ElevenLabs response
+   * is never interrupted.
+   */
+  const handleTtsModeSelect = useCallback(
+    (mode: RealtimeTtsMode) => {
+      if (mode === ttsMode) return;
+      if (mode === 'browser' && !BROWSER_TTS_SUPPORTED) {
+        setError('Browser speech synthesis is not available in this browser');
+        addLog('error', 'Browser TTS unavailable (no speechSynthesis)');
+        return;
+      }
+      setTtsMode(mode);
+      if (BROWSER_TTS_SUPPORTED) {
+        try {
+          window.speechSynthesis.cancel();
+        } catch {
+          // speechSynthesis not ready — nothing to cancel.
+        }
+      }
+      browserTtsQueueRef.current = [];
+      browserTtsSpeakingRef.current = false;
+      // Phase 6M: switching to browser mode is also a user gesture — warm
+      // the engine once so the first browser-mode sentence starts fast.
+      if (mode === 'browser' && !browserTtsWarmupDoneRef.current) {
+        browserTtsWarmupDoneRef.current = true;
+        warmUpBrowserSpeech();
+        addLog('browser_tts', 'browser_tts_warmup (silent, volume=0)');
+      }
+      const ws = wsRef.current;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        const msg: RealtimeTtsModeMessage = { type: 'tts_mode', mode };
+        ws.send(JSON.stringify(msg));
+        addLog('ws', `tts_mode=${mode} (applies to next turn)`);
+      } else {
+        addLog('ws', `tts_mode=${mode}`);
+      }
+    },
+    [addLog, ttsMode],
+  );
 
   const isConnected = connState === 'connected';
   const isBusy = connState !== 'disconnected';
@@ -713,6 +1005,38 @@ export default function RealtimeStt() {
             <span className={micActive ? 'text-red-400' : 'text-gray-500'}>
               {micActive ? 'live' : 'off'}
             </span>
+          </span>
+          {/* Phase 6L: response TTS mode — ElevenLabs (server MP3) vs Browser
+              (Web Speech API). Compact switch; doubles as the "TTS: …"
+              diagnostic label for manual benchmarking. */}
+          <span className="flex items-center gap-1">
+            <span className="text-gray-500">TTS:</span>
+            <button
+              onClick={() => handleTtsModeSelect('elevenlabs')}
+              className={
+                ttsMode === 'elevenlabs'
+                  ? 'px-2 py-0.5 bg-blue-600 text-white rounded text-xs font-medium'
+                  : 'px-2 py-0.5 bg-gray-700 text-gray-300 rounded text-xs hover:bg-gray-600'
+              }
+            >
+              ElevenLabs
+            </button>
+            <button
+              onClick={() => handleTtsModeSelect('browser')}
+              disabled={!BROWSER_TTS_SUPPORTED}
+              title={
+                BROWSER_TTS_SUPPORTED
+                  ? 'Speak responses locally via speechSynthesis'
+                  : 'speechSynthesis is not available in this browser'
+              }
+              className={
+                ttsMode === 'browser'
+                  ? 'px-2 py-0.5 bg-blue-600 text-white rounded text-xs font-medium'
+                  : 'px-2 py-0.5 bg-gray-700 text-gray-300 rounded text-xs hover:bg-gray-600 disabled:opacity-40 disabled:hover:bg-gray-700 disabled:cursor-not-allowed'
+              }
+            >
+              Browser{!BROWSER_TTS_SUPPORTED ? ' (unavailable)' : ''}
+            </button>
           </span>
           {isConnected ? (
             <button
