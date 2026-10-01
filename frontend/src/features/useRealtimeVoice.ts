@@ -285,6 +285,16 @@ export default function useRealtimeVoice(
   // repeated for every segment.
   const browserTtsWarmupDoneRef = useRef(false);
   const lastVoiceLogKeyRef = useRef<string | null>(null);
+  // Barge-in (interrupt while the assistant speaks): turn-level staleness
+  // gate built on the server turn labels. latestMediaTurnRef = highest
+  // assistant turn seen; lastMetricsTurnRef = last completed turn;
+  // activeTurnRef = turn currently being produced (0 = idle);
+  // bargeInCutoffRef = set on interruption — frames with turn <= cutoff are
+  // discarded until a newer turn's output arrives.
+  const latestMediaTurnRef = useRef(0);
+  const lastMetricsTurnRef = useRef(0);
+  const activeTurnRef = useRef(0);
+  const bargeInCutoffRef = useRef<number | null>(null);
 
   // Phase 6L/6M: pick a sensible English voice for browser TTS — LOCAL
   // (offline) voices first, because remote network voices delay onstart.
@@ -381,8 +391,72 @@ export default function useRealtimeVoice(
     }
     browserTtsQueueRef.current = [];
     browserTtsSpeakingRef.current = false;
+    // Barge-in gate: a torn-down session has nothing left to invalidate.
+    bargeInCutoffRef.current = null;
     setMicActive(false);
   }, []);
+
+  /** Barge-in: cancel ONLY assistant playback (ElevenLabs audio queue and
+   * browser speech). The microphone, AudioWorklet, AudioContext and the
+   * WebSocket keep running — the user's utterance becomes the next turn.
+   * Playback-only subset of teardownAudio(); no session teardown. */
+  const cancelAssistantPlayback = useCallback(() => {
+    const audioEl = audioRef.current;
+    if (audioEl) {
+      audioEl.onplaying = null;
+      audioEl.onended = null;
+      audioEl.onerror = null;
+      audioEl.pause();
+      if (audioEl.src) {
+        URL.revokeObjectURL(audioEl.src);
+        audioEl.removeAttribute('src');
+      }
+    }
+    const cleared = clearAudioQueue(audioQueueRef.current);
+    audioQueueRef.current = cleared.state;
+    for (const url of cleared.revokeUrls) {
+      URL.revokeObjectURL(url);
+    }
+    // The interrupted segment must not label the next turn's diagnostics.
+    lastPlayedSegmentRef.current = null;
+    if (BROWSER_TTS_SUPPORTED) {
+      try {
+        window.speechSynthesis.cancel();
+      } catch {
+        // speechSynthesis not ready — nothing to cancel.
+      }
+    }
+    browserTtsQueueRef.current = [];
+    browserTtsSpeakingRef.current = false;
+  }, []);
+
+  /** Barge-in trigger: cut the assistant's playback the moment the user
+   * speaks again — but only while assistant audio is active or a response
+   * is in flight. The first qualifying interruption sets the turn cutoff
+   * from the server turn labels; repeat partials of the same episode are
+   * inert (no duplicate log), while interrupting a newer in-flight turn
+   * extends the cutoff. start()/teardown() reset the gate. */
+  const maybeBargeIn = useCallback(
+    (source: string) => {
+      const playbackActive =
+        audioQueueRef.current.current !== null ||
+        audioQueueRef.current.pending.length > 0 ||
+        browserTtsQueueRef.current.length > 0 ||
+        browserTtsSpeakingRef.current;
+      if (!playbackActive && activeTurnRef.current === 0) return;
+      const cutoff = Math.max(
+        latestMediaTurnRef.current,
+        activeTurnRef.current,
+      );
+      if (bargeInCutoffRef.current !== null && cutoff <= bargeInCutoffRef.current) {
+        return; // already covered by an earlier interruption
+      }
+      bargeInCutoffRef.current = cutoff;
+      cancelAssistantPlayback();
+      addLog('barge_in', `source=${source} cutoff_turn=${cutoff}`);
+    },
+    [addLog, cancelAssistantPlayback],
+  );
 
   /** Phase 6H: play the next queued sentence segment (strict order).
    *
@@ -624,12 +698,17 @@ export default function useRealtimeVoice(
           );
           break;
         case 'transcript_partial':
+          // Earliest reliable user-speech signal: a new partial while the
+          // assistant is still speaking interrupts its playback.
+          maybeBargeIn('transcript_partial');
           // One evolving current turn: partials replace in place and are
           // never committed as conversation messages.
           dispatchConversation({ type: 'partial', text: event.text });
           addLog('transcript_partial', `"${event.text}"`);
           break;
         case 'transcript_final':
+          // Backup trigger (partials usually fired already — idempotent).
+          maybeBargeIn('transcript_final');
           // Finalized segments accumulate into the same turn; the turn is
           // committed only when the backend dispatches it (agent_processing).
           dispatchConversation({ type: 'final', text: event.text });
@@ -640,6 +719,9 @@ export default function useRealtimeVoice(
           break;
         case 'agent_processing':
           // The turn was released by the backend: commit ONE user message.
+          // Track the in-flight server turn (turn numbers come from
+          // turn_metrics) so interrupting generation can cut its audio.
+          activeTurnRef.current = lastMetricsTurnRef.current + 1;
           dispatchConversation({ type: 'agent_processing' });
           addLog('agent_processing', '');
           break;
@@ -679,6 +761,23 @@ case 'agent_delta':
           // speaks strictly in sentence order (one at a time). No audio
           // events exist in this mode.
           const turnNo = typeof event.turn === 'number' ? event.turn : null;
+          // Barge-in: discard the interrupted turn's late sentences; the
+          // first frame of a newer turn lifts the gate.
+          if (bargeInCutoffRef.current !== null) {
+            if (turnNo === null || turnNo <= bargeInCutoffRef.current) {
+              addLog(
+                'tts_text',
+                `barge_in drop turn=${event.turn ?? 'n/a'} cutoff=${bargeInCutoffRef.current}`,
+              );
+              break;
+            }
+            addLog('tts_text', `barge_in resume turn=${turnNo}`);
+            bargeInCutoffRef.current = null;
+          }
+          latestMediaTurnRef.current = Math.max(
+            latestMediaTurnRef.current,
+            turnNo ?? 0,
+          );
           const segmentNo = typeof event.segment === 'number' ? event.segment : 1;
           addLog('tts_text', `turn=${turnNo ?? 'n/a'} segment=${segmentNo}`);
           browserTtsQueueRef.current.push({
@@ -695,6 +794,24 @@ case 'agent_delta':
           // Phase 6G: capture the backend turn + server send timestamp so the
           // playback-start report below can be correlated server-side.
           const audioTurn = typeof event.turn === 'number' ? event.turn : null;
+          // Barge-in: discard the interrupted turn's late segments before
+          // decoding (no blob/object URL is created, so nothing leaks); the
+          // first segment of a newer turn lifts the gate.
+          if (bargeInCutoffRef.current !== null) {
+            if (audioTurn === null || audioTurn <= bargeInCutoffRef.current) {
+              addLog(
+                'audio',
+                `barge_in drop turn=${event.turn ?? 'n/a'} cutoff=${bargeInCutoffRef.current}`,
+              );
+              break;
+            }
+            addLog('audio', `barge_in resume turn=${audioTurn}`);
+            bargeInCutoffRef.current = null;
+          }
+          latestMediaTurnRef.current = Math.max(
+            latestMediaTurnRef.current,
+            audioTurn ?? 0,
+          );
           const wsTransitMs =
             typeof event.sent_epoch_ms === 'number'
               ? Math.max(0, Math.round(Date.now() - event.sent_epoch_ms))
@@ -734,6 +851,11 @@ case 'agent_delta':
         case 'turn_metrics': {
           setTurnMetrics(event.data);
           const d = event.data;
+          // Turn fully produced (metrics arrive after its TTS consumer
+          // completes): retire the in-flight marker, remember the number.
+          lastMetricsTurnRef.current = d.turn;
+          latestMediaTurnRef.current = Math.max(latestMediaTurnRef.current, d.turn);
+          activeTurnRef.current = 0;
           addLog(
             'turn_metrics',
             `turn=${d.turn} utterance_to_agent=${d.utterance_end_to_agent_ms ?? 'N/A'}ms ` +
@@ -757,6 +879,7 @@ case 'agent_delta':
           wsRef.current?.close();
           break;
         case 'error':
+          activeTurnRef.current = 0;
           dispatchConversation({ type: 'agent_failed' });
           setTtsProcessing(false);
           setError(event.message);
@@ -765,7 +888,7 @@ case 'agent_delta':
           break;
       }
     },
-    [addLog, teardownAudio, playNextSegment, speakNextBrowserTts],
+    [addLog, teardownAudio, playNextSegment, speakNextBrowserTts, maybeBargeIn],
   );
 
   const start = useCallback(
@@ -782,6 +905,11 @@ case 'agent_delta':
       setBrowserPlaybackLatencyMs(null);
       audioQueueRef.current = createAudioQueueState();
       lastPlayedSegmentRef.current = null;
+      // Barge-in gate + turn tracking: a fresh session starts clean.
+      bargeInCutoffRef.current = null;
+      latestMediaTurnRef.current = 0;
+      lastMetricsTurnRef.current = 0;
+      activeTurnRef.current = 0;
       // Phase 6L: no stale browser speech may leak into the new session.
       if (BROWSER_TTS_SUPPORTED) {
         try {

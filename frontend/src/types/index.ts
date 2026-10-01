@@ -460,7 +460,13 @@ export interface RealtimeBrowserTimingMessage {
 /** One entry in the realtime event log UI. */
 export interface RealtimeLogEntry {
   time: string;
-  type: RealtimeEventType | 'mic' | 'ws' | 'browser_timing' | 'browser_tts';
+  type:
+    | RealtimeEventType
+    | 'mic'
+    | 'ws'
+    | 'browser_timing'
+    | 'browser_tts'
+    | 'barge_in';
   detail: string;
 }
 
