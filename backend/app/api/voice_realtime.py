@@ -35,6 +35,8 @@ Server → Client protocol:
     {"type": "transcript_final", "text": "...", "confidence": 0.95}
     {"type": "utterance_end"}
     {"type": "agent_processing"}
+    {"type": "agent_delta", "text": "..."}
+         (progressive assistant text — one raw LLM delta per event)
     {"type": "agent_response", "text": "...", "tool_calls": 0, "iterations": 1}
     {"type": "tts_processing"}
     {"type": "audio", "format": "audio/mpeg", "data": "...", "turn": 1,
@@ -1263,6 +1265,8 @@ async def _stream_llm_response(
     llm: LLMInterface,
     model: str | None,
     sentence_sink: _SentenceSink | None = None,
+    ws: WebSocket | None = None,
+    state: RealtimeSessionState | None = None,
 ) -> dict:
     """Stream LLM response with inline tool-call detection.
 
@@ -1279,6 +1283,11 @@ async def _stream_llm_response(
     filler is discarded and ``_complete_streamed_tool_turn`` executes the
     tools, runs a final chat() follow-up and streams the final answer
     through the same sink.
+
+    Progressive UI: when ``ws``/``state`` are provided, every streamed
+    content chunk is forwarded to the browser as an ``agent_delta`` event
+    (lifecycle-safe send, no buffering); ``agent_response`` later carries
+    the authoritative complete text.
 
     Returns:
         Dict with response, tool_calls, usage, iterations, first_token_ms,
@@ -1364,6 +1373,15 @@ async def _stream_llm_response(
                     first_token_at = time.monotonic()
                 accumulated_text += chunk.content
                 chunk_count += 1
+                # Progressive UI: forward the raw delta immediately —
+                # lifecycle-safe send, no extra buffering. agent_response
+                # later carries the authoritative complete text.
+                if ws is not None and state is not None:
+                    await _safe_ws_send(
+                        ws,
+                        state,
+                        {"type": "agent_delta", "text": chunk.content},
+                    )
                 # Feed to sentence buffer
                 new_sentences = buffer.add(chunk.content)
                 if new_sentences:
@@ -2270,6 +2288,8 @@ async def _agent_worker(
                 llm=state.llm,
                 model=resolved_model,
                 sentence_sink=sentence_sink,
+                ws=ws,
+                state=state,
             )
             turn_timing.streamed_tokens = result.get("streamed_tokens", 0)
             turn_timing.llm_sentence_count = result.get(

@@ -40,7 +40,13 @@ export default function VoiceChat() {
   // Auto-scroll to the latest message (same pattern as TextChat).
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [conversation.entries.length, currentTurn, conversation.agentProcessing, ttsProcessing]);
+  }, [
+    conversation.entries.length,
+    currentTurn,
+    conversation.agentProcessing,
+    conversation.assistantPartial,
+    ttsProcessing,
+  ]);
 
   const isConnected = connState === 'connected';
   const isBusy = connState !== 'disconnected';
@@ -56,7 +62,9 @@ export default function VoiceChat() {
 
   const statusLabel = isConnected
     ? conversation.agentProcessing
-      ? 'Thinking…'
+      ? conversation.assistantPartial
+        ? 'Responding…'
+        : 'Thinking…'
       : ttsProcessing
         ? 'Speaking…'
         : micActive
@@ -206,8 +214,18 @@ export default function VoiceChat() {
           </div>
         )}
 
-        {/* Subtle in-flight states while the agent works / TTS plays. */}
-        {conversation.agentProcessing && (
+        {/* Progressive assistant response — grows while the LLM streams
+            (agent_delta events), finalized by agent_response. */}
+        {conversation.assistantPartial && (
+          <div className="flex justify-start">
+            <div className="rounded-2xl px-4 py-2 max-w-[85%] text-sm whitespace-pre-wrap break-words border bg-gray-800 border-gray-700 text-gray-100 opacity-90">
+              {conversation.assistantPartial}
+            </div>
+          </div>
+        )}
+
+        {/* In-flight states: Thinking only until the first delta arrives. */}
+        {conversation.agentProcessing && !conversation.assistantPartial && (
           <div className="flex justify-start">
             <div className="rounded-2xl px-4 py-2 max-w-[85%] text-sm border bg-gray-800 border-gray-700 text-gray-400">
               <span className="animate-pulse">Thinking…</span>

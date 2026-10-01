@@ -14,8 +14,9 @@
  *                     "tts_mode":"elevenlabs"|"browser"} | binary PCM
  *                    | {"type":"tts_mode","mode":"browser"} | {"type":"stop"}
  *   server → client: session_started | transcript_partial | transcript_final
- *                    | utterance_end | agent_processing | agent_response
- *                    | tts_text (Phase 6L browser TTS) | completed | error
+ *                    | utterance_end | agent_processing | agent_delta
+ *                    | agent_response | tts_text (Phase 6L browser TTS)
+ *                    | completed | error
  */
 
 import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
@@ -653,6 +654,13 @@ export default function useRealtimeVoice(
             'agent_response',
             `text="${event.text.slice(0, 50)}${event.text.length > 50 ? '…' : ''}" tools=${event.tool_calls} iterations=${event.iterations}`,
           );
+          break;
+case 'agent_delta':
+          // Progressive assistant text: accumulate the raw LLM delta into
+          // the evolving assistant message. agent_response later commits
+          // the authoritative full text (replaces the draft). Deliberately
+          // not addLog()'d — per-token events would flood the dev log.
+          dispatchConversation({ type: 'agent_delta', text: event.text });
           break;
         case 'tts_processing':
           setTtsProcessing(true);

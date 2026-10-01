@@ -204,16 +204,20 @@ export default function RealtimeStt() {
           <div className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2">
             <div className="text-xs text-gray-500 mb-1 font-medium uppercase">
               Conversation
-              {conversation.agentProcessing && (
-                <span className="ml-2 text-yellow-400 animate-pulse">thinking…</span>
-              )}
+              {conversation.agentProcessing &&
+                (conversation.assistantPartial ? (
+                  <span className="ml-2 text-blue-400 animate-pulse">responding…</span>
+                ) : (
+                  <span className="ml-2 text-yellow-400 animate-pulse">thinking…</span>
+                ))}
               {!conversation.agentProcessing && ttsProcessing && (
                 <span className="ml-2 text-green-400 animate-pulse">speaking…</span>
               )}
             </div>
             <div className="space-y-2 max-h-80 overflow-y-auto">
               {conversation.entries.length === 0 &&
-                !currentTurn && (
+                !currentTurn &&
+                !conversation.assistantPartial && (
                   <div className="text-sm text-gray-600">—</div>
                 )}
               {conversation.entries.map((entry, i) => (
@@ -248,6 +252,15 @@ export default function RealtimeStt() {
                     )}
                 </div>
               ))}
+              {/* Progressive assistant draft — grows while the LLM streams
+                  (agent_delta events); agent_response commits the final row
+                  and clears this draft, so the text is never duplicated. */}
+              {conversation.assistantPartial && (
+                <div className="text-sm break-words">
+                  <span className="text-blue-400 font-semibold">ASSISTANT:</span>{' '}
+                  <span className="text-blue-100">{conversation.assistantPartial}</span>
+                </div>
+              )}
             </div>
           </div>
           {/* Current turn — ONE evolving message while the user speaks. */}

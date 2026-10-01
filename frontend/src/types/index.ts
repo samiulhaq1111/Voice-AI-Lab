@@ -239,6 +239,7 @@ export type RealtimeEventType =
   | 'transcript_final'
   | 'utterance_end'
   | 'agent_processing'
+  | 'agent_delta'
   | 'agent_response'
   | 'tts_processing'
   | 'audio'
@@ -274,6 +275,13 @@ export interface RealtimeUtteranceEnd {
 
 export interface RealtimeAgentProcessing {
   type: 'agent_processing';
+}
+
+/** Progressive assistant text: one raw LLM delta while the response
+ * streams. agent_response later carries the authoritative complete text. */
+export interface RealtimeAgentDelta {
+  type: 'agent_delta';
+  text: string;
 }
 
 export interface RealtimeAgentResponse {
@@ -389,6 +397,7 @@ export type RealtimeEvent =
   | RealtimeTranscriptFinal
   | RealtimeUtteranceEnd
   | RealtimeAgentProcessing
+  | RealtimeAgentDelta
   | RealtimeAgentResponse
   | RealtimeTTSProcessing
   | RealtimeAudio

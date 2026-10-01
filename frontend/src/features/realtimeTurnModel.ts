@@ -10,7 +10,11 @@
  *   agent_processing     the turn was released/dispatched → commit ONE user
  *                        message built from the finalized segments (the same
  *                        text the agent received)
- *   agent_response       commit the assistant message
+ *   agent_delta          progressive assistant text — appends the raw LLM
+ *                        delta to the evolving assistant message
+ *                        (assistantPartial)
+ *   agent_response       commit the assistant message (authoritative full
+ *                        text replaces the accumulated draft)
  *
  * Interim partials never become conversation entries; only the dispatch
  * commits the user's turn.
@@ -34,6 +38,8 @@ export interface ConversationState {
   partial: string;
   /** True between dispatch (agent_processing) and the outcome. */
   agentProcessing: boolean;
+  /** Accumulated agent_delta text of the in-flight assistant response. */
+  assistantPartial: string;
 }
 
 export type ConversationAction =
@@ -41,6 +47,7 @@ export type ConversationAction =
   | { type: 'partial'; text: string }
   | { type: 'final'; text: string }
   | { type: 'agent_processing' }
+  | { type: 'agent_delta'; text: string }
   | {
       type: 'agent_response';
       text: string;
@@ -50,7 +57,13 @@ export type ConversationAction =
   | { type: 'agent_failed' };
 
 export function createConversationState(): ConversationState {
-  return { entries: [], pendingFinals: [], partial: '', agentProcessing: false };
+  return {
+    entries: [],
+    pendingFinals: [],
+    partial: '',
+    agentProcessing: false,
+    assistantPartial: '',
+  };
 }
 
 function joinSegments(segments: string[]): string {
@@ -94,8 +107,17 @@ export function conversationReducer(
         pendingFinals: [],
         partial: '',
         agentProcessing: true,
+        assistantPartial: '',
       };
     }
+    case 'agent_delta':
+      // Progressive assistant text: append the raw LLM delta to the
+      // evolving message. agent_response later commits the authoritative
+      // full text (replacing, not appending — no duplication).
+      return {
+        ...state,
+        assistantPartial: state.assistantPartial + action.text,
+      };
     case 'agent_response':
       return {
         ...state,
@@ -109,10 +131,13 @@ export function conversationReducer(
           },
         ],
         agentProcessing: false,
+        // The event text is authoritative — drop the accumulated draft so
+        // the final message is never duplicated.
+        assistantPartial: '',
       };
     case 'agent_failed':
       // Error before a response: keep the committed history, stop the
-      // in-flight indicator.
-      return { ...state, agentProcessing: false };
+      // in-flight indicator, discard the partial draft.
+      return { ...state, agentProcessing: false, assistantPartial: '' };
   }
 }
