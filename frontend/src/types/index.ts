@@ -240,6 +240,7 @@ export type RealtimeEventType =
   | 'utterance_end'
   | 'agent_processing'
   | 'agent_delta'
+  | 'tool_progress'
   | 'agent_response'
   | 'tts_processing'
   | 'audio'
@@ -282,6 +283,14 @@ export interface RealtimeAgentProcessing {
 export interface RealtimeAgentDelta {
   type: 'agent_delta';
   text: string;
+}
+
+/** Deterministic tool-progress ack, sent right before each tool executes
+ * (no LLM involved). agent_response later clears the temporary status. */
+export interface RealtimeToolProgress {
+  type: 'tool_progress';
+  tool_name: string;
+  message: string;
 }
 
 export interface RealtimeAgentResponse {
@@ -398,6 +407,7 @@ export type RealtimeEvent =
   | RealtimeUtteranceEnd
   | RealtimeAgentProcessing
   | RealtimeAgentDelta
+  | RealtimeToolProgress
   | RealtimeAgentResponse
   | RealtimeTTSProcessing
   | RealtimeAudio

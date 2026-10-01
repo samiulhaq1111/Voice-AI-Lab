@@ -15,8 +15,8 @@
  *                    | {"type":"tts_mode","mode":"browser"} | {"type":"stop"}
  *   server → client: session_started | transcript_partial | transcript_final
  *                    | utterance_end | agent_processing | agent_delta
- *                    | agent_response | tts_text (Phase 6L browser TTS)
- *                    | completed | error
+ *                    | tool_progress | agent_response
+ *                    | tts_text (Phase 6L browser TTS) | completed | error
  */
 
 import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
@@ -661,6 +661,14 @@ case 'agent_delta':
           // the authoritative full text (replaces the draft). Deliberately
           // not addLog()'d — per-token events would flood the dev log.
           dispatchConversation({ type: 'agent_delta', text: event.text });
+          break;
+        case 'tool_progress':
+          // Deterministic ack sent right before a tool executes — shown as
+          // a temporary status message. The backend also queues the same
+          // text into the TTS sentence sink, so it is spoken while the tool
+          // runs. agent_response later clears the status.
+          dispatchConversation({ type: 'tool_progress', message: event.message });
+          addLog('tool_progress', `${event.tool_name}: ${event.message}`);
           break;
         case 'tts_processing':
           setTtsProcessing(true);

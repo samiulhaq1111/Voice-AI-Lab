@@ -13,6 +13,8 @@
  *   agent_delta          progressive assistant text — appends the raw LLM
  *                        delta to the evolving assistant message
  *                        (assistantPartial)
+ *   tool_progress        temporary status ack while a tool executes
+ *                        (toolProgress) — cleared by agent_response
  *   agent_response       commit the assistant message (authoritative full
  *                        text replaces the accumulated draft)
  *
@@ -40,6 +42,8 @@ export interface ConversationState {
   agentProcessing: boolean;
   /** Accumulated agent_delta text of the in-flight assistant response. */
   assistantPartial: string;
+  /** Temporary tool-progress status message (cleared by agent_response). */
+  toolProgress: string;
 }
 
 export type ConversationAction =
@@ -48,6 +52,7 @@ export type ConversationAction =
   | { type: 'final'; text: string }
   | { type: 'agent_processing' }
   | { type: 'agent_delta'; text: string }
+  | { type: 'tool_progress'; message: string }
   | {
       type: 'agent_response';
       text: string;
@@ -63,6 +68,7 @@ export function createConversationState(): ConversationState {
     partial: '',
     agentProcessing: false,
     assistantPartial: '',
+    toolProgress: '',
   };
 }
 
@@ -108,6 +114,7 @@ export function conversationReducer(
         partial: '',
         agentProcessing: true,
         assistantPartial: '',
+        toolProgress: '',
       };
     }
     case 'agent_delta':
@@ -118,6 +125,11 @@ export function conversationReducer(
         ...state,
         assistantPartial: state.assistantPartial + action.text,
       };
+    case 'tool_progress':
+      // Temporary status ack while a tool executes (spoken via the TTS
+      // pipeline independently). Never enters the assistant accumulator;
+      // agent_response clears it when the real answer arrives.
+      return { ...state, toolProgress: action.message };
     case 'agent_response':
       return {
         ...state,
@@ -134,10 +146,16 @@ export function conversationReducer(
         // The event text is authoritative — drop the accumulated draft so
         // the final message is never duplicated.
         assistantPartial: '',
+        toolProgress: '',
       };
     case 'agent_failed':
       // Error before a response: keep the committed history, stop the
-      // in-flight indicator, discard the partial draft.
-      return { ...state, agentProcessing: false, assistantPartial: '' };
+      // in-flight indicator, discard the partial draft and status.
+      return {
+        ...state,
+        agentProcessing: false,
+        assistantPartial: '',
+        toolProgress: '',
+      };
   }
 }

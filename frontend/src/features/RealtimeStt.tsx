@@ -217,7 +217,8 @@ export default function RealtimeStt() {
             <div className="space-y-2 max-h-80 overflow-y-auto">
               {conversation.entries.length === 0 &&
                 !currentTurn &&
-                !conversation.assistantPartial && (
+                !conversation.assistantPartial &&
+                !conversation.toolProgress && (
                   <div className="text-sm text-gray-600">—</div>
                 )}
               {conversation.entries.map((entry, i) => (
@@ -259,6 +260,15 @@ export default function RealtimeStt() {
                 <div className="text-sm break-words">
                   <span className="text-blue-400 font-semibold">ASSISTANT:</span>{' '}
                   <span className="text-blue-100">{conversation.assistantPartial}</span>
+                </div>
+              )}
+              {/* Temporary tool-progress status — deterministic ack sent
+                  right before a tool executes (also spoken via TTS).
+                  agent_response clears it when the answer arrives. */}
+              {conversation.toolProgress && (
+                <div className="text-sm break-words">
+                  <span className="text-blue-400 font-semibold">ASSISTANT:</span>{' '}
+                  <span className="text-blue-100 italic">{conversation.toolProgress}</span>
                 </div>
               )}
             </div>

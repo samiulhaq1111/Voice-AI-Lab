@@ -62,7 +62,7 @@ export default function VoiceChat() {
 
   const statusLabel = isConnected
     ? conversation.agentProcessing
-      ? conversation.assistantPartial
+      ? conversation.assistantPartial || conversation.toolProgress
         ? 'Responding…'
         : 'Thinking…'
       : ttsProcessing
@@ -224,14 +224,27 @@ export default function VoiceChat() {
           </div>
         )}
 
-        {/* In-flight states: Thinking only until the first delta arrives. */}
-        {conversation.agentProcessing && !conversation.assistantPartial && (
+        {/* Temporary tool-progress status — deterministic ack sent right
+            before a tool executes; spoken via the TTS pipeline separately.
+            agent_response clears it when the final answer arrives. */}
+        {conversation.toolProgress && (
           <div className="flex justify-start">
-            <div className="rounded-2xl px-4 py-2 max-w-[85%] text-sm border bg-gray-800 border-gray-700 text-gray-400">
-              <span className="animate-pulse">Thinking…</span>
+            <div className="rounded-2xl px-4 py-2 max-w-[85%] text-sm whitespace-pre-wrap break-words border bg-gray-800 border-gray-700 text-gray-100 opacity-80 italic">
+              {conversation.toolProgress}
             </div>
           </div>
         )}
+
+        {/* In-flight states: Thinking only until the first delta arrives. */}
+        {conversation.agentProcessing &&
+          !conversation.assistantPartial &&
+          !conversation.toolProgress && (
+            <div className="flex justify-start">
+              <div className="rounded-2xl px-4 py-2 max-w-[85%] text-sm border bg-gray-800 border-gray-700 text-gray-400">
+                <span className="animate-pulse">Thinking…</span>
+              </div>
+            </div>
+          )}
         {!conversation.agentProcessing && ttsProcessing && (
           <div className="flex justify-start">
             <div className="rounded-2xl px-4 py-2 max-w-[85%] text-sm border bg-gray-800 border-gray-700 text-gray-400">

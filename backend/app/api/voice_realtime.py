@@ -38,6 +38,9 @@ Server → Client protocol:
     {"type": "agent_delta", "text": "..."}
          (progressive assistant text — one raw LLM delta per event)
     {"type": "agent_response", "text": "...", "tool_calls": 0, "iterations": 1}
+    {"type": "tool_progress", "tool_name": "get_employee",
+     "message": "Sure, let me check the employee details for you."}
+     (deterministic ack sent right before each tool executes)
     {"type": "tts_processing"}
     {"type": "audio", "format": "audio/mpeg", "data": "...", "turn": 1,
      "segment": 1, "sent_epoch_ms": 1727000000000}  (elevenlabs mode)
@@ -1448,6 +1451,8 @@ async def _stream_llm_response(
             stream_start=stream_start,
             first_token_at=first_token_at,
             streamed_tokens=chunk_count,
+            ws=ws,
+            state=state,
         )
 
     # Save messages to DB (user message + assistant response)
@@ -1485,6 +1490,31 @@ async def _stream_llm_response(
     }
 
 
+# Deterministic tool-progress acks: shown/spoken while a tool executes so the
+# caller gets immediate feedback without an extra LLM request. Exact tool-name
+# matches win; well-known name fragments get a tailored ack; anything else
+# gets the generic one. Never includes arguments, IDs or internal details.
+_TOOL_PROGRESS_EXACT: dict[str, str] = {
+    "get_employee": "Sure, let me check the employee details for you.",
+    "get_weather": "Sure, let me check the latest weather for you.",
+}
+_TOOL_PROGRESS_KEYWORDS: tuple[tuple[str, str], ...] = (
+    ("appointment", "Let me check that for you."),
+    ("search", "Let me check that for you."),
+)
+_TOOL_PROGRESS_DEFAULT = "Sure, let me check that for you."
+
+
+def _tool_progress_message(tool_name: str) -> str:
+    if tool_name in _TOOL_PROGRESS_EXACT:
+        return _TOOL_PROGRESS_EXACT[tool_name]
+    lowered = tool_name.lower()
+    for keyword, message in _TOOL_PROGRESS_KEYWORDS:
+        if keyword in lowered:
+            return message
+    return _TOOL_PROGRESS_DEFAULT
+
+
 async def _complete_streamed_tool_turn(
     *,
     db: Session,
@@ -1499,6 +1529,8 @@ async def _complete_streamed_tool_turn(
     stream_start: float,
     first_token_at: float | None,
     streamed_tokens: int,
+    ws: WebSocket | None = None,
+    state: RealtimeSessionState | None = None,
 ) -> dict:
     """Execute streamed tool calls and stream the final answer back.
 
@@ -1511,6 +1543,11 @@ async def _complete_streamed_tool_turn(
     keeps streaming sentence by sentence.
 
     Mirrors the proven streaming+tools flow of the Telnyx agent.
+
+    Tool progress UX: right before each executor call a deterministic
+    ``tool_progress`` event is sent (lifecycle-safe, when ws/state are
+    provided) and the ack is pushed through sentence_sink so the existing
+    TTS consumer speaks it while the tool runs.
 
     Returns:
         Dict with the final response, detected tool calls, final usage,
@@ -1547,6 +1584,23 @@ async def _complete_streamed_tool_turn(
         tool_name = tool_call["function"]["name"]
         arguments_str = tool_call["function"]["arguments"]
         tool_call_id = tool_call.get("id", "")
+        # Immediate feedback: deterministic ack event + speech BEFORE the
+        # potentially slow executor call. Lifecycle-safe send (suppressed on
+        # STOP/closed); the ack rides the existing sentence_sink so the TTS
+        # consumer speaks it while the tool runs.
+        progress_message = _tool_progress_message(tool_name)
+        if ws is not None and state is not None:
+            await _safe_ws_send(
+                ws,
+                state,
+                {
+                    "type": "tool_progress",
+                    "tool_name": tool_name,
+                    "message": progress_message,
+                },
+            )
+        if sentence_sink is not None:
+            sentence_sink.put(progress_message)
         tool_start = time.monotonic()
         logger.info(
             "[REALTIME:TOOL] executing tool=%s args=%s",
