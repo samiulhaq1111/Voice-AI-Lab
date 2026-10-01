@@ -32,15 +32,21 @@ Server → Client protocol:
     {"type": "session_started", "session_id": "...", "provider": "...",
      "model": "...", "sample_rate": 16000}
     {"type": "transcript_partial", "text": "...", "confidence": 0.9}
-    {"type": "transcript_final", "text": "...", "confidence": 0.95}
+    {"type": "transcript_final", "text": "...", "confidence": 0.95,
+     "speech_final": true}
     {"type": "utterance_end"}
     {"type": "agent_processing"}
     {"type": "agent_delta", "text": "..."}
          (progressive assistant text — one raw LLM delta per event)
     {"type": "agent_response", "text": "...", "tool_calls": 0, "iterations": 1}
     {"type": "tool_progress", "tool_name": "get_employee",
+     "tool_call_id": "call_abc123",
      "message": "Sure, let me check the employee details for you."}
      (deterministic ack sent right before each tool executes)
+    {"type": "tool_result", "tool_name": "get_employee",
+     "tool_call_id": "call_abc123", "duration_ms": 617, "success": true,
+     "error": null}
+     (one per executed tool call — fan-out calls each report; not deduplicated)
     {"type": "tts_processing"}
     {"type": "audio", "format": "audio/mpeg", "data": "...", "turn": 1,
      "segment": 1, "sent_epoch_ms": 1727000000000}  (elevenlabs mode)
@@ -1081,6 +1087,7 @@ async def _pump_provider_events(
                         "type": "transcript_final",
                         "text": event.text,
                         "confidence": round(event.confidence, 4),
+                        "speech_final": speech_final,
                     },
                 ):
                     break
@@ -1605,6 +1612,7 @@ async def _complete_streamed_tool_turn(
                     {
                         "type": "tool_progress",
                         "tool_name": tool_name,
+                        "tool_call_id": tool_call_id,
                         "message": progress_message,
                     },
                 )
@@ -1653,6 +1661,23 @@ async def _complete_streamed_tool_turn(
             tool_ms,
             tool_result.success,
         )
+        # Trace support: report each executed tool call back to the client
+        # (name, call id, duration, outcome). Unlike tool_progress this is
+        # NOT deduplicated — fan-out calls execute once each and the client
+        # trace shows every execution.
+        if ws is not None and state is not None:
+            await _safe_ws_send(
+                ws,
+                state,
+                {
+                    "type": "tool_result",
+                    "tool_name": tool_name,
+                    "tool_call_id": tool_call_id,
+                    "duration_ms": round(tool_ms),
+                    "success": tool_result.success,
+                    "error": tool_result.error,
+                },
+            )
 
     # Final LLM call: conversation + tool results, no tool schemas — one
     # tool round per turn keeps latency bounded.

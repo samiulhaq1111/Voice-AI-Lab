@@ -29,6 +29,7 @@ import type {
   RealtimeTimings,
   RealtimeTtsMode,
   RealtimeTtsModeMessage,
+  RealtimeTraceEvent,
   RealtimeTurnMetrics,
 } from '../types';
 import {
@@ -182,6 +183,17 @@ function warmUpBrowserSpeech(): void {
   }
 }
 
+/** Trace helper: milliseconds since a performance.now() mark ('n/a' when unset). */
+function since(mark: number): string {
+  return mark > 0 ? `${Math.round(performance.now() - mark)}ms` : 'n/a';
+}
+
+/** Trace helper: flatten whitespace, make embedded quotes safe, truncate. */
+function clip(text: string, max: number): string {
+  const flat = text.replace(/\s+/g, ' ').replace(/"/g, "'").trim();
+  return flat.length > max ? `${flat.slice(0, max)}…` : flat;
+}
+
 /** Selected LLM provider/model for one realtime session start (sent in START). */
 export interface RealtimeStartConfig {
   llmProvider?: string;
@@ -190,9 +202,13 @@ export interface RealtimeStartConfig {
 
 export interface UseRealtimeVoiceOptions {
   /** Optional sink for the engine's diagnostic lines. The developer screen
-   * feeds its Events panel through this; Voice Chat passes nothing so its
-   * conversation UI stays free of diagnostics. */
-  onDiagnostic?: (type: RealtimeLogEntry['type'], detail: string) => void;
+   * feeds its Events panel through this; Voice Chat feeds its Debug Logs
+   * drawer. For trace lines `type` is a RealtimeTraceEvent (uppercase). */
+  onDiagnostic?: (
+    type: RealtimeLogEntry['type'],
+    detail: string,
+    turn?: number | null,
+  ) => void;
 }
 
 export interface UseRealtimeVoiceResult {
@@ -223,9 +239,12 @@ export default function useRealtimeVoice(
     onDiagnosticRef.current = options.onDiagnostic;
   });
 
-  const addLog = useCallback((type: RealtimeLogEntry['type'], detail: string) => {
-    onDiagnosticRef.current?.(type, detail);
-  }, []);
+  const addLog = useCallback(
+    (type: RealtimeLogEntry['type'], detail: string, turn?: number | null) => {
+      onDiagnosticRef.current?.(type, detail, turn);
+    },
+    [],
+  );
 
   const [connState, setConnState] = useState<RealtimeConnectionState>('disconnected');
   const [micActive, setMicActive] = useState(false);
@@ -296,6 +315,70 @@ export default function useRealtimeVoice(
   const activeTurnRef = useRef(0);
   const bargeInCutoffRef = useRef<number | null>(null);
 
+  // --- Realtime trace (Voice Chat "Debug Logs" drawer) --------------------
+  // Trace lines ride the SAME onDiagnostic channel the developer screen's
+  // Events panel uses — this is not a second logging system. Uppercase event
+  // names let the drawer filter trace lines from ordinary diagnostics.
+  const lastTraceAtRef = useRef(0);
+  const trace = useCallback(
+    (event: RealtimeTraceEvent, detail: string, turn: number | null) => {
+      const nowMs = performance.now();
+      const gap =
+        lastTraceAtRef.current > 0
+          ? ` since_prev=${Math.round(nowMs - lastTraceAtRef.current)}ms`
+          : '';
+      lastTraceAtRef.current = nowMs;
+      addLog(event, `${detail}${gap}`.trim(), turn);
+    },
+    [addLog],
+  );
+  // Turn label for events emitted between turns: the in-flight turn when one
+  // is active, otherwise one past the last completed turn.
+  const pendingSpeechTurn = useCallback(
+    () =>
+      activeTurnRef.current !== 0
+        ? activeTurnRef.current
+        : lastMetricsTurnRef.current + 1,
+    [],
+  );
+  // Per-speech-episode marks: STT_PARTIAL logs the first partial immediately
+  // and then at most once per second; finals feed UTTERANCE_END/TURN_RELEASED.
+  const speechMarksRef = useRef({
+    startedAt: 0,
+    lastPartialLogAt: 0,
+    partialsSkipped: 0,
+    speechFinalSeen: false,
+    finals: 0,
+  });
+  const noteSpeechStarted = useCallback(() => {
+    const marks = speechMarksRef.current;
+    if (marks.startedAt !== 0) return;
+    marks.startedAt = performance.now();
+    marks.lastPartialLogAt = 0;
+    marks.partialsSkipped = 0;
+    marks.speechFinalSeen = false;
+    marks.finals = 0;
+  }, []);
+  // Per-turn marks (re-armed on agent_processing): cheap since_* references
+  // for latency lines plus the once-per-turn trace gates.
+  const traceTurnRef = useRef({
+    turn: 0,
+    startedAt: 0,
+    llmRequestAt: 0,
+    firstTokenSeen: false,
+    firstSentenceSeen: false,
+    firstAudioSeen: false,
+    responseStarted: false,
+    ackedTools: new Set<string>(),
+  });
+  // Session-scoped trace metadata (START config) for LLM_REQUEST/SESSION_START.
+  const sessionTraceRef = useRef({ llmProvider: '', llmModel: '' });
+  // Live TTS mode for trace lines emitted outside the render closure.
+  const ttsModeRef = useRef(ttsModeState);
+  useEffect(() => {
+    ttsModeRef.current = ttsModeState;
+  }, [ttsModeState]);
+
   // Phase 6L/6M: pick a sensible English voice for browser TTS — LOCAL
   // (offline) voices first, because remote network voices delay onstart.
   // Voices populate asynchronously in Chrome (onvoiceschanged); re-pick
@@ -330,6 +413,12 @@ export default function useRealtimeVoice(
 
   /** Stop mic tracks, disconnect worklet, close AudioContext. */
   const teardownAudio = useCallback(() => {
+    const hadMic = micStreamRef.current !== null;
+    const hadPlayback =
+      audioQueueRef.current.current !== null ||
+      audioQueueRef.current.pending.length > 0 ||
+      browserTtsQueueRef.current.length > 0 ||
+      browserTtsSpeakingRef.current;
     if (workletNodeRef.current) {
       // STOP path: detach the frame handler first (no frame is forwarded
       // after STOP), then reset the worklet PCM accumulator. The node is
@@ -394,13 +483,21 @@ export default function useRealtimeVoice(
     // Barge-in gate: a torn-down session has nothing left to invalidate.
     bargeInCutoffRef.current = null;
     setMicActive(false);
-  }, []);
+    // Trace: only report what was actually running (teardown is idempotent).
+    if (hadMic) trace('MIC_STOPPED', '', null);
+    if (hadPlayback) trace('AUDIO_QUEUE_CLEARED', 'reason=teardown', null);
+  }, [trace]);
 
   /** Barge-in: cancel ONLY assistant playback (ElevenLabs audio queue and
    * browser speech). The microphone, AudioWorklet, AudioContext and the
    * WebSocket keep running — the user's utterance becomes the next turn.
    * Playback-only subset of teardownAudio(); no session teardown. */
   const cancelAssistantPlayback = useCallback(() => {
+    const wasPlaying =
+      audioQueueRef.current.current !== null ||
+      audioQueueRef.current.pending.length > 0 ||
+      browserTtsQueueRef.current.length > 0 ||
+      browserTtsSpeakingRef.current;
     const audioEl = audioRef.current;
     if (audioEl) {
       audioEl.onplaying = null;
@@ -428,7 +525,13 @@ export default function useRealtimeVoice(
     }
     browserTtsQueueRef.current = [];
     browserTtsSpeakingRef.current = false;
-  }, []);
+    // Trace: the interruption pair (BARGE_IN_DETECTED is emitted by
+    // maybeBargeIn just before this runs). Turn = the cutoff turn.
+    if (wasPlaying) {
+      trace('PLAYBACK_CANCELLED', 'reason=barge_in', bargeInCutoffRef.current);
+      trace('AUDIO_QUEUE_CLEARED', 'reason=barge_in', bargeInCutoffRef.current);
+    }
+  }, [trace]);
 
   /** Barge-in trigger: cut the assistant's playback the moment the user
    * speaks again — but only while assistant audio is active or a response
@@ -437,7 +540,7 @@ export default function useRealtimeVoice(
    * inert (no duplicate log), while interrupting a newer in-flight turn
    * extends the cutoff. start()/teardown() reset the gate. */
   const maybeBargeIn = useCallback(
-    (source: string) => {
+    (source: string, text: string) => {
       const playbackActive =
         audioQueueRef.current.current !== null ||
         audioQueueRef.current.pending.length > 0 ||
@@ -452,10 +555,15 @@ export default function useRealtimeVoice(
         return; // already covered by an earlier interruption
       }
       bargeInCutoffRef.current = cutoff;
+      trace(
+        'BARGE_IN_DETECTED',
+        `source=${source} text="${clip(text, 40)}" cutoff_turn=${cutoff}`,
+        cutoff,
+      );
       cancelAssistantPlayback();
       addLog('barge_in', `source=${source} cutoff_turn=${cutoff}`);
     },
-    [addLog, cancelAssistantPlayback],
+    [trace, cancelAssistantPlayback, addLog],
   );
 
   /** Phase 6H: play the next queued sentence segment (strict order).
@@ -477,6 +585,8 @@ export default function useRealtimeVoice(
       audioQueueRef.current = promoted.state;
       const segment = promoted.next;
       if (!segment) return;
+      const segLabel = segment.segmentNo != null ? String(segment.segmentNo) : 'n/a';
+      let playbackStartedAt: number | null = null;
 
       if (audioEl.src) {
         URL.revokeObjectURL(audioEl.src);
@@ -528,11 +638,17 @@ export default function useRealtimeVoice(
               : previous.turn !== null && previous.turn === segment.turn
                 ? `segment ${previous.segmentNo}`
                 : `turn ${previous.turn} segment ${previous.segmentNo}`;
+        playbackStartedAt = playingAt;
         if (predecessor === null) {
           console.log(
             `[VOICE:UI] audio_playing first_segment_playback_latency_ms=${elapsedMs}`,
           );
           addLog('audio', `playing (first-segment playback latency=${elapsedMs}ms)`);
+          trace(
+            'AUDIO_PLAYING',
+            `segment=${segLabel} mode=elevenlabs first_segment_latency=${elapsedMs}ms`,
+            segment.turn,
+          );
         } else if (firstOfTurn) {
           // First audio of a new turn that still waited behind the previous
           // turn's tail — honest label, but it owns this turn's report/UI.
@@ -541,9 +657,21 @@ export default function useRealtimeVoice(
             'audio',
             `playing (first of turn, queued behind ${predecessor}, wait=${elapsedMs}ms)`,
           );
+          trace('AUDIO_PLAYING', `segment=${segLabel} mode=elevenlabs`, segment.turn);
+          trace(
+            'AUDIO_QUEUE_WAIT',
+            `segment=${segLabel} queued_behind=${predecessor} wait=${elapsedMs}ms`,
+            segment.turn,
+          );
         } else {
           console.log(`[VOICE:UI] audio_playing queue_wait_ms=${elapsedMs}`);
           addLog('audio', `playing (queued behind ${predecessor}, wait=${elapsedMs}ms)`);
+          trace('AUDIO_PLAYING', `segment=${segLabel} mode=elevenlabs`, segment.turn);
+          trace(
+            'AUDIO_QUEUE_WAIT',
+            `segment=${segLabel} queued_behind=${predecessor} wait=${elapsedMs}ms`,
+            segment.turn,
+          );
         }
         if (firstOfTurn) {
           setBrowserPlaybackLatencyMs(elapsedMs);
@@ -569,18 +697,39 @@ export default function useRealtimeVoice(
           }
         }
       };
-      audioEl.onended = () => finishSegment('segment ended');
+      audioEl.onended = () => {
+        if (audioQueueRef.current.current === segment) {
+          const playedMs =
+            playbackStartedAt != null
+              ? Math.round(performance.now() - playbackStartedAt)
+              : null;
+          trace(
+            'AUDIO_ENDED',
+            `segment=${segLabel}${playedMs != null ? ` played_ms=${playedMs}` : ''}`,
+            segment.turn,
+          );
+          trace(
+            'TTS_SEGMENT_COMPLETED',
+            `mode=elevenlabs segment=${segLabel}` +
+              (playedMs != null ? ` duration=${playedMs}ms` : ''),
+            segment.turn,
+          );
+        }
+        finishSegment('segment ended');
+      };
       audioEl.onerror = () => {
         addLog('error', 'Audio segment playback failed');
+        trace('AUDIO_DROPPED', `segment=${segLabel} reason=playback_error`, segment.turn);
         finishSegment('');
       };
       audioEl.play().catch((e) => {
         console.error('[REALTIME] Audio playback failed:', e);
         addLog('error', `Audio playback blocked: ${e.message}`);
+        trace('AUDIO_DROPPED', `segment=${segLabel} reason=play_blocked`, segment.turn);
         finishSegment('');
       });
     },
-    [addLog],
+    [addLog, trace],
   );
 
   /** Phase 6L: speak the next queued browser-TTS sentence (strict order).
@@ -622,6 +771,7 @@ export default function useRealtimeVoice(
         `browser_tts_prepare turn=${turnLabel} segment=${item.segmentNo}` +
           ` queue_ms=${Math.round(preparedAt - item.receivedAt)}`,
       );
+      trace('TTS_SEGMENT_START', `mode=browser segment=${item.segmentNo}`, item.turn);
       const voiceKey = voice
         ? `${voice.name}|${voice.lang}|${voice.localService}`
         : 'default';
@@ -656,6 +806,17 @@ export default function useRealtimeVoice(
           `browser_tts_started turn=${turnLabel} segment=${item.segmentNo}` +
             ` startup_ms=${startupMs} engine_ms=${engineMs}`,
         );
+        const turnMarks = traceTurnRef.current;
+        trace('AUDIO_PLAYING', `segment=${item.segmentNo} mode=browser`, item.turn);
+        if (!turnMarks.firstAudioSeen) {
+          turnMarks.firstAudioSeen = true;
+          trace(
+            'TTS_FIRST_AUDIO',
+            `mode=browser segment=${item.segmentNo} startup_ms=${startupMs}` +
+              ` engine_ms=${engineMs}`,
+            item.turn,
+          );
+        }
       };
       let finished = false;
       const finish = (detail: string) => {
@@ -670,12 +831,28 @@ export default function useRealtimeVoice(
       utterance.onend = () => {
         const durationMs =
           startedAt != null ? Math.round(performance.now() - startedAt) : null;
+        if (startedAt != null && sessionEpochRef.current === epoch) {
+          trace('AUDIO_ENDED', `segment=${item.segmentNo} mode=browser`, item.turn);
+          trace(
+            'TTS_SEGMENT_COMPLETED',
+            `mode=browser segment=${item.segmentNo}` +
+              (durationMs != null ? ` duration=${durationMs}ms` : ''),
+            item.turn,
+          );
+        }
         finish(
           `browser_tts_ended turn=${turnLabel} segment=${item.segmentNo}` +
             (durationMs != null ? ` duration=${durationMs}ms` : ''),
         );
       };
       utterance.onerror = (e) => {
+        if (sessionEpochRef.current === epoch) {
+          trace(
+            'TTS_ERROR',
+            `mode=browser segment=${item.segmentNo} error=${e.error ?? 'unknown'}`,
+            item.turn,
+          );
+        }
         finish(
           `browser_tts_error turn=${turnLabel} segment=${item.segmentNo}` +
             ` error=${e.error ?? 'unknown'}`,
@@ -683,7 +860,7 @@ export default function useRealtimeVoice(
       };
       window.speechSynthesis.speak(utterance);
     },
-    [addLog],
+    [addLog, trace],
   );
 
   const handleServerEvent = useCallback(
@@ -696,36 +873,119 @@ export default function useRealtimeVoice(
             'session_started',
             `id=${event.session_id.slice(0, 8)}… provider=${event.provider} model=${event.model}`,
           );
+          trace(
+            'SESSION_START',
+            `session=${event.session_id} stt=${event.provider}/${event.model}` +
+              ` sample_rate=${event.sample_rate} encoding=${event.encoding}` +
+              ` tts_mode=${ttsModeRef.current}` +
+              ` llm=${sessionTraceRef.current.llmProvider || 'default'}/${
+                sessionTraceRef.current.llmModel || 'default'
+              }`,
+            null,
+          );
           break;
-        case 'transcript_partial':
+        case 'transcript_partial': {
           // Earliest reliable user-speech signal: a new partial while the
           // assistant is still speaking interrupts its playback.
-          maybeBargeIn('transcript_partial');
+          maybeBargeIn('transcript_partial', event.text);
           // One evolving current turn: partials replace in place and are
           // never committed as conversation messages.
           dispatchConversation({ type: 'partial', text: event.text });
           addLog('transcript_partial', `"${event.text}"`);
+          // Trace: first partial of each speech episode logs immediately,
+          // then at most one line per second (skipped counts fold in).
+          const marks = speechMarksRef.current;
+          const nowMs = performance.now();
+          if (marks.startedAt === 0) {
+            noteSpeechStarted();
+          }
+          if (marks.lastPartialLogAt === 0) {
+            marks.lastPartialLogAt = nowMs;
+            trace('STT_PARTIAL', `text="${clip(event.text, 60)}"`, pendingSpeechTurn());
+          } else if (nowMs - marks.lastPartialLogAt >= 1000) {
+            const skipped = marks.partialsSkipped;
+            marks.partialsSkipped = 0;
+            marks.lastPartialLogAt = nowMs;
+            trace(
+              'STT_PARTIAL',
+              `text="${clip(event.text, 60)}"${skipped > 0 ? ` throttled=${skipped}` : ''}`,
+              pendingSpeechTurn(),
+            );
+          } else {
+            marks.partialsSkipped += 1;
+          }
           break;
-        case 'transcript_final':
+        }
+        case 'transcript_final': {
           // Backup trigger (partials usually fired already — idempotent).
-          maybeBargeIn('transcript_final');
+          maybeBargeIn('transcript_final', event.text);
           // Finalized segments accumulate into the same turn; the turn is
           // committed only when the backend dispatches it (agent_processing).
           dispatchConversation({ type: 'final', text: event.text });
           addLog('transcript_final', `"${event.text}"`);
+          const marks = speechMarksRef.current;
+          if (marks.startedAt === 0) noteSpeechStarted();
+          marks.finals += 1;
+          trace(
+            'STT_FINAL',
+            `text="${clip(event.text, 60)}" since_speech_start=${since(marks.startedAt)}`,
+            pendingSpeechTurn(),
+          );
+          if (event.speech_final) {
+            marks.speechFinalSeen = true;
+            trace('SPEECH_FINAL', `finals=${marks.finals}`, pendingSpeechTurn());
+          }
           break;
+        }
         case 'utterance_end':
           addLog('utterance_end', '');
+          trace(
+            'UTTERANCE_END',
+            `finals=${speechMarksRef.current.finals}`,
+            pendingSpeechTurn(),
+          );
           break;
-        case 'agent_processing':
+        case 'agent_processing': {
           // The turn was released by the backend: commit ONE user message.
           // Track the in-flight server turn (turn numbers come from
           // turn_metrics) so interrupting generation can cut its audio.
           activeTurnRef.current = lastMetricsTurnRef.current + 1;
+          const releasedTurn = activeTurnRef.current;
           dispatchConversation({ type: 'agent_processing' });
           addLog('agent_processing', '');
+          // Trace: the release reason is derived from this speech episode's
+          // observed marks; the per-turn marks are re-armed so every since_*
+          // reference belongs to this turn.
+          const speechMarks = speechMarksRef.current;
+          trace(
+            'TURN_RELEASED',
+            `reason=${speechMarks.speechFinalSeen ? 'speech_final' : 'utterance_end'}` +
+              ` finals=${speechMarks.finals}`,
+            releasedTurn,
+          );
+          trace('TURN_CREATED', `turn=${releasedTurn}`, releasedTurn);
+          trace('AGENT_PROCESSING', `turn=${releasedTurn}`, releasedTurn);
+          speechMarks.startedAt = 0;
+          speechMarks.speechFinalSeen = false;
+          speechMarks.finals = 0;
+          const turnMarks = traceTurnRef.current;
+          turnMarks.turn = releasedTurn;
+          turnMarks.startedAt = performance.now();
+          turnMarks.llmRequestAt = performance.now();
+          turnMarks.firstTokenSeen = false;
+          turnMarks.firstSentenceSeen = false;
+          turnMarks.firstAudioSeen = false;
+          turnMarks.responseStarted = false;
+          turnMarks.ackedTools.clear();
+          trace(
+            'LLM_REQUEST',
+            `provider=${sessionTraceRef.current.llmProvider || 'default'}` +
+              ` model=${sessionTraceRef.current.llmModel || 'default'}`,
+            releasedTurn,
+          );
           break;
-        case 'agent_response':
+        }
+        case 'agent_response': {
           dispatchConversation({
             type: 'agent_response',
             text: event.text,
@@ -736,26 +996,116 @@ export default function useRealtimeVoice(
             'agent_response',
             `text="${event.text.slice(0, 50)}${event.text.length > 50 ? '…' : ''}" tools=${event.tool_calls} iterations=${event.iterations}`,
           );
+          // Trace: buffered mode has no agent_delta stream — the response
+          // start is only observable here. Deltas never appear in the trace.
+          const turnMarks = traceTurnRef.current;
+          const turnNo = turnMarks.turn || null;
+          if (!turnMarks.responseStarted) {
+            turnMarks.responseStarted = true;
+            trace(
+              'AGENT_RESPONSE_STARTED',
+              `mode=buffered since_llm_request=${since(turnMarks.llmRequestAt)}`,
+              turnNo,
+            );
+          }
+          trace(
+            'AGENT_RESPONSE_COMPLETED',
+            `chars=${event.text.length} tools=${event.tool_calls} iterations=${event.iterations}`,
+            turnNo,
+          );
+          trace(
+            'LLM_COMPLETED',
+            `duration=${since(turnMarks.llmRequestAt)} tools=${event.tool_calls}` +
+              ` iterations=${event.iterations}`,
+            turnNo,
+          );
           break;
-case 'agent_delta':
+        }
+        case 'agent_delta': {
           // Progressive assistant text: accumulate the raw LLM delta into
           // the evolving assistant message. agent_response later commits
           // the authoritative full text (replaces the draft). Deliberately
           // not addLog()'d — per-token events would flood the dev log.
           dispatchConversation({ type: 'agent_delta', text: event.text });
+          // Trace: exactly two marks per turn — first token and response
+          // start. Individual deltas are never traced.
+          const turnMarks = traceTurnRef.current;
+          if (!turnMarks.firstTokenSeen) {
+            turnMarks.firstTokenSeen = true;
+            const turnNo = turnMarks.turn || null;
+            trace(
+              'LLM_FIRST_TOKEN',
+              `since_turn_start=${since(turnMarks.startedAt)}` +
+                ` since_llm_request=${since(turnMarks.llmRequestAt)}`,
+              turnNo,
+            );
+            if (!turnMarks.responseStarted) {
+              turnMarks.responseStarted = true;
+              trace('AGENT_RESPONSE_STARTED', 'mode=streaming', turnNo);
+            }
+          }
           break;
-        case 'tool_progress':
+        }
+        case 'tool_progress': {
           // Deterministic ack sent right before a tool executes — shown as
           // a temporary status message. The backend also queues the same
           // text into the TTS sentence sink, so it is spoken while the tool
           // runs. agent_response later clears the status.
           dispatchConversation({ type: 'tool_progress', message: event.message });
           addLog('tool_progress', `${event.tool_name}: ${event.message}`);
+          // Trace: one TOOL_PROGRESS + TOOL_CALL per tool_call_id; a repeated
+          // id means the backend answered a duplicate ack — keep it visible
+          // as a suppressed-duplicate line instead of hiding it.
+          const turnMarks = traceTurnRef.current;
+          const callLabel = event.tool_call_id ?? 'n/a';
+          const key = event.tool_call_id ?? event.tool_name;
+          const turnNo = turnMarks.turn || null;
+          if (turnMarks.ackedTools.has(key)) {
+            trace(
+              'TOOL_PROGRESS_DUPLICATE_SUPPRESSED',
+              `tool=${event.tool_name} call_id=${callLabel}`,
+              turnNo,
+            );
+          } else {
+            turnMarks.ackedTools.add(key);
+            trace('TOOL_PROGRESS', `tool=${event.tool_name} call_id=${callLabel}`, turnNo);
+            trace('TOOL_CALL', `tool=${event.tool_name} call_id=${callLabel}`, turnNo);
+          }
           break;
-        case 'tts_processing':
+        }
+        case 'tool_result': {
+          const turnMarks = traceTurnRef.current;
+          const callLabel = event.tool_call_id ?? 'n/a';
+          const line =
+            `tool=${event.tool_name} call_id=${callLabel}` +
+            ` duration=${event.duration_ms}ms success=${event.success}` +
+            (event.error ? ` error="${clip(event.error, 60)}"` : '');
+          if (event.success) {
+            trace('TOOL_RESULT', line, turnMarks.turn || null);
+          } else {
+            trace('TOOL_ERROR', line, turnMarks.turn || null);
+          }
+          break;
+        }
+        case 'tts_processing': {
           setTtsProcessing(true);
           addLog('tts_processing', '');
+          // Trace: the first-sentence mark and the start of the TTS stage
+          // (tts_processing is sent once per turn, with the first sentence).
+          const turnMarks = traceTurnRef.current;
+          const turnNo = turnMarks.turn || null;
+          if (!turnMarks.firstSentenceSeen) {
+            turnMarks.firstSentenceSeen = true;
+            trace(
+              'LLM_FIRST_SENTENCE',
+              `since_turn_start=${since(turnMarks.startedAt)}` +
+                ` since_llm_request=${since(turnMarks.llmRequestAt)}`,
+              turnNo,
+            );
+            trace('TTS_START', `mode=${ttsModeRef.current}`, turnNo);
+          }
           break;
+        }
         case 'tts_text': {
           // Phase 6L browser TTS: queue the sentence text; speechSynthesis
           // speaks strictly in sentence order (one at a time). No audio
@@ -769,9 +1119,16 @@ case 'agent_delta':
                 'tts_text',
                 `barge_in drop turn=${event.turn ?? 'n/a'} cutoff=${bargeInCutoffRef.current}`,
               );
+              trace(
+                'STALE_AUDIO_DROPPED',
+                `mode=browser segment=${event.segment ?? 'n/a'}` +
+                  ` turn=${event.turn ?? 'n/a'} cutoff=${bargeInCutoffRef.current}`,
+                bargeInCutoffRef.current,
+              );
               break;
             }
             addLog('tts_text', `barge_in resume turn=${turnNo}`);
+            trace('BARGE_IN_RESUMED', `turn=${turnNo} mode=browser`, turnNo);
             bargeInCutoffRef.current = null;
           }
           latestMediaTurnRef.current = Math.max(
@@ -786,6 +1143,16 @@ case 'agent_delta':
             text: event.text,
             receivedAt: performance.now(),
           });
+          trace(
+            'AUDIO_RECEIVED',
+            `segment=${segmentNo} mode=browser chars=${event.text.length}`,
+            turnNo,
+          );
+          trace(
+            'AUDIO_ENQUEUED',
+            `segment=${segmentNo} mode=browser queue_pos=${browserTtsQueueRef.current.length}`,
+            turnNo,
+          );
           speakNextBrowserTts(sessionEpochRef.current);
           break;
         }
@@ -803,9 +1170,16 @@ case 'agent_delta':
                 'audio',
                 `barge_in drop turn=${event.turn ?? 'n/a'} cutoff=${bargeInCutoffRef.current}`,
               );
+              trace(
+                'STALE_AUDIO_DROPPED',
+                `mode=elevenlabs segment=${event.segment ?? 'n/a'}` +
+                  ` turn=${event.turn ?? 'n/a'} cutoff=${bargeInCutoffRef.current}`,
+                bargeInCutoffRef.current,
+              );
               break;
             }
             addLog('audio', `barge_in resume turn=${audioTurn}`);
+            trace('BARGE_IN_RESUMED', `turn=${audioTurn} mode=elevenlabs`, audioTurn);
             bargeInCutoffRef.current = null;
           }
           latestMediaTurnRef.current = Math.max(
@@ -845,6 +1219,28 @@ case 'agent_delta':
             wsTransitMs,
             receivedAt: performance.now(),
           });
+          trace(
+            'AUDIO_RECEIVED',
+            `segment=${segmentNo} mode=elevenlabs format=${event.format}` +
+              ` size=${bytes.length}B transit=${wsTransitMs ?? 'n/a'}ms`,
+            audioTurn,
+          );
+          const turnMarks = traceTurnRef.current;
+          if (!turnMarks.firstAudioSeen) {
+            turnMarks.firstAudioSeen = true;
+            trace(
+              'TTS_FIRST_AUDIO',
+              `segment=${segmentNo} mode=elevenlabs` +
+                ` since_turn_start=${since(turnMarks.startedAt)}` +
+                ` since_llm_request=${since(turnMarks.llmRequestAt)}`,
+              audioTurn,
+            );
+          }
+          trace(
+            'AUDIO_ENQUEUED',
+            `segment=${segmentNo} mode=elevenlabs queue_pos=${audioQueueRef.current.pending.length}`,
+            audioTurn,
+          );
           playNextSegment();
           break;
         }
@@ -862,6 +1258,20 @@ case 'agent_delta':
               `agent=${d.agent_processing_ms ?? 'N/A'}ms tts=${d.tts_duration_ms ?? 'N/A'}ms ` +
               `total=${d.utterance_end_to_audio_sent_ms ?? 'N/A'}ms`,
           );
+          // Trace: the turn's TTS stage is complete once its metrics arrive;
+          // every value below is the server's authoritative measurement.
+          trace('TTS_COMPLETED', `duration=${d.tts_duration_ms ?? 'N/A'}ms`, d.turn);
+          trace(
+            'TURN_METRICS',
+            `release=${d.utterance_end_to_release_ms ?? 'N/A'}ms` +
+              ` agent=${d.agent_processing_ms ?? 'N/A'}ms` +
+              ` llm_first_token=${d.llm_request_to_first_token_ms ?? 'N/A'}ms` +
+              ` llm_first_sentence=${d.llm_request_to_first_sentence_ms ?? 'N/A'}ms` +
+              ` llm_complete=${d.llm_request_to_complete_ms ?? 'N/A'}ms` +
+              ` tts=${d.tts_duration_ms ?? 'N/A'}ms` +
+              ` total=${d.utterance_end_to_audio_sent_ms ?? 'N/A'}ms`,
+            d.turn,
+          );
           break;
         }
         case 'completed':
@@ -869,6 +1279,11 @@ case 'agent_delta':
           addLog(
             'completed',
             `chunks=${event.timings.audio_chunks} bytes=${event.timings.audio_bytes} agent_responses=${event.timings.agent_response_count}`,
+          );
+          trace(
+            'SESSION_STOP',
+            `reason=completed agent_responses=${event.timings.agent_response_count}`,
+            null,
           );
           // Graceful shutdown — clear force-close timer and disconnect
           if (stopTimeoutRef.current) {
@@ -878,17 +1293,44 @@ case 'agent_delta':
           teardownAudio();
           wsRef.current?.close();
           break;
-        case 'error':
+        case 'error': {
           activeTurnRef.current = 0;
           dispatchConversation({ type: 'agent_failed' });
           setTtsProcessing(false);
           setError(event.message);
           addLog('error', `${event.stage ? `[${event.stage}] ` : ''}${event.message}`);
+          // Trace: session-level failure plus the stage-specific line. The
+          // backend reports stages 'stt' | 'agent' | 'tts'.
+          const turnNo = traceTurnRef.current.turn || null;
+          trace(
+            'SESSION_ERROR',
+            `stage=${event.stage ?? 'protocol'} message="${clip(event.message, 80)}"`,
+            turnNo,
+          );
+          if (event.stage === 'agent') {
+            trace('AGENT_FAILED', `message="${clip(event.message, 80)}"`, turnNo);
+          } else if (event.stage === 'tts') {
+            trace(
+              'TTS_ERROR',
+              `mode=${ttsModeRef.current} message="${clip(event.message, 80)}"`,
+              turnNo,
+            );
+          }
           teardownAudio();
           break;
+        }
       }
     },
-    [addLog, teardownAudio, playNextSegment, speakNextBrowserTts, maybeBargeIn],
+    [
+      addLog,
+      teardownAudio,
+      playNextSegment,
+      speakNextBrowserTts,
+      maybeBargeIn,
+      trace,
+      pendingSpeechTurn,
+      noteSpeechStarted,
+    ],
   );
 
   const start = useCallback(
@@ -910,6 +1352,24 @@ case 'agent_delta':
       latestMediaTurnRef.current = 0;
       lastMetricsTurnRef.current = 0;
       activeTurnRef.current = 0;
+      // Trace state: fresh episode/turn marks and session metadata.
+      lastTraceAtRef.current = 0;
+      speechMarksRef.current.startedAt = 0;
+      speechMarksRef.current.speechFinalSeen = false;
+      speechMarksRef.current.finals = 0;
+      const traceTurn = traceTurnRef.current;
+      traceTurn.turn = 0;
+      traceTurn.startedAt = 0;
+      traceTurn.llmRequestAt = 0;
+      traceTurn.firstTokenSeen = false;
+      traceTurn.firstSentenceSeen = false;
+      traceTurn.firstAudioSeen = false;
+      traceTurn.responseStarted = false;
+      traceTurn.ackedTools.clear();
+      sessionTraceRef.current = {
+        llmProvider: config.llmProvider ?? '',
+        llmModel: config.llmModel ?? '',
+      };
       // Phase 6L: no stale browser speech may leak into the new session.
       if (BROWSER_TTS_SUPPORTED) {
         try {
@@ -1001,6 +1461,12 @@ case 'agent_delta':
             'ws',
             `START sent sample_rate=${audioCtx.sampleRate} llm=${config.llmProvider}/${config.llmModel || 'default'} tts=${ttsModeState}`,
           );
+          trace(
+            'WS_CONNECTED',
+            `url=${REALTIME_WS_URL.replace(/^wss?:\/\//, '')}` +
+              ` rate=${audioCtx.sampleRate} tts_mode=${ttsModeState}`,
+            null,
+          );
 
           // 5. Worklet PCM frames → WS binary frames.
           // The worklet batches ~50 ms Int16 frames (2400 samples / 4800 bytes
@@ -1029,6 +1495,11 @@ case 'agent_delta':
           silentSink.connect(audioCtx.destination);
           silentSinkRef.current = silentSink;
           setMicActive(true);
+          trace(
+            'MIC_STARTED',
+            `rate=${audioCtx.sampleRate} channels=1 frame_ms=50`,
+            null,
+          );
         };
 
         ws.onmessage = (e) => {
@@ -1044,6 +1515,7 @@ case 'agent_delta':
           if (sessionEpochRef.current !== epoch) return;
           setError('Realtime WebSocket connection error');
           addLog('error', 'WebSocket connection error');
+          trace('SESSION_ERROR', 'stage=ws message="WebSocket connection error"', null);
         };
 
         ws.onclose = () => {
@@ -1052,6 +1524,7 @@ case 'agent_delta':
             return;
           }
           setConnState('disconnected');
+          trace('WS_DISCONNECTED', `expected=${closingRef.current}`, null);
           teardownAudio();
           if (!closingRef.current) {
             addLog('ws', 'closed');
@@ -1072,14 +1545,16 @@ case 'agent_delta':
         } else {
           setError(`Realtime start failed: ${msg}`);
         }
+        trace('SESSION_ERROR', `stage=start message="${clip(msg, 80)}"`, null);
       }
     },
-    [addLog, connState, handleServerEvent, teardownAudio, ttsModeState],
+    [addLog, connState, handleServerEvent, teardownAudio, ttsModeState, trace],
   );
 
   const stop = useCallback(() => {
     closingRef.current = true;
     addLog('ws', 'STOP sent');
+    trace('SESSION_STOP', 'reason=user_stop', null);
 
     // Detach audio graph first so no more PCM frames are produced
     teardownAudio();
@@ -1100,7 +1575,7 @@ case 'agent_delta':
     } else {
       setConnState('disconnected');
     }
-  }, [addLog, teardownAudio]);
+  }, [addLog, teardownAudio, trace]);
 
   /** Phase 6L: switch the realtime response TTS mode.
    *

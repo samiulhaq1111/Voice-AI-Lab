@@ -241,6 +241,7 @@ export type RealtimeEventType =
   | 'agent_processing'
   | 'agent_delta'
   | 'tool_progress'
+  | 'tool_result'
   | 'agent_response'
   | 'tts_processing'
   | 'audio'
@@ -268,6 +269,8 @@ export interface RealtimeTranscriptFinal {
   type: 'transcript_final';
   text: string;
   confidence?: number;
+  /** Deepgram endpointing proof that the speaker stopped (turn-finalization v2). */
+  speech_final?: boolean;
 }
 
 export interface RealtimeUtteranceEnd {
@@ -290,7 +293,20 @@ export interface RealtimeAgentDelta {
 export interface RealtimeToolProgress {
   type: 'tool_progress';
   tool_name: string;
+  /** Provider tool-call id (links progress to the matching tool_result). */
+  tool_call_id?: string;
   message: string;
+}
+
+/** One executed tool call, reported after the executor finishes. Unlike
+ * tool_progress this is per-execution (fan-out calls each report). */
+export interface RealtimeToolResult {
+  type: 'tool_result';
+  tool_name: string;
+  tool_call_id?: string;
+  duration_ms: number;
+  success: boolean;
+  error?: string | null;
 }
 
 export interface RealtimeAgentResponse {
@@ -408,6 +424,7 @@ export type RealtimeEvent =
   | RealtimeAgentProcessing
   | RealtimeAgentDelta
   | RealtimeToolProgress
+  | RealtimeToolResult
   | RealtimeAgentResponse
   | RealtimeTTSProcessing
   | RealtimeAudio
@@ -457,17 +474,69 @@ export interface RealtimeBrowserTimingMessage {
   received_to_playing_ms: number;
 }
 
+/** Voice Chat trace panel event names (uppercase by design so the drawer
+ * can filter trace lines from ordinary diagnostic entries). */
+export type RealtimeTraceEvent =
+  | 'SESSION_START'
+  | 'SESSION_STOP'
+  | 'WS_CONNECTED'
+  | 'WS_DISCONNECTED'
+  | 'SESSION_ERROR'
+  | 'MIC_STARTED'
+  | 'MIC_STOPPED'
+  | 'STT_PARTIAL'
+  | 'STT_FINAL'
+  | 'SPEECH_FINAL'
+  | 'UTTERANCE_END'
+  | 'TURN_RELEASED'
+  | 'TURN_CREATED'
+  | 'AGENT_PROCESSING'
+  | 'AGENT_RESPONSE_STARTED'
+  | 'AGENT_RESPONSE_COMPLETED'
+  | 'AGENT_FAILED'
+  | 'TURN_METRICS'
+  | 'LLM_REQUEST'
+  | 'LLM_FIRST_TOKEN'
+  | 'LLM_FIRST_SENTENCE'
+  | 'LLM_COMPLETED'
+  | 'LLM_ERROR'
+  | 'TOOL_PROGRESS'
+  | 'TOOL_CALL'
+  | 'TOOL_RESULT'
+  | 'TOOL_ERROR'
+  | 'TOOL_PROGRESS_DUPLICATE_SUPPRESSED'
+  | 'TTS_START'
+  | 'TTS_SEGMENT_START'
+  | 'TTS_FIRST_AUDIO'
+  | 'TTS_SEGMENT_COMPLETED'
+  | 'TTS_COMPLETED'
+  | 'TTS_ERROR'
+  | 'AUDIO_RECEIVED'
+  | 'AUDIO_ENQUEUED'
+  | 'AUDIO_PLAYING'
+  | 'AUDIO_ENDED'
+  | 'AUDIO_QUEUE_WAIT'
+  | 'AUDIO_QUEUE_CLEARED'
+  | 'AUDIO_DROPPED'
+  | 'BARGE_IN_DETECTED'
+  | 'PLAYBACK_CANCELLED'
+  | 'STALE_AUDIO_DROPPED'
+  | 'BARGE_IN_RESUMED';
+
 /** One entry in the realtime event log UI. */
 export interface RealtimeLogEntry {
   time: string;
   type:
     | RealtimeEventType
+    | RealtimeTraceEvent
     | 'mic'
     | 'ws'
     | 'browser_timing'
     | 'browser_tts'
     | 'barge_in';
   detail: string;
+  /** Turn number this entry belongs to (null for session-level lines). */
+  turn?: number | null;
 }
 
 // --- Benchmark Types (Phase 5B) ---
