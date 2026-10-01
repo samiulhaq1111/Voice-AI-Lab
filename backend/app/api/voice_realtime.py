@@ -1579,6 +1579,11 @@ async def _complete_streamed_tool_turn(
     tool_messages: list[LLMMessage] = []
     tool_records: list[dict[str, Any]] = []
     tool_execution_total_ms = 0.0
+    # One progress ack per distinct tool name per turn: the model may fan out
+    # several legitimate calls to the same tool (e.g. get_leave_balance per
+    # leave type) — they all still execute below, but the caller hears one
+    # acknowledgment per tool.
+    acked_tools: set[str] = set()
 
     for tool_call in detected_tool_calls:
         tool_name = tool_call["function"]["name"]
@@ -1587,20 +1592,24 @@ async def _complete_streamed_tool_turn(
         # Immediate feedback: deterministic ack event + speech BEFORE the
         # potentially slow executor call. Lifecycle-safe send (suppressed on
         # STOP/closed); the ack rides the existing sentence_sink so the TTS
-        # consumer speaks it while the tool runs.
-        progress_message = _tool_progress_message(tool_name)
-        if ws is not None and state is not None:
-            await _safe_ws_send(
-                ws,
-                state,
-                {
-                    "type": "tool_progress",
-                    "tool_name": tool_name,
-                    "message": progress_message,
-                },
-            )
-        if sentence_sink is not None:
-            sentence_sink.put(progress_message)
+        # consumer speaks it while the tool runs. Only the first call per
+        # tool name is acknowledged — repeat calls to the same tool still
+        # execute in full below.
+        if tool_name not in acked_tools:
+            acked_tools.add(tool_name)
+            progress_message = _tool_progress_message(tool_name)
+            if ws is not None and state is not None:
+                await _safe_ws_send(
+                    ws,
+                    state,
+                    {
+                        "type": "tool_progress",
+                        "tool_name": tool_name,
+                        "message": progress_message,
+                    },
+                )
+            if sentence_sink is not None:
+                sentence_sink.put(progress_message)
         tool_start = time.monotonic()
         logger.info(
             "[REALTIME:TOOL] executing tool=%s args=%s",
