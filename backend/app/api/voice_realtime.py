@@ -1457,6 +1457,7 @@ async def _stream_llm_response(
             streamed_text=accumulated_text,
             stream_start=stream_start,
             first_token_at=first_token_at,
+            req1_ms=stream_ms,
             streamed_tokens=chunk_count,
             ws=ws,
             state=state,
@@ -1535,6 +1536,7 @@ async def _complete_streamed_tool_turn(
     streamed_text: str,
     stream_start: float,
     first_token_at: float | None,
+    req1_ms: float,
     streamed_tokens: int,
     ws: WebSocket | None = None,
     state: RealtimeSessionState | None = None,
@@ -1559,8 +1561,9 @@ async def _complete_streamed_tool_turn(
 
     Returns:
         Dict with the final response, detected tool calls, final usage,
-        iterations (initial stream + final chat) and the absolute Phase 6G
-        marks.
+        iterations (initial stream + final chat), the absolute Phase 6G
+        marks and the tool-turn timing breakdown (req1_ms, tool_ms,
+        final_ms, total_ms).
     """
     from app.models.voice_session import VoiceSession
     from app.services.realtime_voice_service import _save_message, _save_tool_call
@@ -1844,6 +1847,12 @@ async def _complete_streamed_tool_turn(
         ),
         "streamed_tokens": streamed_tokens,
         "sentences": sentences,
+        # Tool-turn timing breakdown: req1 (tool selection) -> tools -> req2
+        # (final answer); total_ms spans req1 start -> req2 completion.
+        "req1_ms": req1_ms,
+        "tool_ms": tool_execution_total_ms,
+        "final_ms": final_ms,
+        "total_ms": (final_llm_completed_at - stream_start) * 1000,
         # Phase 6G marks: the initial stream start anchors the turn's LLM
         # request; llm_completed_at covers tool execution + final chat.
         "llm_request_started_at": stream_start,
@@ -2441,6 +2450,20 @@ async def _agent_worker(
                 result.get("streamed", False),
                 f"{first_token_ms:.1f}" if first_token_ms else "n/a",
             )
+
+            # Tool-turn timing breakdown: one consolidated line per tool turn
+            # (req1 tool-selection stream -> tools -> req2 follow-up).
+            if result.get("iterations") == 2:
+                logger.info(
+                    "[REALTIME:TOOL] turn_metrics turn=%d req1_ms=%.0f "
+                    "req1_ttft_ms=%s tool_ms=%.0f req2_ms=%.0f total_ms=%.0f",
+                    turn,
+                    result.get("req1_ms") or 0.0,
+                    _fmt_ms(result.get("first_token_ms")),
+                    result.get("tool_ms") or 0.0,
+                    result.get("final_ms") or 0.0,
+                    result.get("total_ms") or 0.0,
+                )
 
             timings.agent_response_count += 1
 

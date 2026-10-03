@@ -1,5 +1,6 @@
 """OpenRouter LLM adapter implementing LLMInterface."""
 
+import asyncio
 import json
 import time
 from collections.abc import AsyncIterator
@@ -12,6 +13,9 @@ from app.providers.llm.interface import LLMInterface
 from app.providers.types import LLMMessage, LLMResponse, StreamChunk, ToolSchema
 
 _OPENROUTER_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+# Bounded deadline for draining the SSE tail after an early consumer stop.
+_SSE_DRAIN_TIMEOUT_S = 1.0
 
 
 class OpenRouterAdapter(LLMInterface):
@@ -159,29 +163,50 @@ class OpenRouterAdapter(LLMInterface):
                 json=payload,
             ) as response:
                 response.raise_for_status()
-                async for line in response.aiter_lines():
-                    if not line.startswith("data: "):
-                        continue
-                    data_str = line[6:]
-                    if data_str.strip() == "[DONE]":
-                        break
+                lines = response.aiter_lines()
+                finish_seen = False
+                try:
+                    async for line in lines:
+                        if not line.startswith("data: "):
+                            continue
+                        data_str = line[6:]
+                        if data_str.strip() == "[DONE]":
+                            break
 
-                    chunk = json.loads(data_str)
-                    choices = chunk.get("choices", [])
-                    if not choices:
-                        continue
+                        chunk = json.loads(data_str)
+                        choices = chunk.get("choices", [])
+                        if not choices:
+                            continue
 
-                    delta = choices[0].get("delta", {})
-                    finish = choices[0].get("finish_reason")
-                    content = delta.get("content")
-                    tool_calls = delta.get("tool_calls")
+                        delta = choices[0].get("delta", {})
+                        finish = choices[0].get("finish_reason")
+                        content = delta.get("content")
+                        tool_calls = delta.get("tool_calls")
 
-                    if content or tool_calls or finish:
-                        yield StreamChunk(
-                            content=content,
-                            tool_calls=tool_calls,
-                            finish_reason=finish,
-                        )
+                        if content or tool_calls or finish:
+                            if finish:
+                                finish_seen = True
+                            yield StreamChunk(
+                                content=content,
+                                tool_calls=tool_calls,
+                                finish_reason=finish,
+                            )
+                except GeneratorExit:
+                    # The consumer stopped right after the final finish_reason
+                    # chunk: read the remaining SSE tail (data: [DONE] + HTTP
+                    # body terminator) so httpcore can pool the connection
+                    # instead of closing it. Generator close runs in the
+                    # event loop's finalizer task, so the caller is never
+                    # delayed. Bounded to 1s; cancellation is never
+                    # suppressed, and interrupted streams are not drained.
+                    if finish_seen:
+                        try:
+                            async with asyncio.timeout(_SSE_DRAIN_TIMEOUT_S):
+                                async for _ in lines:
+                                    pass
+                        except Exception:
+                            pass
+                    raise
 
         except httpx.HTTPStatusError as e:
             logger.error("OpenRouter stream error: HTTP %d", e.response.status_code)
