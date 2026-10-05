@@ -31,6 +31,8 @@ class Settings(BaseSettings):
     telnyx_api_key: str = ""
     telnyx_speak_voice: str = "female"
     telnyx_media_ws_url: str = ""
+    qwen_ws_url: str = ""
+    qwen_ws_api_key: str = ""
 
     # --- Default Provider Selections ---
     default_stt_provider: str = "deepgram"

@@ -11,7 +11,7 @@ from app.providers.tts.interface import TTSInterface
 
 # Supported provider names per type
 SUPPORTED_STT_PROVIDERS = {"deepgram"}
-SUPPORTED_LLM_PROVIDERS = {"openrouter"}
+SUPPORTED_LLM_PROVIDERS = {"openrouter", "qwen_ws"}
 SUPPORTED_TTS_PROVIDERS = {"elevenlabs"}
 
 # Curated OpenRouter LLM model catalogue for the Chat and Voice UIs.
@@ -102,6 +102,11 @@ def get_llm_provider(
 
         return OpenRouterAdapter(api_key=api_key, default_model=model)
 
+    if name == "qwen_ws":
+        from app.providers.llm.qwen_ws import QwenWebSocketAdapter
+
+        return QwenWebSocketAdapter(default_model=model, api_key=api_key)
+
     raise ProviderError(
         f"Unsupported LLM provider: '{name}'. Supported: {sorted(SUPPORTED_LLM_PROVIDERS)}"
     )
@@ -164,6 +169,13 @@ def get_available_providers() -> dict:
                 "models": [*LLM_FREE_MODELS, *LLM_PAID_MODELS],
                 "paid_models": list(LLM_PAID_MODELS),
                 "configured": settings.is_provider_configured("openrouter"),
+            },
+            {
+                "provider": "qwen_ws",
+                "display_name": "Qwen WebSocket (Qwen3.5-4B)",
+                "default_model": "Qwen/Qwen3.5-4B",
+                "models": ["Qwen/Qwen3.5-4B"],
+                "configured": bool(settings.qwen_ws_url),
             },
         ],
         "tts": [
