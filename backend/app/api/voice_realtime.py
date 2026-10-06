@@ -124,6 +124,24 @@ _TURN_RELEASE_SETTLE_MS = 800
 # cancellation and provider rate limits stay manageable.
 _TTS_SENTENCE_CONCURRENCY = 2
 
+# Phase 1 (latency): early TTS chunking thresholds. The realtime gateway
+# configures SentenceBuffer with these so the FIRST TTS request can start
+# while the LLM is still generating — without waiting for a complete
+# sentence and without waiting for the stream to finish.
+#
+# ``_MIN_FIRST_CHUNK_CHARS``: chunks emitted off trailing punctuation or a
+# stall flush are never shorter than this (tiny fragments like "e.g." or
+# "Bye." keep accumulating; hard ". " boundaries still emit immediately).
+# ``_MAX_TTS_CHUNK_CHARS``: boundary-less runs are soft-split at the last
+# word boundary that fits — words are never split.
+# ``_CHUNK_FLUSH_TIMEOUT_MS``: when no new token arrives for this long the
+# chunk watchdog flushes buffered text at a safe word boundary. The
+# watchdog only ever inspects the SentenceBuffer — it never touches, times
+# out or cancels the LLM stream itself.
+_MIN_FIRST_CHUNK_CHARS = 15
+_MAX_TTS_CHUNK_CHARS = 160
+_CHUNK_FLUSH_TIMEOUT_MS = 220
+
 
 @dataclass
 class UtteranceTimings:
@@ -160,6 +178,10 @@ class UtteranceTimings:
     llm_request_started_at: float | None = None
     llm_first_token_at: float | None = None
     llm_first_sentence_at: float | None = None
+    # Phase 1: mark of the first TTS-ready chunk (a complete sentence, a
+    # trailing-punctuation chunk or a watchdog/soft-split chunk — the first
+    # text the TTS consumer could actually start on).
+    llm_first_chunk_at: float | None = None
     llm_completed_at: float | None = None
     tts_started_at: float | None = None
     tts_first_audio_at: float | None = None
@@ -242,6 +264,26 @@ class UtteranceTimings:
             "llm_request_to_complete_ms": _elapsed(
                 self.llm_request_started_at, self.llm_completed_at
             ),
+            # Phase 1 first-chunk metrics: the first TTS request can start on
+            # a partial-sentence chunk now, so these anchors measure the wait
+            # the old pipeline paid in full before any TTS request started.
+            # Fall back to the first-sentence mark for older data.
+            "llm_first_chunk_ms": _elapsed(
+                self.agent_processing_started_at,
+                self.llm_first_chunk_at or self.llm_first_sentence_at,
+            ),
+            "first_chunk_to_tts_request_ms": _elapsed(
+                self.llm_first_chunk_at or self.llm_first_sentence_at,
+                self.tts_started_at,
+            ),
+            "first_chunk_to_first_audio_ms": _elapsed(
+                self.llm_first_chunk_at or self.llm_first_sentence_at,
+                self.tts_first_audio_at,
+            ),
+            "first_chunk_to_first_audio_sent_ms": _elapsed(
+                self.llm_first_chunk_at or self.llm_first_sentence_at,
+                self.first_audio_sent_at or self.audio_sent_at,
+            ),
             "first_sentence_to_tts_start_ms": _elapsed(
                 self.llm_first_sentence_at, self.tts_started_at
             ),
@@ -290,6 +332,9 @@ class UtteranceTimings:
             "llm_request_offset_ms": _offset(self.llm_request_started_at),
             "llm_first_token_offset_ms": _offset(self.llm_first_token_at),
             "llm_first_sentence_offset_ms": _offset(self.llm_first_sentence_at),
+            "llm_first_chunk_offset_ms": _offset(
+                self.llm_first_chunk_at or self.llm_first_sentence_at
+            ),
             "llm_completed_offset_ms": _offset(self.llm_completed_at),
             "tts_started_offset_ms": _offset(self.tts_started_at),
             "tts_completed_offset_ms": _offset(self.tts_completed_at),
@@ -372,7 +417,8 @@ def _log_turn_latency_breakdown(
         "llm_first_token=%s llm_first_sentence=%s llm_complete=%s "
         "tts_start=%s tts_first_audio=%s tts_complete=%s audio_sent=%s "
         "browser_received=%s browser_playing=%s total=%s "
-        "first_audio=%s sentences=%s tts_mode=%s",
+        "first_audio=%s sentences=%s tts_mode=%s "
+        "first_chunk=%s first_chunk_to_tts=%s first_chunk_to_audio_sent=%s",
         turn,
         _fmt_ms(m.get("utterance_end_to_release_ms")),
         _fmt_ms(m.get("release_to_agent_ms")),
@@ -390,6 +436,9 @@ def _log_turn_latency_breakdown(
         _fmt_ms(m.get("utterance_to_first_audio_ms")),
         m.get("tts_sentence_count") or "n/a",
         m.get("tts_mode") or "n/a",
+        _fmt_ms(m.get("llm_first_chunk_ms")),
+        _fmt_ms(m.get("first_chunk_to_tts_request_ms")),
+        _fmt_ms(m.get("first_chunk_to_first_audio_sent_ms")),
     )
 
 
@@ -1234,6 +1283,8 @@ async def _synthesize_sentence_segment(
     tts: TTSInterface,
     sentence: str,
     turn_timing: UtteranceTimings,
+    *,
+    diagnostics: dict[str, float] | None = None,
 ) -> tuple[bytes, str, int, str]:
     """Synthesize one sentence into one complete audio segment (Phase 6H).
 
@@ -1243,18 +1294,30 @@ async def _synthesize_sentence_segment(
     Providers without streaming support: buffered ``synthesize()`` fallback
     (the pre-6H path; first-audio latency unavailable).
 
+    Measurement only: when ``diagnostics`` is provided, the per-segment
+    marks ``request_started`` (provider request opened), ``first_chunk_at``
+    (first provider audio byte), ``last_chunk_at`` (final provider audio
+    byte) and ``assembled_at`` (MP3 join complete) are recorded into it.
+    Timing-only — the audio bytes and control flow are never affected.
+
     Returns:
         (audio_bytes, content_type, chunk_count, mode).
     """
+    diag: dict[str, float] = diagnostics if diagnostics is not None else {}
     stream = await _open_tts_stream(tts, sentence)
     if stream is None:
+        diag["request_started"] = time.monotonic()
         result = await tts.synthesize(text=sentence)
+        diag["assembled_at"] = time.monotonic()
         return result.audio_data, result.content_type, 0, "buffered"
     try:
         chunks: list[bytes] = []
+        diag["request_started"] = time.monotonic()
         async for chunk in stream:
             if not chunk:
                 continue
+            if "first_chunk_at" not in diag:
+                diag["first_chunk_at"] = time.monotonic()
             if turn_timing.tts_first_audio_at is None:
                 # First provider audio byte of this turn — the genuine
                 # "TTS started producing audio" mark (Phase 6H).
@@ -1262,7 +1325,10 @@ async def _synthesize_sentence_segment(
             chunks.append(chunk)
         if not chunks:
             raise RealtimeVoiceError("TTS stream returned no audio")
-        return b"".join(chunks), _STREAM_AUDIO_CONTENT_TYPE, len(chunks), "streaming"
+        diag["last_chunk_at"] = time.monotonic()
+        audio = b"".join(chunks)
+        diag["assembled_at"] = time.monotonic()
+        return audio, _STREAM_AUDIO_CONTENT_TYPE, len(chunks), "streaming"
     finally:
         await _close_tts_stream(stream)
 
@@ -1288,6 +1354,12 @@ async def _stream_llm_response(
     moment SentenceBuffer yields it — the concurrent TTS consumer can start
     on sentence 1 while this stream is still producing sentences.
 
+    Phase 1: SentenceBuffer runs with early chunking enabled, and a
+    buffer-only watchdog flushes stalled text at a word boundary, so the
+    first TTS chunk can start before the stream ends. The watchdog never
+    awaits or cancels the LLM generator and is reaped in ``finally``
+    before the stream-end flush.
+
     Tool calls (OpenAI-compatible streaming protocol): deltas are
     accumulated by tool-call index; when a turn calls tools the streamed
     filler is discarded and ``_complete_streamed_tool_turn`` executes the
@@ -1303,7 +1375,7 @@ async def _stream_llm_response(
         Dict with response, tool_calls, usage, iterations, first_token_ms,
         streamed_tokens and the absolute Phase 6G marks
         (llm_request_started_at, llm_first_token_at, llm_first_sentence_at,
-        llm_completed_at, sentence_count).
+        llm_first_chunk_at, llm_completed_at, sentence_count).
     """
     from app.models.voice_session import VoiceSession
     from app.services.realtime_voice_service import _load_history, _save_message
@@ -1334,8 +1406,44 @@ async def _stream_llm_response(
     first_sentence_at: float | None = None
     accumulated_text = ""
     chunk_count = 0
-    buffer = SentenceBuffer()
+    # Phase 1: early chunking — the first TTS chunk may be a complete
+    # sentence, a trailing-punctuation chunk, a soft max-split or a stall
+    # flush, all emitted while the LLM is still generating.
+    buffer = SentenceBuffer(
+        min_first_chunk_chars=_MIN_FIRST_CHUNK_CHARS,
+        max_chunk_chars=_MAX_TTS_CHUNK_CHARS,
+    )
     sentences: list[str] = []
+
+    def _emit_chunks(new_chunks: list[str]) -> None:
+        """Record + forward freshly emitted TTS chunks (order preserved)."""
+        nonlocal first_sentence_at
+        if not new_chunks:
+            return
+        if first_sentence_at is None:
+            first_sentence_at = time.monotonic()
+        sentences.extend(new_chunks)
+        if sentence_sink is not None:
+            for sentence in new_chunks:
+                sentence_sink.put(sentence)
+
+    async def _chunk_flush_watchdog() -> None:
+        """Flush stalled buffer text at a safe word boundary (Phase 1).
+
+        Inspects ONLY the SentenceBuffer — it never awaits, times out or
+        cancels the LLM generator, so a slow chunk can never be aborted by
+        this watchdog. Cancelled and reaped in the stream ``finally``
+        before the stream-end flush, so no delayed flush can land after
+        completion or cancellation.
+        """
+        while True:
+            await asyncio.sleep(_CHUNK_FLUSH_TIMEOUT_MS / 1000.0)
+            if tool_detected:
+                # A tool turn discards the streamed filler — once tool-call
+                # deltas appeared, never flush leftover filler text into the
+                # TTS sink. The tool follow-up has its own watchdog.
+                return
+            _emit_chunks(buffer.flush_on_timeout())
 
     # Tool-call streaming state: deltas arrive split across chunks and are
     # accumulated by tool-call index (OpenAI streaming protocol).
@@ -1343,6 +1451,7 @@ async def _stream_llm_response(
     tool_call_deltas: dict[int, dict[str, Any]] = {}
 
     stream_start = time.monotonic()
+    watchdog_task = asyncio.create_task(_chunk_flush_watchdog())
     try:
         async for chunk in llm.stream_chat(
             messages=messages,
@@ -1392,15 +1501,10 @@ async def _stream_llm_response(
                         state,
                         {"type": "agent_delta", "text": chunk.content},
                     )
-                # Feed to sentence buffer
-                new_sentences = buffer.add(chunk.content)
-                if new_sentences:
-                    if first_sentence_at is None:
-                        first_sentence_at = time.monotonic()
-                    sentences.extend(new_sentences)
-                    if sentence_sink is not None:
-                        for sentence in new_sentences:
-                            sentence_sink.put(sentence)
+                # Feed to sentence buffer (Phase 1: it may emit early
+                # chunks — trailing punctuation, soft max-split or a
+                # watchdog stall flush — before the stream completes).
+                _emit_chunks(buffer.add(chunk.content))
 
             if chunk.finish_reason:
                 break
@@ -1410,17 +1514,22 @@ async def _stream_llm_response(
             str(e),
         )
         raise RealtimeVoiceError(f"LLM streaming failed: {e}") from e
+    finally:
+        # Phase 1: reap the chunk watchdog BEFORE the stream-end flush so
+        # no delayed watchdog flush can land after completion, failure or
+        # cancellation. A session cancel (STOP/disconnect) raises
+        # CancelledError past `except Exception` and is still cleaned up
+        # here; the watchdog itself never touches the LLM generator.
+        watchdog_task.cancel()
+        await asyncio.gather(watchdog_task, return_exceptions=True)
 
     # Flush any remaining text from buffer (only when no tool calls were
-    # detected — a tool turn discards the streamed filler text).
+    # detected — a tool turn discards the streamed filler text). The chunk
+    # watchdog is already reaped, so the remainder is emitted exactly once.
     if not tool_detected:
         remaining = buffer.flush()
         if remaining:
-            if first_sentence_at is None:
-                first_sentence_at = time.monotonic()
-            sentences.append(remaining)
-            if sentence_sink is not None:
-                sentence_sink.put(remaining)
+            _emit_chunks([remaining])
 
     stream_completed_at = time.monotonic()
     stream_ms = (stream_completed_at - stream_start) * 1000
@@ -1493,6 +1602,7 @@ async def _stream_llm_response(
         "llm_request_started_at": stream_start,
         "llm_first_token_at": first_token_at,
         "llm_first_sentence_at": first_sentence_at,
+        "llm_first_chunk_at": first_sentence_at,
         "llm_completed_at": stream_completed_at,
         "sentence_count": len(sentences),
     }
@@ -1707,9 +1817,38 @@ async def _complete_streamed_tool_turn(
     )
     final_text = ""
     final_usage: dict[str, Any] = {}
-    final_buffer = SentenceBuffer()
+    # Phase 1: same early chunking as the main stream — the final spoken
+    # answer starts flowing to TTS while it is still being generated.
+    final_buffer = SentenceBuffer(
+        min_first_chunk_chars=_MIN_FIRST_CHUNK_CHARS,
+        max_chunk_chars=_MAX_TTS_CHUNK_CHARS,
+    )
     sentences: list[str] = []
     first_sentence_at: float | None = None
+
+    def _emit_final_chunks(new_chunks: list[str]) -> None:
+        """Record + forward TTS chunks for the tool follow-up answer."""
+        nonlocal first_sentence_at
+        if not new_chunks:
+            return
+        if first_sentence_at is None:
+            first_sentence_at = time.monotonic()
+        sentences.extend(new_chunks)
+        if sentence_sink is not None:
+            for sentence in new_chunks:
+                sentence_sink.put(sentence)
+
+    async def _final_chunk_flush_watchdog() -> None:
+        """Buffer-only stall flush for the tool follow-up answer.
+
+        Mirrors the main-stream watchdog: it inspects only the
+        SentenceBuffer and is cancelled + reaped in the ``finally`` below.
+        """
+        while True:
+            await asyncio.sleep(_CHUNK_FLUSH_TIMEOUT_MS / 1000.0)
+            _emit_final_chunks(final_buffer.flush_on_timeout())
+
+    final_watchdog_task = asyncio.create_task(_final_chunk_flush_watchdog())
     try:
         async for chunk in llm.stream_chat(
             messages=final_messages,
@@ -1726,14 +1865,7 @@ async def _complete_streamed_tool_turn(
                         state,
                         {"type": "agent_delta", "text": chunk.content},
                     )
-                new_sentences = final_buffer.add(chunk.content)
-                if new_sentences:
-                    if first_sentence_at is None:
-                        first_sentence_at = time.monotonic()
-                    sentences.extend(new_sentences)
-                    if sentence_sink is not None:
-                        for sentence in new_sentences:
-                            sentence_sink.put(sentence)
+                _emit_final_chunks(final_buffer.add(chunk.content))
             if chunk.finish_reason:
                 break
     except Exception as e:
@@ -1742,15 +1874,15 @@ async def _complete_streamed_tool_turn(
             str(e),
         )
         raise RealtimeVoiceError(f"LLM tool follow-up failed: {e}") from e
+    finally:
+        # Reap the watchdog before the trailing flush (see main stream).
+        final_watchdog_task.cancel()
+        await asyncio.gather(final_watchdog_task, return_exceptions=True)
 
     # Flush any trailing partial sentence, same as the no-tool path.
     trailing = final_buffer.flush()
     if trailing:
-        if first_sentence_at is None:
-            first_sentence_at = time.monotonic()
-        sentences.append(trailing)
-        if sentence_sink is not None:
-            sentence_sink.put(trailing)
+        _emit_final_chunks([trailing])
 
     final_llm_completed_at = time.monotonic()
     final_ms = (final_llm_completed_at - final_llm_start) * 1000
@@ -1858,6 +1990,7 @@ async def _complete_streamed_tool_turn(
         "llm_request_started_at": stream_start,
         "llm_first_token_at": first_token_at,
         "llm_first_sentence_at": first_sentence_at,
+        "llm_first_chunk_at": first_sentence_at,
         "llm_completed_at": final_llm_completed_at,
         "sentence_count": len(sentences),
     }
@@ -2004,6 +2137,16 @@ async def _tts_sentence_consumer(
     async def _synthesize(sentence_no: int, sentence: str) -> dict[str, Any]:
         """Synthesize one sentence; never raises (cancellation excepted)."""
         started_at = time.monotonic()
+        # Measurement-only per-segment marks (see _synthesize_sentence_segment).
+        segment_diag: dict[str, float] = {}
+
+        def _diag_delta(end_key: str, start: float | None) -> str:
+            """Measured delta between diagnostic marks, or n/a when absent."""
+            end = segment_diag.get(end_key)
+            if end is None or start is None:
+                return "n/a"
+            return f"{(end - start) * 1000:.1f}"
+
         logger.info(
             "[REALTIME:TTS] segment_tts_started turn=%d sentence=%d chars=%d",
             turn,
@@ -2012,7 +2155,12 @@ async def _tts_sentence_consumer(
         )
         try:
             audio_data, content_type, chunks, mode = (
-                await _synthesize_sentence_segment(state.tts, sentence, turn_timing)
+                await _synthesize_sentence_segment(
+                    state.tts,
+                    sentence,
+                    turn_timing,
+                    diagnostics=segment_diag,
+                )
             )
         except Exception as e:
             return {
@@ -2032,13 +2180,18 @@ async def _tts_sentence_consumer(
         turn_timing.tts_audio_chunks += chunks
         logger.info(
             "[REALTIME:TTS] segment_tts_completed turn=%d sentence=%d "
-            "bytes=%d chunks=%d mode=%s synthesis_ms=%.0f",
+            "bytes=%d chunks=%d mode=%s synthesis_ms=%.0f "
+            "req_ms=%s first_byte_ms=%s stream_ms=%s assemble_ms=%s",
             turn,
             sentence_no,
             len(audio_data),
             chunks,
             mode,
             (completed_at - started_at) * 1000,
+            _diag_delta("request_started", started_at),
+            _diag_delta("first_chunk_at", segment_diag.get("request_started")),
+            _diag_delta("last_chunk_at", segment_diag.get("first_chunk_at")),
+            _diag_delta("assembled_at", segment_diag.get("last_chunk_at")),
         )
         return {
             "sentence_no": sentence_no,
@@ -2435,6 +2588,12 @@ async def _agent_worker(
                     turn_timing.agent_processing_started_at + first_token_ms / 1000
                 )
             turn_timing.llm_first_sentence_at = result.get("llm_first_sentence_at")
+            # Phase 1: the first chunk is what the first TTS request started
+            # on; fall back to the first-sentence mark for streams that only
+            # report sentences (e.g. older or mocked results).
+            turn_timing.llm_first_chunk_at = (
+                result.get("llm_first_chunk_at") or turn_timing.llm_first_sentence_at
+            )
             turn_timing.llm_completed_at = (
                 result.get("llm_completed_at") or time.monotonic()
             )

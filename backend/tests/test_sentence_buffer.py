@@ -171,3 +171,86 @@ class TestSentenceBuffer:
         # After sentence emission, buffer should be empty
         assert len(buf) == 0
         assert not buf
+
+
+class TestSentenceBufferEarlyChunking:
+    """Phase 1: opt-in early chunking for the realtime TTS gateway."""
+
+    def test_trailing_question_emits_immediately(self) -> None:
+        """A long-enough buffer ending in '?' emits without a space."""
+        buf = SentenceBuffer(min_first_chunk_chars=15)
+        assert buf.add("Hello, how are you?") == ["Hello, how are you?"]
+
+    def test_trailing_period_emits_immediately(self) -> None:
+        """A single sentence ending in '.' emits before the stream ends."""
+        buf = SentenceBuffer(min_first_chunk_chars=15)
+        assert buf.add("The best approach is WebSockets.") == [
+            "The best approach is WebSockets."
+        ]
+
+    def test_short_trailing_punctuation_still_waits(self) -> None:
+        """Fragments below the minimum keep accumulating."""
+        buf = SentenceBuffer(min_first_chunk_chars=15)
+        assert buf.add("Bye.") == []
+        assert buf.flush() == "Bye."
+
+    def test_decimal_not_split(self) -> None:
+        """"3." waits for its decimal continuation instead of emitting."""
+        buf = SentenceBuffer(min_first_chunk_chars=15)
+        assert buf.add("The current version 3.") == []
+        assert buf.add("14 is available.") == [
+            "The current version 3.14 is available."
+        ]
+
+    def test_max_chunk_splits_at_word_boundary(self) -> None:
+        """Over-long boundary-less text soft-splits at the last space."""
+        buf = SentenceBuffer(min_first_chunk_chars=15, max_chunk_chars=40)
+        text = "The quick brown fox jumps over the lazy dog and keeps running"
+        assert buf.add(text) == ["The quick brown fox jumps over the lazy"]
+        assert buf.flush() == "dog and keeps running"
+
+    def test_max_chunk_never_splits_words(self) -> None:
+        """A single word longer than the max is never split."""
+        buf = SentenceBuffer(min_first_chunk_chars=15, max_chunk_chars=20)
+        assert buf.add("Supercalifragilisticexpialidocious") == []
+        assert buf.add(" word") == []
+        assert buf.flush() == "Supercalifragilisticexpialidocious word"
+
+    def test_timeout_flush_at_word_boundary(self) -> None:
+        """flush_on_timeout emits complete words and keeps the partial word."""
+        buf = SentenceBuffer(min_first_chunk_chars=15)
+        assert buf.add("I think the best approach is WebSock") == []
+        assert buf.flush_on_timeout() == ["I think the best approach is"]
+        assert buf.flush() == "WebSock"
+
+    def test_timeout_flush_too_short_is_noop(self) -> None:
+        """A buffer below the minimum is left untouched by the timeout."""
+        buf = SentenceBuffer(min_first_chunk_chars=15)
+        assert buf.add("Almost") == []
+        assert buf.flush_on_timeout() == []
+        assert buf.flush() == "Almost"
+
+    def test_timeout_flush_requires_early_chunking(self) -> None:
+        """Legacy buffers keep the original behaviour (no timeout flush)."""
+        buf = SentenceBuffer()
+        assert buf.add("Hello world without a boundary") == []
+        assert buf.flush_on_timeout() == []
+
+    def test_timeout_flush_holds_possible_decimal(self) -> None:
+        """A trailing digit-dot is not flushed by the timeout either."""
+        buf = SentenceBuffer(min_first_chunk_chars=15)
+        assert buf.add("The total is 42.") == []
+        assert buf.flush_on_timeout() == []
+        assert buf.flush() == "The total is 42."
+
+    def test_remaining_text_emitted_at_stream_end(self) -> None:
+        """The trailing remainder is still returned by flush()."""
+        buf = SentenceBuffer(min_first_chunk_chars=15, max_chunk_chars=160)
+        assert buf.add("Hello, how are you? I'm doing") == ["Hello, how are you?"]
+        assert buf.flush() == "I'm doing"
+
+    def test_legacy_mode_unchanged(self) -> None:
+        """Default construction keeps the boundary-only semantics."""
+        buf = SentenceBuffer()
+        assert buf.add("Hello world.") == []
+        assert buf.add(" ") == ["Hello world."]

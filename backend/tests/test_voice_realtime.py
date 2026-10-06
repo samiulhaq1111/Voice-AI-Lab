@@ -2708,6 +2708,10 @@ class TestPerTurnLatencyMetrics:
                 # Offsets for debugging
                 assert "utterance_end_offset_ms" in metrics_data
                 assert "audio_sent_offset_ms" in metrics_data
+                # Phase 1: first-chunk anchors ride along (additive only).
+                assert "llm_first_chunk_ms" in metrics_data
+                assert "first_chunk_to_tts_request_ms" in metrics_data
+                assert "first_chunk_to_first_audio_sent_ms" in metrics_data
         finally:
             _stop_patchers(patchers)
             holder["patcher"].stop()
@@ -3866,6 +3870,7 @@ class TestTurnLatencyInstrumentation:
             llm_request_started_at=100.82,
             llm_first_token_at=101.22,
             llm_first_sentence_at=101.47,
+            llm_first_chunk_at=101.30,
             llm_completed_at=103.18,
             tts_started_at=103.20,
             tts_completed_at=104.50,
@@ -3891,9 +3896,31 @@ class TestTurnLatencyInstrumentation:
         assert result["utterance_to_first_audio_ms"] == 4520.0
         assert result["llm_sentence_count"] == 3
         assert result["utterance_released_offset_ms"] == 100800.0
+        # Phase 1 first-chunk anchors (additive)
+        assert result["llm_first_chunk_ms"] == 490.0
+        assert result["first_chunk_to_tts_request_ms"] == 1900.0
+        assert result["first_chunk_to_first_audio_ms"] is None
+        assert result["first_chunk_to_first_audio_sent_ms"] == 3220.0
+        assert result["llm_first_chunk_offset_ms"] == 101300.0
         # Phase 6E keys preserved
         assert result["utterance_end_to_agent_ms"] == 810.0
         assert result["tts_duration_ms"] == 1300.0
+
+    def test_utterance_timings_first_chunk_fallback(self) -> None:
+        """Without a chunk mark the Phase 1 metrics fall back to sentences."""
+        from app.api.voice_realtime import UtteranceTimings
+
+        t = UtteranceTimings(
+            turn=1,
+            llm_first_sentence_at=101.0,
+            tts_started_at=102.0,
+            audio_sent_at=104.0,
+        )
+        result = t.to_metrics_dict(0.0)
+
+        assert result["first_chunk_to_tts_request_ms"] == 1000.0
+        assert result["first_chunk_to_first_audio_sent_ms"] == 3000.0
+        assert result["llm_first_chunk_offset_ms"] == 101000.0
 
     def test_stream_llm_records_first_sentence_timestamp(self) -> None:
         """First token, first sentence and completion marks are recorded."""
@@ -3946,6 +3973,8 @@ class TestTurnLatencyInstrumentation:
         done = result["llm_completed_at"]
         assert all(v is not None for v in (req, tok, sent_at, done))
         assert req <= tok <= sent_at <= done
+        # Phase 1: the first-chunk mark aliases the first sentence here.
+        assert result["llm_first_chunk_at"] == sent_at
         # The relative first-token ms stays consistent with the absolute marks.
         assert abs((tok - req) * 1000 - result["first_token_ms"]) < 5.0
 
@@ -3995,6 +4024,194 @@ class TestTurnLatencyInstrumentation:
         assert result["sentence_count"] == 0
         assert result["llm_request_started_at"] is not None
         assert result["llm_completed_at"] is not None
+
+    def test_stream_llm_emits_chunk_before_stream_completion(self) -> None:
+        """Phase 1: a trailing '?' chunk reaches the sink mid-stream."""
+        from app.api.voice_realtime import _SentenceSink, _stream_llm_response
+        from app.providers.types import StreamChunk
+
+        mock_llm = MagicMock()
+
+        async def _run():
+            release = asyncio.Event()
+            parked = asyncio.Event()
+
+            async def fake_stream():
+                yield StreamChunk(content="Hello, how are you?")
+                parked.set()
+                await release.wait()
+                yield StreamChunk(content="", finish_reason="stop")
+
+            mock_llm.stream_chat = MagicMock(return_value=fake_stream())
+            sink = _SentenceSink()
+            mock_db = MagicMock()
+            mock_db_session = MagicMock()
+            mock_db_session.id = "test-session"
+            mock_db_session.message_count = 0
+            mock_db.query.return_value.filter.return_value.first.return_value = (
+                mock_db_session
+            )
+            with (
+                patch(
+                    "app.services.realtime_voice_service._load_history",
+                    return_value=[],
+                ),
+                patch("app.services.realtime_voice_service._save_message"),
+            ):
+                task = asyncio.create_task(
+                    _stream_llm_response(
+                        db=mock_db,
+                        voice_session_id="test-session",
+                        transcript="Hi",
+                        llm=mock_llm,
+                        model="test-model",
+                        sentence_sink=sink,
+                    )
+                )
+                await parked.wait()
+                # The chunk is already in the TTS sink although the LLM
+                # stream is parked and has not completed yet.
+                assert sink.count == 1
+                first = sink.queue.get_nowait()
+                release.set()
+                result = await asyncio.wait_for(task, timeout=5)
+            return first, sink, result
+
+        first, sink, result = asyncio.run(_run())
+        assert first == "Hello, how are you?"
+        assert result["sentences"] == ["Hello, how are you?"]
+        assert sink.count == 1
+        assert result["llm_first_chunk_at"] is not None
+        assert result["llm_first_chunk_at"] == result["llm_first_sentence_at"]
+
+    def test_stream_llm_watchdog_flushes_stalled_text(self) -> None:
+        """Phase 1: a stalled stream emits buffered words before it ends."""
+        from app.api.voice_realtime import _SentenceSink, _stream_llm_response
+        from app.providers.types import StreamChunk
+
+        mock_llm = MagicMock()
+
+        async def _run():
+            release = asyncio.Event()
+            parked = asyncio.Event()
+            completed = {"at": None}
+
+            async def fake_stream():
+                yield StreamChunk(content="I think the best approach is WebSock")
+                parked.set()
+                await release.wait()
+                yield StreamChunk(content="ets.")
+                completed["at"] = time.monotonic()
+                yield StreamChunk(content="", finish_reason="stop")
+
+            mock_llm.stream_chat = MagicMock(return_value=fake_stream())
+            sink = _SentenceSink()
+            mock_db = MagicMock()
+            mock_db_session = MagicMock()
+            mock_db_session.id = "test-session"
+            mock_db_session.message_count = 0
+            mock_db.query.return_value.filter.return_value.first.return_value = (
+                mock_db_session
+            )
+            with (
+                patch(
+                    "app.services.realtime_voice_service._load_history",
+                    return_value=[],
+                ),
+                patch("app.services.realtime_voice_service._save_message"),
+            ):
+                task = asyncio.create_task(
+                    _stream_llm_response(
+                        db=mock_db,
+                        voice_session_id="test-session",
+                        transcript="Hi",
+                        llm=mock_llm,
+                        model="test-model",
+                        sentence_sink=sink,
+                    )
+                )
+                await parked.wait()
+                assert sink.count == 0
+                # The ~220 ms watchdog flushes complete words while parked.
+                await _wait_until(lambda: sink.count >= 1)
+                completed_before_release = completed["at"]
+                first = sink.queue.get_nowait()
+                release.set()
+                result = await asyncio.wait_for(task, timeout=5)
+                await _assert_no_pending_tasks()
+            return first, completed_before_release, result
+
+        first, completed_before_release, result = asyncio.run(_run())
+        assert completed_before_release is None
+        assert first == "I think the best approach is"
+        assert result["sentences"] == [
+            "I think the best approach is",
+            "WebSockets.",
+        ]
+        assert result["llm_first_chunk_at"] is not None
+        assert result["llm_first_chunk_at"] == result["llm_first_sentence_at"]
+
+    def test_stream_llm_cancellation_reaps_watchdog(self) -> None:
+        """Phase 1: cancelling the stream reaps the watchdog — no late flush."""
+        from app.api.voice_realtime import _SentenceSink, _stream_llm_response
+        from app.providers.types import StreamChunk
+
+        mock_llm = MagicMock()
+
+        async def _run():
+            release = asyncio.Event()
+            parked = asyncio.Event()
+
+            async def fake_stream():
+                yield StreamChunk(content="I think the best approach is WebSock")
+                parked.set()
+                await release.wait()
+                yield StreamChunk(content="", finish_reason="stop")
+
+            mock_llm.stream_chat = MagicMock(return_value=fake_stream())
+            sink = _SentenceSink()
+            mock_db = MagicMock()
+            mock_db_session = MagicMock()
+            mock_db_session.id = "test-session"
+            mock_db_session.message_count = 0
+            mock_db.query.return_value.filter.return_value.first.return_value = (
+                mock_db_session
+            )
+            with (
+                patch(
+                    "app.services.realtime_voice_service._load_history",
+                    return_value=[],
+                ),
+                patch("app.services.realtime_voice_service._save_message"),
+            ):
+                task = asyncio.create_task(
+                    _stream_llm_response(
+                        db=mock_db,
+                        voice_session_id="test-session",
+                        transcript="Hi",
+                        llm=mock_llm,
+                        model="test-model",
+                        sentence_sink=sink,
+                    )
+                )
+                await parked.wait()
+                # Cancel well before the first watchdog tick (~220 ms).
+                await asyncio.sleep(0.05)
+                task.cancel()
+                try:
+                    await task
+                    raise AssertionError("stream task was not cancelled")
+                except asyncio.CancelledError:
+                    pass
+                # Long past the watchdog interval — a surviving watchdog
+                # would flush "I think the best approach is" into the sink.
+                await asyncio.sleep(0.4)
+                assert sink.count == 0
+                await _assert_no_pending_tasks()
+            return sink
+
+        sink = asyncio.run(_run())
+        assert sink.count == 0
 
     def test_turn_metrics_include_phase6g_segments(self) -> None:
         """End-to-end turn_metrics carries the 6G segments; 6E keys preserved."""

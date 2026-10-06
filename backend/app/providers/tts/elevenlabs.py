@@ -259,6 +259,8 @@ class ElevenLabsAdapter(TTSInterface):
 
         stream_start = time.monotonic()
         first_chunk_ms: float | None = None
+        # Measurement only: provider request → HTTP response headers.
+        response_ms: float | None = None
         total_bytes = 0
         chunks = 0
 
@@ -271,6 +273,7 @@ class ElevenLabsAdapter(TTSInterface):
                 headers={"Accept": "application/octet-stream"},
             ) as response:
                 response.raise_for_status()
+                response_ms = (time.monotonic() - stream_start) * 1000
                 async for chunk in response.aiter_bytes():
                     if not chunk:
                         continue
@@ -280,21 +283,23 @@ class ElevenLabsAdapter(TTSInterface):
                         first_chunk_ms = (time.monotonic() - stream_start) * 1000
                         logger.info(
                             "[VOICE:TTS] stream first_chunk provider=elevenlabs "
-                            "format=%s bytes=%d ttfa_ms=%.0f",
+                            "format=%s bytes=%d ttfa_ms=%.0f response_ms=%s",
                             resolved_format,
                             len(chunk),
                             first_chunk_ms,
+                            f"{response_ms:.1f}" if response_ms is not None else "n/a",
                         )
                     yield chunk
 
             logger.info(
                 "[VOICE:TTS] stream complete provider=elevenlabs format=%s "
-                "chunks=%d bytes=%d ttfa_ms=%s total_ms=%.0f",
+                "chunks=%d bytes=%d ttfa_ms=%s total_ms=%.0f response_ms=%s",
                 resolved_format,
                 chunks,
                 total_bytes,
                 f"{first_chunk_ms:.0f}" if first_chunk_ms is not None else "n/a",
                 (time.monotonic() - stream_start) * 1000,
+                f"{response_ms:.1f}" if response_ms is not None else "n/a",
             )
 
         except httpx.HTTPStatusError as e:
