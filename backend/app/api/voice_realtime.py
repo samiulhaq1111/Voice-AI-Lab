@@ -19,7 +19,12 @@ Client → Server protocol:
     {"type": "start", "sample_rate": 16000, "channels": 1,
      "encoding": "linear16", "language": "en", "model": "nova-3",
      "llm_provider": "openrouter", "llm_model": "openai/gpt-4o-mini",
-     "utterance_end_ms": 1000, "tts_mode": "elevenlabs"|"browser"}
+     "utterance_end_ms": 1000, "tts_mode": "elevenlabs"|"browser",
+     "audio_stream": true|false}
+         (Phase 2: true advertises browser-side MediaSource MP3 support —
+          each sentence is then delivered as audio_chunk/audio_end while it
+          is still being synthesized. Omitted/false keeps the complete-MP3
+          protocol.)
     <binary PCM audio chunks>
     {"type": "browser_timing", "turn": 1, "ws_transit_ms": 3.0,
      "received_to_playing_ms": 15.0}  (Phase 6G playback report)
@@ -49,7 +54,16 @@ Server → Client protocol:
      (one per executed tool call — fan-out calls each report; not deduplicated)
     {"type": "tts_processing"}
     {"type": "audio", "format": "audio/mpeg", "data": "...", "turn": 1,
-     "segment": 1, "sent_epoch_ms": 1727000000000}  (elevenlabs mode)
+     "segment": 1, "sent_epoch_ms": 1727000000000}  (elevenlabs mode —
+     one complete segment per sentence; used unless the client sent
+     "audio_stream": true)
+    {"type": "audio_chunk", "format": "audio/mpeg", "data": "...", "turn": 1,
+     "segment": 1, "seq": 0, "sent_epoch_ms": 1727000000000}
+     (Phase 2 incremental delivery: one ElevenLabs request per sentence,
+      provider chunks forwarded as they arrive — strictly ordered)
+    {"type": "audio_end", "turn": 1, "segment": 1, "seq": 3}
+     (Phase 2: closes an audio_chunk sequence so the browser can finalize
+      playback)
     {"type": "tts_text", "turn": 1, "segment": 1, "text": "..."}
      (Phase 6L browser mode — sentence text for speechSynthesis; no audio)
     {"type": "turn_metrics", "data": {...}}
@@ -62,7 +76,12 @@ is still streaming the remainder of the response. Phase 6K: sentence TTS
 pre-generates with bounded concurrency while earlier segments are sent, and
 segments are still delivered strictly in sentence order. Phase 6L: in browser
 TTS mode the same sentence stream is forwarded as tts_text events instead —
-no ElevenLabs request, no MP3, no base64 audio.
+no ElevenLabs request, no MP3, no base64 audio. Phase 2 (audio_stream
+clients): the complete-MP3 wait is removed from the ElevenLabs path — each
+provider chunk is forwarded to the browser the moment it arrives
+(audio_chunk / audio_end), still one provider request per sentence, one
+strict segment order, and unchanged cancellation/barge-in semantics; every
+other client keeps the complete-MP3 messages.
 """
 
 import asyncio
@@ -577,6 +596,12 @@ class RealtimeSessionState:
     # turn's consumer reads it at creation, so a switch applies to the next
     # turn (an in-flight response is never interrupted).
     tts_mode: str = "elevenlabs"
+    # Phase 2: incremental audio delivery. Set from START ("audio_stream":
+    # true — the browser advertises MediaSource MP3 support): the TTS
+    # consumer then forwards each sentence's provider chunks as
+    # audio_chunk/audio_end instead of one complete audio message. Legacy
+    # clients (field absent/false) keep the complete-MP3 protocol.
+    audio_stream: bool = False
     # Turn currently owned by the agent worker (0 = none). Audio segments are
     # delivered mid-turn, so a browser report for this turn may arrive before
     # the metrics payload exists.
@@ -1331,6 +1356,48 @@ async def _synthesize_sentence_segment(
         return audio, _STREAM_AUDIO_CONTENT_TYPE, len(chunks), "streaming"
     finally:
         await _close_tts_stream(stream)
+
+
+async def _stream_sentence_segment(
+    stream: Any,
+    turn_timing: UtteranceTimings,
+    outbox: asyncio.Queue,
+    diagnostics: dict[str, float],
+) -> tuple[int, int]:
+    """Phase 2: forward provider chunks into the segment outbox as they arrive.
+
+    One provider request, many chunks: every non-empty chunk is enqueued for
+    the ordered sender while the provider stream is still open, so the
+    browser receives the first audio bytes without waiting for the complete
+    MP3. Measurement reuses the ``_synthesize_sentence_segment`` marks
+    (``request_started`` / ``first_chunk_at`` / ``last_chunk_at``); there is
+    deliberately no ``assembled_at`` — nothing is joined here.
+
+    Returns:
+        (total_bytes, chunk_count) delivered by the provider stream.
+    """
+    total_bytes = 0
+    chunk_count = 0
+    try:
+        diagnostics["request_started"] = time.monotonic()
+        async for chunk in stream:
+            if not chunk:
+                continue
+            if "first_chunk_at" not in diagnostics:
+                diagnostics["first_chunk_at"] = time.monotonic()
+            if turn_timing.tts_first_audio_at is None:
+                turn_timing.tts_first_audio_at = time.monotonic()
+            outbox.put_nowait(
+                {"kind": "chunk", "seq": chunk_count, "data": chunk}
+            )
+            chunk_count += 1
+            total_bytes += len(chunk)
+        if not chunk_count:
+            raise RealtimeVoiceError("TTS stream returned no audio")
+        diagnostics["last_chunk_at"] = time.monotonic()
+    finally:
+        await _close_tts_stream(stream)
+    return total_bytes, chunk_count
 
 
 async def _stream_llm_response(
@@ -2104,10 +2171,18 @@ async def _tts_sentence_consumer(
 
     Phase 6K: sentence synthesis pre-generates with bounded concurrency
     (``_TTS_SENTENCE_CONCURRENCY``) — sentence N+1's TTS runs while segment
-    N is being sent (and played by the browser). Completed audio is retained
-    in an ordered buffer and segments are handed to the socket strictly by
-    sentence index: segment N+1 is never sent before segment N. One failed
-    sentence is logged and counted, never fatal to the turn or session.
+    N is being sent (and played by the browser). Segments are handed to the
+    socket strictly by sentence index: segment N+1 is never started before
+    segment N. One failed sentence is logged and counted, never fatal to
+    the turn or session.
+
+    Phase 2: every sentence owns an outbox queue. Its producer enqueues
+    ``chunk`` items (incremental ElevenLabs delivery when the client
+    advertised ``audio_stream``) or one ``complete`` item (buffered
+    fallback / legacy clients), followed by an ``end`` item. The ordered
+    sender drains only the outbox of the next unsent sentence, so provider
+    arrival order can never reorder segments — and the first chunk reaches
+    the browser while the provider stream is still open.
 
     Runs as a session-owned task (``state.tts_task``); STOP/disconnect
     cancels it via ``_stop_session_tasks``. In-flight sentence synthesis
@@ -2126,17 +2201,29 @@ async def _tts_sentence_consumer(
         "first_error": None,
     }
     segment_no = 0
-    # Phase 6K ordered-concurrency state: synthesis outcomes by sentence
-    # index, in-flight synthesis tasks by sentence index, sentences waiting
-    # for a free slot, and the next sentence index the sender may send.
-    outcomes: dict[int, dict[str, Any]] = {}
+    # Phase 2: incremental delivery is only enabled when the client
+    # advertised MediaSource MP3 support in START. Every other client keeps
+    # the complete-MP3 protocol (legacy behavior, byte-for-byte).
+    incremental = bool(state.audio_stream)
+    # Phase 6K/2 ordered-concurrency state: per-sentence outboxes filled by
+    # the synthesis producers ("chunk" / "complete" / "end" items),
+    # in-flight synthesis tasks by sentence index, sentences waiting for a
+    # free slot, and the next sentence index the sender may send.
+    outboxes: dict[int, asyncio.Queue] = {}
     tasks: dict[int, asyncio.Task] = {}
     pending: list[tuple[int, str]] = []
     next_to_send = 1
+    # Phase 2 delivery bookkeeping: "open" spans the items of one segment;
+    # *_sent_at bound that segment's first/last socket write.
+    send_open = False
+    seg_first_sent_at: float | None = None
+    seg_last_sent_at: float | None = None
+    seg_chunks_sent = 0
 
     async def _synthesize(sentence_no: int, sentence: str) -> dict[str, Any]:
         """Synthesize one sentence; never raises (cancellation excepted)."""
         started_at = time.monotonic()
+        outbox = outboxes[sentence_no]
         # Measurement-only per-segment marks (see _synthesize_sentence_segment).
         segment_diag: dict[str, float] = {}
 
@@ -2154,15 +2241,64 @@ async def _tts_sentence_consumer(
             len(sentence),
         )
         try:
-            audio_data, content_type, chunks, mode = (
-                await _synthesize_sentence_segment(
+            if incremental:
+                # Phase 2: one provider request, chunks forwarded to the
+                # ordered sender the moment they arrive (no b"".join wait).
+                stream = await _open_tts_stream(state.tts, sentence)
+                if stream is not None:
+                    sent_bytes, chunks = await _stream_sentence_segment(
+                        stream, turn_timing, outbox, segment_diag
+                    )
+                    content_type = _STREAM_AUDIO_CONTENT_TYPE
+                    mode = "streaming"
+                    chunked = True
+                else:
+                    # Provider cannot stream — buffered fallback, delivered
+                    # as one complete segment (Phase 6H shape).
+                    (
+                        audio_data,
+                        content_type,
+                        chunks,
+                        mode,
+                    ) = await _synthesize_sentence_segment(
+                        state.tts,
+                        sentence,
+                        turn_timing,
+                        diagnostics=segment_diag,
+                    )
+                    sent_bytes = len(audio_data)
+                    chunked = False
+                    outbox.put_nowait(
+                        {
+                            "kind": "complete",
+                            "data": audio_data,
+                            "content_type": content_type,
+                        }
+                    )
+            else:
+                # Legacy delivery: one complete MP3 per sentence (unchanged).
+                (
+                    audio_data,
+                    content_type,
+                    chunks,
+                    mode,
+                ) = await _synthesize_sentence_segment(
                     state.tts,
                     sentence,
                     turn_timing,
                     diagnostics=segment_diag,
                 )
-            )
+                sent_bytes = len(audio_data)
+                chunked = False
+                outbox.put_nowait(
+                    {
+                        "kind": "complete",
+                        "data": audio_data,
+                        "content_type": content_type,
+                    }
+                )
         except Exception as e:
+            outbox.put_nowait({"kind": "end", "ok": False})
             return {
                 "sentence_no": sentence_no,
                 "ok": False,
@@ -2178,13 +2314,27 @@ async def _tts_sentence_consumer(
             turn_timing.tts_first_sentence_completed_at = completed_at
         turn_timing.tts_sentence_count += 1
         turn_timing.tts_audio_chunks += chunks
+        outbox.put_nowait(
+            {
+                "kind": "end",
+                "ok": True,
+                "mode": mode,
+                "chunked": chunked,
+                "bytes": sent_bytes,
+                "chunks": chunks,
+                "chars": len(sentence),
+                "started_at": started_at,
+                "completed_at": completed_at,
+                "request_started": segment_diag.get("request_started"),
+            }
+        )
         logger.info(
             "[REALTIME:TTS] segment_tts_completed turn=%d sentence=%d "
             "bytes=%d chunks=%d mode=%s synthesis_ms=%.0f "
             "req_ms=%s first_byte_ms=%s stream_ms=%s assemble_ms=%s",
             turn,
             sentence_no,
-            len(audio_data),
+            sent_bytes,
             chunks,
             mode,
             (completed_at - started_at) * 1000,
@@ -2196,21 +2346,13 @@ async def _tts_sentence_consumer(
         return {
             "sentence_no": sentence_no,
             "ok": True,
-            "audio": audio_data,
-            "content_type": content_type,
-            "chunks": chunks,
-            "mode": mode,
-            "chars": len(sentence),
-            "started_at": started_at,
-            "completed_at": completed_at,
         }
 
     def _record(task: asyncio.Task) -> None:
-        """Fold one finished synthesis task into the ordered outcome map."""
+        """Fold one finished synthesis task into the turn statistics."""
         outcome = task.result()
         sentence_no = outcome["sentence_no"]
         tasks.pop(sentence_no, None)
-        outcomes[sentence_no] = outcome
         if outcome["ok"]:
             return
         # One failed sentence must not kill the turn or the session: log,
@@ -2229,6 +2371,9 @@ async def _tts_sentence_consumer(
         )
 
     def _start_task(sentence_no: int, sentence: str) -> None:
+        # Phase 2: the outbox exists before the producer runs — the ordered
+        # sender arms on it as soon as this sentence is next in order.
+        outboxes[sentence_no] = asyncio.Queue()
         tasks[sentence_no] = asyncio.create_task(
             _synthesize(sentence_no, sentence),
             name=f"realtime_tts_sentence_{turn}_{sentence_no}",
@@ -2253,11 +2398,9 @@ async def _tts_sentence_consumer(
                 turn,
                 sentence_no,
             )
-            outcomes[sentence_no] = {
-                "sentence_no": sentence_no,
-                "ok": False,
-                "skipped": True,
-            }
+            outbox = asyncio.Queue()
+            outbox.put_nowait({"kind": "end", "ok": False, "skipped": True})
+            outboxes[sentence_no] = outbox
             return
         if sentence_no == 1:
             # The TTS stage opens with the first sentence; sent from here
@@ -2272,61 +2415,133 @@ async def _tts_sentence_consumer(
             logger.info("[REALTIME] tts_processing turn=%d", turn)
         _schedule(sentence_no, sentence)
 
-    async def _drain() -> None:
-        """Send every segment that is ready and next in sentence order."""
+    async def _deliver(item: dict[str, Any]) -> None:
+        """Deliver one outbox item: chunk, complete segment, or end marker.
+
+        Ordering contract: items are pulled only from the outbox of
+        ``next_to_send``, so provider arrival order can never reorder
+        sentences — segment N+1 is never started before segment N ended.
+        """
         nonlocal segment_no, next_to_send, ws_dead
-        while not ws_dead and next_to_send in outcomes:
-            outcome = outcomes.pop(next_to_send)
-            sentence_no = next_to_send
-            next_to_send += 1
-            if not outcome["ok"]:
-                # Failed or skipped sentence: no segment; the sender just
-                # advances so later sentences keep their turn order.
-                continue
-            audio_data = outcome["audio"]
-            segment_no += 1
-            audio_b64 = base64.b64encode(audio_data).decode("ascii")
-            if not await _safe_ws_send(
-                ws,
-                state,
-                {
+        nonlocal send_open, seg_first_sent_at, seg_last_sent_at, seg_chunks_sent
+        kind = item["kind"]
+        if kind in ("chunk", "complete"):
+            if not send_open:
+                # First item of this segment: assign the segment number now
+                # so every chunk of the segment carries the same number.
+                send_open = True
+                segment_no += 1
+                seg_first_sent_at = None
+                seg_last_sent_at = None
+                seg_chunks_sent = 0
+            if kind == "chunk":
+                payload = {
+                    "type": "audio_chunk",
+                    "format": _STREAM_AUDIO_CONTENT_TYPE,
+                    "data": base64.b64encode(item["data"]).decode("ascii"),
+                    "turn": turn,
+                    "segment": segment_no,
+                    "seq": item["seq"],
+                    "sent_epoch_ms": int(time.time() * 1000),
+                }
+            else:
+                payload = {
                     "type": "audio",
-                    "format": outcome["content_type"],
-                    "data": audio_b64,
+                    "format": item["content_type"],
+                    "data": base64.b64encode(item["data"]).decode("ascii"),
                     "turn": turn,
                     "segment": segment_no,
                     "sent_epoch_ms": int(time.time() * 1000),
-                },
-            ):
+                }
+            if not await _safe_ws_send(ws, state, payload):
                 # Session is stopping/closed — later segments could never
                 # be heard; stop consuming.
                 ws_dead = True
                 return
             sent_at = time.monotonic()
-            if turn_timing.first_audio_sent_at is None:
-                turn_timing.first_audio_sent_at = sent_at
+            if seg_first_sent_at is None:
+                seg_first_sent_at = sent_at
+                if turn_timing.first_audio_sent_at is None:
+                    turn_timing.first_audio_sent_at = sent_at
+            seg_last_sent_at = sent_at
+            seg_chunks_sent += 1
             turn_timing.audio_sent_at = sent_at
-            summary["segments_sent"] += 1
-            summary["chunks"] += outcome["chunks"]
-            timings.tts_response_count += 1
-            timings.tts_audio_bytes += len(audio_data)
-            timings.tts_characters += outcome["chars"]
-            logger.info(
-                "[REALTIME] audio_segment_sent turn=%d segment=%d sentence=%d "
-                "bytes=%d chunks=%d mode=%s synthesis_ms=%.0f held_ms=%.0f",
-                turn,
-                segment_no,
-                sentence_no,
-                len(audio_data),
-                outcome["chunks"],
-                outcome["mode"],
-                (outcome["completed_at"] - outcome["started_at"]) * 1000,
-                max(0.0, (sent_at - outcome["completed_at"]) * 1000),
-            )
+            return
+        # end marker: this sentence's segment is complete (or failed/skipped).
+        ok = bool(item.get("ok"))
+        if send_open:
+            if seg_chunks_sent > 0:
+                # Chunked segment: close the sequence so the browser can
+                # finalize playback. Also sent after a mid-stream failure so
+                # a partially delivered segment still plays out and the
+                # queue keeps moving.
+                if not await _safe_ws_send(
+                    ws,
+                    state,
+                    {
+                        "type": "audio_end",
+                        "turn": turn,
+                        "segment": segment_no,
+                        "seq": seg_chunks_sent - 1,
+                    },
+                ):
+                    ws_dead = True
+            if ok:
+                sent_at = time.monotonic()
+                completed_at = item.get("completed_at")
+                item_started_at = item.get("started_at")
+                request_started = item.get("request_started")
+                synthesis_ms: float | None = None
+                if completed_at is not None and item_started_at is not None:
+                    synthesis_ms = (completed_at - item_started_at) * 1000
+                first_sent_ms: float | None = None
+                if seg_first_sent_at is not None and request_started is not None:
+                    first_sent_ms = (seg_first_sent_at - request_started) * 1000
+                sent_span_ms: float | None = None
+                if seg_last_sent_at is not None and seg_first_sent_at is not None:
+                    sent_span_ms = (seg_last_sent_at - seg_first_sent_at) * 1000
+                # held_ms keeps its Phase 6K meaning (assembly -> send). A
+                # chunked segment has no assembly wait left — report n/a
+                # instead of a silent zero.
+                held_ms: float | None = None
+                if (
+                    not item.get("chunked")
+                    and completed_at is not None
+                    and seg_last_sent_at is not None
+                ):
+                    held_ms = max(0.0, (seg_last_sent_at - completed_at) * 1000)
+                summary["segments_sent"] += 1
+                summary["chunks"] += int(item.get("chunks", 0))
+                timings.tts_response_count += 1
+                timings.tts_audio_bytes += int(item.get("bytes", 0))
+                timings.tts_characters += int(item.get("chars", 0))
+                logger.info(
+                    "[REALTIME] audio_segment_sent turn=%d segment=%d sentence=%d "
+                    "bytes=%d chunks=%d mode=%s synthesis_ms=%s held_ms=%s "
+                    "first_sent_ms=%s sent_span_ms=%s",
+                    turn,
+                    segment_no,
+                    next_to_send,
+                    int(item.get("bytes", 0)),
+                    int(item.get("chunks", 0)),
+                    item.get("mode", "?"),
+                    _fmt_ms(synthesis_ms),
+                    _fmt_ms(held_ms),
+                    _fmt_ms(first_sent_ms),
+                    _fmt_ms(sent_span_ms),
+                )
+        outboxes.pop(next_to_send, None)
+        next_to_send += 1
+        send_open = False
+        seg_first_sent_at = None
+        seg_last_sent_at = None
+        seg_chunks_sent = 0
 
     get_task: asyncio.Task | None = asyncio.ensure_future(sentence_sink.queue.get())
     sentinel_seen = False
     ws_dead = False
+    # Phase 2: pending ordered-sender get() on the next unsent sentence.
+    send_task: asyncio.Task | None = None
     try:
         while True:
             if ws_dead:
@@ -2336,12 +2551,24 @@ async def _tts_sentence_consumer(
                 held_no, held_sentence = pending.pop(0)
                 _start_task(held_no, held_sentence)
             # Normal exit: end-of-response seen, nothing in flight or held,
-            # and every ready segment has been sent.
-            if sentinel_seen and not pending and not tasks and not outcomes:
+            # no outbox left undelivered, and no segment mid-flight.
+            if (
+                sentinel_seen
+                and not pending
+                and not tasks
+                and not outboxes
+                and not send_open
+            ):
                 break
             wait_set: set[asyncio.Task] = set(tasks.values())
             if not sentinel_seen and get_task is not None:
                 wait_set.add(get_task)
+            if send_task is None and next_to_send in outboxes:
+                # Arm the ordered sender: the next item of the next unsent
+                # sentence is delivered the moment the producer enqueues it.
+                send_task = asyncio.ensure_future(outboxes[next_to_send].get())
+            if send_task is not None:
+                wait_set.add(send_task)
             if not wait_set:
                 break
             done, _ = await asyncio.wait(
@@ -2358,11 +2585,15 @@ async def _tts_sentence_consumer(
                     await _handle_sentence(sentence)
                 if not sentinel_seen and not ws_dead and get_task is None:
                     get_task = asyncio.ensure_future(sentence_sink.queue.get())
+            completed_send: asyncio.Task | None = None
+            if send_task is not None and send_task in done:
+                completed_send = send_task
+                send_task = None
+                await _deliver(completed_send.result())
             for finished in done:
-                if finished is completed_get:
+                if finished is completed_get or finished is completed_send:
                     continue
                 _record(finished)
-            await _drain()
     finally:
         # STOP/disconnect/dead socket: cancel and reap every task this
         # consumer created so no synthesis outlives the session and no task
@@ -2370,6 +2601,8 @@ async def _tts_sentence_consumer(
         stranded = list(tasks.values())
         if get_task is not None and not get_task.done():
             stranded.append(get_task)
+        if send_task is not None and not send_task.done():
+            stranded.append(send_task)
         for stranded_task in stranded:
             stranded_task.cancel()
         if stranded:
@@ -3026,6 +3259,11 @@ async def _handle_realtime_session(ws: WebSocket) -> None:
                     # keeps the Phase 6K audio pipeline; "browser" forwards
                     # tts_text and the browser speaks it).
                     state.tts_mode = tts_mode
+                    # Phase 2: incremental audio delivery — enabled only when
+                    # the browser advertised MediaSource MP3 support in START
+                    # ("audio_stream": true). Absent/false keeps the
+                    # complete-MP3 messages for this session.
+                    state.audio_stream = msg.get("audio_stream") is True
 
                     # Pre-create LLM provider for reuse
                     if state.llm_provider:

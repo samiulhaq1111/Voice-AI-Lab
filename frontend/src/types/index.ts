@@ -344,6 +344,31 @@ export interface RealtimeAudio {
   sent_epoch_ms?: number;
 }
 
+/** Phase 2: one incremental MP3 chunk of a sentence segment. Sent while the
+ *  backend is still synthesizing the segment — only to clients whose START
+ *  advertised `audio_stream: true`. Chunks of one segment arrive strictly in
+ *  `seq` order; segments keep the `audio`-message sentence order. */
+export interface RealtimeAudioChunk {
+  type: 'audio_chunk';
+  format: string;
+  data: string; // base64 MP3 chunk
+  turn?: number;
+  segment?: number;
+  /** 0-based chunk index within the segment (strictly increasing). */
+  seq?: number;
+  /** Server wall-clock (epoch ms) when this chunk was sent. */
+  sent_epoch_ms?: number;
+}
+
+/** Phase 2: closes an audio_chunk sequence — the segment is fully delivered. */
+export interface RealtimeAudioEnd {
+  type: 'audio_end';
+  turn?: number;
+  segment?: number;
+  /** seq of the last chunk of the segment. */
+  seq?: number;
+}
+
 /** Per-turn latency metrics from the server (one per utterance). */
 export interface RealtimeTurnMetrics {
   turn: number;
@@ -428,6 +453,8 @@ export type RealtimeEvent =
   | RealtimeAgentResponse
   | RealtimeTTSProcessing
   | RealtimeAudio
+  | RealtimeAudioChunk
+  | RealtimeAudioEnd
   | RealtimeTtsText
   | RealtimeTurnMetricsEvent
   | RealtimeCompleted
@@ -459,6 +486,10 @@ export interface RealtimeStartMessage {
   /** Phase 6L: response TTS mode — 'elevenlabs' (server MP3, default) or
    * 'browser' (tts_text events spoken via speechSynthesis). */
   tts_mode?: RealtimeTtsMode;
+  /** Phase 2: true advertises MediaSource MP3 support — the backend then
+   * delivers each sentence as ordered audio_chunk/audio_end messages while
+   * it is still being synthesized. Omitted/false keeps complete segments. */
+  audio_stream?: boolean;
 }
 
 export type RealtimeConnectionState = 'disconnected' | 'connecting' | 'connected';

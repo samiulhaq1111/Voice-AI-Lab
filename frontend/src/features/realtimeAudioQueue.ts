@@ -8,8 +8,33 @@
  * object URLs and the WebSocket playback report.
  */
 
+/** Phase 2: incremental MP3 delivery state for one streamed segment.
+ *
+ * The backend forwards a sentence's ElevenLabs chunks as audio_chunk
+ * messages while it is still synthesizing (clients that advertised
+ * `audio_stream` in START). Playback uses MediaSource ('audio/mpeg') so the
+ * first bytes can start playing before the sentence is complete. All DOM
+ * plumbing is owned by the component; this descriptor is inert state. */
+export interface StreamedAudioSegment {
+  /** MediaSource the <audio> element plays via this segment's object URL. */
+  mediaSource: MediaSource;
+  /** Created on 'sourceopen' — one appendBuffer at a time (MSE rule). */
+  sourceBuffer: SourceBuffer | null;
+  /** MP3 chunk bytes received but not yet appended, in seq order
+   *  (ArrayBuffer — directly appendBuffer-compatible). */
+  queue: ArrayBuffer[];
+  /** audio_end seen: finalize with endOfStream() once the queue drains. */
+  ended: boolean;
+  /** True after an unrecoverable MSE failure; the segment is dropped. */
+  failed: boolean;
+  /** Component pump installed while this segment is current; no-op until
+   *  then (chunks received early simply accumulate in `queue`). */
+  onData?: () => void;
+}
+
 export interface AudioSegment {
-  /** Object URL of the decoded audio blob. */
+  /** Object URL of the decoded audio blob — or, for a streamed segment
+   *  (Phase 2), the MediaSource object URL. */
   url: string;
   /** Turn this segment belongs to (null when the server did not label it). */
   turn: number | null;
@@ -21,6 +46,8 @@ export interface AudioSegment {
   wsTransitMs: number | null;
   /** performance.now() when the segment message was received. */
   receivedAt: number;
+  /** Phase 2: present when the segment is delivered incrementally. */
+  stream?: StreamedAudioSegment;
 }
 
 export interface AudioQueueState {

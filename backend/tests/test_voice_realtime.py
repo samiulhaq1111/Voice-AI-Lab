@@ -5048,3 +5048,279 @@ class TestSentenceStreamingTts:
             await _assert_no_pending_tasks()
         finally:
             _stop_patchers(patchers)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: incremental audio delivery (audio_stream clients)
+# ---------------------------------------------------------------------------
+
+
+def _start_with_audio_stream() -> dict[str, Any]:
+    """START message advertising MediaSource MP3 support (Phase 2)."""
+    msg = _start_with_llm()
+    msg["audio_stream"] = True
+    return msg
+
+
+class _GatedChunkTTS:
+    """Streaming TTS double whose provider stream can be held open by a gate.
+
+    Mirrors the ElevenLabsAdapter contract (plain method returning an async
+    generator of encoded-audio chunks — ``_open_tts_stream`` accepts it).
+    The first chunk is yielded immediately; the rest is held until the test
+    releases ``gate`` — proving the gateway forwards chunks while the
+    provider stream is still open, and that cancellation stops the stream.
+    """
+
+    provider_name = "fake-gated-tts"
+
+    def __init__(
+        self, parts: tuple[bytes, ...] = (b"[c0]", b"[c1]", b"[c2]")
+    ) -> None:
+        self.parts = parts
+        self.gate = asyncio.Event()
+        self.remaining_released = asyncio.Event()
+        self.stream_open = False
+        self.stream_texts: list[str] = []
+        self.cancelled = False
+        self.synthesize = AsyncMock(
+            side_effect=AssertionError("buffered synthesize on streaming path")
+        )
+        self.close = AsyncMock()
+
+    def stream_synthesize(self, text: str, **kwargs: Any):
+        """Plain def → async generator (the real provider's interface shape)."""
+
+        async def _gen():
+            self.stream_texts.append(text)
+            self.stream_open = True
+            try:
+                yield self.parts[0]
+                await self.gate.wait()
+                for part in self.parts[1:]:
+                    yield part
+                self.remaining_released.set()
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
+            finally:
+                self.stream_open = False
+
+        return _gen()
+
+
+class TestIncrementalAudioDelivery:
+    """Phase 2: audio_stream clients receive ordered chunks as they arrive.
+
+    The provider stream is gated: the first chunk must reach the socket
+    while the provider request is still open (the core Phase 2 guarantee),
+    segment ordering must survive TTS concurrency, and STOP/disconnect must
+    cancel the stream with no stale chunks and no leaked tasks.
+    """
+
+    async def test_first_chunk_sent_while_provider_stream_open(self, caplog) -> None:
+        """B: chunk 1 is on the wire before the provider stream completes."""
+        import base64
+
+        session = LifecycleSession(events=_utterance("hello"))
+        ws = LifecycleFakeWS()
+        patchers, _, mock_tts, _ = _patch_realtime_deps()
+        patchers["stream_process"].stop()
+        _install_scripted_llm(["Alpha."])
+        fake = _GatedChunkTTS()
+        mock_tts.stream_synthesize = fake.stream_synthesize
+        try:
+            with (
+                caplog.at_level(logging.INFO),
+                patch(
+                    "app.services.realtime_voice_service._load_history",
+                    return_value=[],
+                ),
+                patch("app.services.realtime_voice_service._save_message"),
+                patch(
+                    "app.api.voice_realtime.open_streaming_session",
+                    return_value=session,
+                ),
+            ):
+                handler = asyncio.create_task(_handle_realtime_session(ws))
+                ws.queue_text(_start_with_audio_stream())
+                # First chunk lands while the provider stream is parked.
+                await _wait_until(
+                    lambda: len(_ws_events_of_type(ws, "audio_chunk")) >= 1
+                )
+                assert fake.stream_open
+                assert not fake.remaining_released.is_set()
+                first = _ws_events_of_type(ws, "audio_chunk")[0]
+                assert first["seq"] == 0
+                assert first["segment"] == 1
+                assert first["turn"] == 1
+                assert first["format"] == "audio/mpeg"
+                assert base64.b64decode(first["data"]) == b"[c0]"
+                assert _ws_events_of_type(ws, "audio_end") == []
+                # Release the tail: remaining chunks then the end marker.
+                fake.gate.set()
+                await _wait_until(
+                    lambda: len(_ws_events_of_type(ws, "audio_end")) >= 1
+                )
+                seqs = [
+                    e["seq"] for e in _ws_events_of_type(ws, "audio_chunk")
+                ]
+                assert seqs == [0, 1, 2]
+                end_event = _ws_events_of_type(ws, "audio_end")[0]
+                assert end_event["segment"] == 1
+                assert end_event["seq"] == 2
+                await _wait_until(
+                    lambda: len(_ws_events_of_type(ws, "turn_metrics")) >= 1
+                )
+                ws.queue_text({"type": "stop"})
+                await asyncio.wait_for(handler, timeout=10)
+            # The complete-segment message never appears for this client.
+            assert _ws_events_of_type(ws, "audio") == []
+            assert ws.event_types()[-1] == "completed"
+            d = _ws_events_of_type(ws, "turn_metrics")[0]["data"]
+            assert d["tts_mode"] == "streaming"
+            assert d["tts_audio_chunks"] == 3
+            assert d["first_audio_sent_offset_ms"] is not None
+            # Phase 2 metric split: first chunk sent while streaming, and
+            # no assembly wait left (held_ms explicitly n/a, not zero).
+            assert "audio_segment_sent turn=1 segment=1" in caplog.text
+            assert "held_ms=n/a" in caplog.text
+            assert "first_sent_ms=" in caplog.text
+            await _assert_no_pending_tasks()
+        finally:
+            _stop_patchers(patchers)
+
+    async def test_chunk_and_segment_order_preserved(self) -> None:
+        """C: per-segment seq order and sentence order hold on the wire."""
+        session = LifecycleSession(events=_utterance("hello"))
+        ws = LifecycleFakeWS()
+        patchers, _, mock_tts, _ = _patch_realtime_deps()
+        patchers["stream_process"].stop()
+        _install_scripted_llm(["Alpha.", "Bravo."])
+        fake = _StreamingTTSDouble()
+        mock_tts.stream_synthesize = fake.stream_synthesize
+        try:
+            with (
+                patch(
+                    "app.services.realtime_voice_service._load_history",
+                    return_value=[],
+                ),
+                patch("app.services.realtime_voice_service._save_message"),
+                patch(
+                    "app.api.voice_realtime.open_streaming_session",
+                    return_value=session,
+                ),
+            ):
+                handler = asyncio.create_task(_handle_realtime_session(ws))
+                ws.queue_text(_start_with_audio_stream())
+                await _wait_until(
+                    lambda: len(_ws_events_of_type(ws, "audio_end")) >= 2
+                )
+                ws.queue_text({"type": "stop"})
+                await asyncio.wait_for(handler, timeout=10)
+            import base64
+
+            audio_msgs = [
+                e
+                for e in ws.sent
+                if e.get("type") in ("audio_chunk", "audio_end")
+            ]
+            assert [e["type"] for e in audio_msgs] == [
+                "audio_chunk",
+                "audio_chunk",
+                "audio_end",
+                "audio_chunk",
+                "audio_chunk",
+                "audio_end",
+            ]
+            assert [e["segment"] for e in audio_msgs] == [1, 1, 1, 2, 2, 2]
+            assert [e.get("seq") for e in audio_msgs] == [0, 1, 1, 0, 1, 1]
+            assert all(e.get("turn") == 1 for e in audio_msgs)
+            # Raw provider chunks — no b"".join anywhere on this path.
+            assert base64.b64decode(audio_msgs[0]["data"]) == b"[Alpha.|a]"
+            assert base64.b64decode(audio_msgs[3]["data"]) == b"[Bravo.|a]"
+            assert _ws_events_of_type(ws, "audio") == []
+            d = _ws_events_of_type(ws, "turn_metrics")[0]["data"]
+            assert d["tts_audio_chunks"] == 4
+            assert d["tts_sentence_count"] == 2
+            await _assert_no_pending_tasks()
+        finally:
+            _stop_patchers(patchers)
+
+    async def test_stop_cancels_incremental_stream_cleanly(self) -> None:
+        """D: STOP mid-stream cancels the provider; no stale chunks leak."""
+        session = LifecycleSession(events=_utterance("hello"))
+        ws = LifecycleFakeWS()
+        patchers, _, mock_tts, _ = _patch_realtime_deps()
+        patchers["stream_process"].stop()
+        _install_scripted_llm(["Alpha."])
+        fake = _GatedChunkTTS()
+        mock_tts.stream_synthesize = fake.stream_synthesize
+        try:
+            with (
+                patch(
+                    "app.services.realtime_voice_service._load_history",
+                    return_value=[],
+                ),
+                patch("app.services.realtime_voice_service._save_message"),
+                patch(
+                    "app.api.voice_realtime.open_streaming_session",
+                    return_value=session,
+                ),
+            ):
+                handler = asyncio.create_task(_handle_realtime_session(ws))
+                ws.queue_text(_start_with_audio_stream())
+                await _wait_until(
+                    lambda: len(_ws_events_of_type(ws, "audio_chunk")) >= 1
+                )
+                ws.queue_text({"type": "stop"})
+                await asyncio.wait_for(handler, timeout=10)
+            # Exactly the one pre-STOP chunk; nothing from the parked tail.
+            assert [
+                e["seq"] for e in _ws_events_of_type(ws, "audio_chunk")
+            ] == [0]
+            assert _ws_events_of_type(ws, "audio_end") == []
+            assert "audio" not in ws.event_types()
+            assert fake.cancelled is True
+            assert not fake.stream_open
+            await _assert_no_pending_tasks()
+        finally:
+            _stop_patchers(patchers)
+
+    async def test_disconnect_cancels_incremental_stream_cleanly(self) -> None:
+        """E: an abrupt disconnect cancels the stream; nothing leaks."""
+        session = LifecycleSession(events=_utterance("hello"))
+        ws = LifecycleFakeWS()
+        patchers, _, mock_tts, _ = _patch_realtime_deps()
+        patchers["stream_process"].stop()
+        _install_scripted_llm(["Alpha."])
+        fake = _GatedChunkTTS()
+        mock_tts.stream_synthesize = fake.stream_synthesize
+        try:
+            with (
+                patch(
+                    "app.services.realtime_voice_service._load_history",
+                    return_value=[],
+                ),
+                patch("app.services.realtime_voice_service._save_message"),
+                patch(
+                    "app.api.voice_realtime.open_streaming_session",
+                    return_value=session,
+                ),
+            ):
+                handler = asyncio.create_task(_handle_realtime_session(ws))
+                ws.queue_text(_start_with_audio_stream())
+                await _wait_until(
+                    lambda: len(_ws_events_of_type(ws, "audio_chunk")) >= 1
+                )
+                ws.queue_disconnect()
+                await asyncio.wait_for(handler, timeout=10)
+            assert fake.cancelled is True
+            assert not fake.stream_open
+            assert "audio_end" not in ws.event_types()
+            assert ws.sends_after_disconnect == 0
+            assert session.closed is True
+            assert session.close_calls == 1
+            await _assert_no_pending_tasks()
+        finally:
+            _stop_patchers(patchers)

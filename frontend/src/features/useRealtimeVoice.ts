@@ -46,7 +46,7 @@ import {
   enqueueSegment,
   markTurnReported,
 } from './realtimeAudioQueue';
-import type { AudioQueueState } from './realtimeAudioQueue';
+import type { AudioQueueState, AudioSegment } from './realtimeAudioQueue';
 
 const WS_BASE = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000').replace(
   'http',
@@ -135,6 +135,34 @@ const BROWSER_TTS_SUPPORTED =
   typeof window !== 'undefined' &&
   'speechSynthesis' in window &&
   typeof SpeechSynthesisUtterance !== 'undefined';
+
+/** Phase 2: MediaSource MP3 support, checked once at module load. When true
+ * the START message advertises "audio_stream": true and the backend
+ * delivers sentence audio incrementally (audio_chunk/audio_end) — playback
+ * starts before the sentence finishes synthesizing. When false the legacy
+ * complete-segment protocol is used, unchanged. */
+const AUDIO_STREAM_SUPPORTED = (() => {
+  try {
+    return (
+      typeof MediaSource !== 'undefined' &&
+      MediaSource.isTypeSupported('audio/mpeg')
+    );
+  } catch {
+    return false;
+  }
+})();
+
+/** Phase 2: base64 → bytes for received audio payloads. Returns an
+ * ArrayBuffer so streamed chunks are directly appendBuffer-compatible. */
+function decodeBase64Audio(data: string): ArrayBuffer {
+  const binary = atob(data);
+  const buffer = new ArrayBuffer(binary.length);
+  const bytes = new Uint8Array(buffer);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return buffer;
+}
 
 /** Phase 6L: one queued browser-TTS sentence (from a tts_text event). */
 interface BrowserTtsItem {
@@ -314,6 +342,9 @@ export default function useRealtimeVoice(
   const lastMetricsTurnRef = useRef(0);
   const activeTurnRef = useRef(0);
   const bargeInCutoffRef = useRef<number | null>(null);
+  // Phase 2: streamed (audio_chunk) segments by `${turn}:${segment}` so
+  // later chunks and audio_end of a segment reach the same queue item.
+  const streamedSegmentsRef = useRef(new Map<string, AudioSegment>());
 
   // --- Realtime trace (Voice Chat "Debug Logs" drawer) --------------------
   // Trace lines ride the SAME onDiagnostic channel the developer screen's
@@ -468,6 +499,9 @@ export default function useRealtimeVoice(
     for (const url of cleared.revokeUrls) {
       URL.revokeObjectURL(url);
     }
+    // Phase 2: streamed-segment registry dies with the queue — later chunks
+    // of a torn-down session have nowhere to land and are ignored.
+    streamedSegmentsRef.current.clear();
     // Phase 6L: stop browser-native speech and drop every pending tts_text
     // sentence — a stopped/old session must never speak stale text. Runs on
     // STOP, completed, error, close and unmount (no-op in elevenlabs mode).
@@ -514,6 +548,8 @@ export default function useRealtimeVoice(
     for (const url of cleared.revokeUrls) {
       URL.revokeObjectURL(url);
     }
+    // Phase 2: streamed-segment registry dies with the queue.
+    streamedSegmentsRef.current.clear();
     // The interrupted segment must not label the next turn's diagnostics.
     lastPlayedSegmentRef.current = null;
     if (BROWSER_TTS_SUPPORTED) {
@@ -593,6 +629,61 @@ export default function useRealtimeVoice(
       }
       audioEl.src = segment.url;
 
+      // Phase 2: streamed segment — wire the MediaSource pump. Chunks that
+      // arrived while this segment waited in the queue are appended in
+      // order here; later chunks are appended as they arrive (one
+      // appendBuffer at a time — MSE requires updateend chaining). Playback
+      // starts as soon as the element has decodable data: no wait for the
+      // complete sentence.
+      const streamState = segment.stream ?? null;
+      if (streamState) {
+        const mediaSource = streamState.mediaSource;
+        const failSegment = (reason: string) => {
+          streamState.failed = true;
+          streamState.onData = undefined;
+          addLog('error', `Streamed audio failed: ${reason}`);
+          trace('AUDIO_DROPPED', `segment=${segLabel} reason=${reason}`, segment.turn);
+          finishSegment('');
+        };
+        const pump = () => {
+          if (streamState.failed) return;
+          if (audioQueueRef.current.current !== segment) return;
+          const sb = streamState.sourceBuffer;
+          if (!sb || sb.updating) return;
+          const chunk = streamState.queue.shift();
+          if (chunk) {
+            try {
+              sb.appendBuffer(chunk);
+            } catch {
+              failSegment('append_error');
+            }
+            return;
+          }
+          if (streamState.ended && mediaSource.readyState === 'open') {
+            try {
+              mediaSource.endOfStream();
+            } catch {
+              // Already ended / detached — nothing to finalize.
+            }
+          }
+        };
+        streamState.onData = pump;
+        mediaSource.addEventListener('sourceopen', () => {
+          if (streamState.failed) return;
+          try {
+            streamState.sourceBuffer = mediaSource.addSourceBuffer('audio/mpeg');
+          } catch {
+            failSegment('sourcebuffer_error');
+            return;
+          }
+          streamState.sourceBuffer.addEventListener('updateend', pump);
+          pump();
+        });
+        mediaSource.addEventListener('error', () =>
+          failSegment('media_source_error'),
+        );
+      }
+
       const finishSegment = (logLine: string) => {
         // Ignore stale signals: the element may already be playing another
         // segment (onerror + rejected play() can both fire for one broken
@@ -602,6 +693,13 @@ export default function useRealtimeVoice(
         audioQueueRef.current = finished.state;
         if (finished.revokeUrl) {
           URL.revokeObjectURL(finished.revokeUrl);
+        }
+        if (segment.stream) {
+          // Phase 2: the streamed registry entry is done — late messages
+          // for this segment are ignored from here on.
+          streamedSegmentsRef.current.delete(
+            `${segment.turn ?? 'n/a'}:${segment.segmentNo ?? 1}`,
+          );
         }
         if (logLine) addLog('audio', logLine);
         playNext();
@@ -1244,6 +1342,120 @@ export default function useRealtimeVoice(
           playNextSegment();
           break;
         }
+        case 'audio_chunk': {
+          // Phase 2: incremental MP3 delivery. The first chunk of a segment
+          // creates the queue item (MediaSource-backed); later chunks land
+          // in the same item. Barge-in drops stale chunks like 'audio'.
+          setTtsProcessing(false);
+          const chunkTurn = typeof event.turn === 'number' ? event.turn : null;
+          if (bargeInCutoffRef.current !== null) {
+            if (chunkTurn === null || chunkTurn <= bargeInCutoffRef.current) {
+              addLog(
+                'audio',
+                `barge_in drop chunk turn=${event.turn ?? 'n/a'} cutoff=${bargeInCutoffRef.current}`,
+              );
+              trace(
+                'STALE_AUDIO_DROPPED',
+                `mode=elevenlabs stream=true segment=${event.segment ?? 'n/a'}` +
+                  ` turn=${event.turn ?? 'n/a'} cutoff=${bargeInCutoffRef.current}`,
+                bargeInCutoffRef.current,
+              );
+              break;
+            }
+            addLog('audio', `barge_in resume turn=${chunkTurn}`);
+            trace('BARGE_IN_RESUMED', `turn=${chunkTurn} mode=elevenlabs`, chunkTurn);
+            bargeInCutoffRef.current = null;
+          }
+          latestMediaTurnRef.current = Math.max(
+            latestMediaTurnRef.current,
+            chunkTurn ?? 0,
+          );
+          const chunkSegmentNo =
+            typeof event.segment === 'number' ? event.segment : 1;
+          const streamKey = `${chunkTurn ?? 'n/a'}:${chunkSegmentNo}`;
+          const chunkBytes = decodeBase64Audio(event.data);
+          const existing = streamedSegmentsRef.current.get(streamKey) ?? null;
+          if (!existing) {
+            const mediaSource = new MediaSource();
+            const url = URL.createObjectURL(mediaSource);
+            const wsTransitMs =
+              typeof event.sent_epoch_ms === 'number'
+                ? Math.max(0, Math.round(Date.now() - event.sent_epoch_ms))
+                : null;
+            if (!audioRef.current) {
+              audioRef.current = new Audio();
+            }
+            const streamedItem: AudioSegment = {
+              url,
+              turn: chunkTurn,
+              segmentNo: chunkSegmentNo,
+              wsTransitMs,
+              receivedAt: performance.now(),
+              stream: {
+                mediaSource,
+                sourceBuffer: null,
+                queue: [chunkBytes],
+                ended: false,
+                failed: false,
+              },
+            };
+            streamedSegmentsRef.current.set(streamKey, streamedItem);
+            audioQueueRef.current = enqueueSegment(
+              audioQueueRef.current,
+              streamedItem,
+            );
+            addLog(
+              'audio',
+              `segment=${chunkSegmentNo} stream seq=${event.seq ?? 0} chunk=${chunkBytes.byteLength}B`,
+            );
+            trace(
+              'AUDIO_RECEIVED',
+              `segment=${chunkSegmentNo} mode=elevenlabs stream=true` +
+                ` transit=${wsTransitMs ?? 'n/a'}ms`,
+              chunkTurn,
+            );
+            const turnMarks = traceTurnRef.current;
+            if (!turnMarks.firstAudioSeen) {
+              turnMarks.firstAudioSeen = true;
+              trace(
+                'TTS_FIRST_AUDIO',
+                `segment=${chunkSegmentNo} mode=elevenlabs stream=true` +
+                  ` since_turn_start=${since(turnMarks.startedAt)}` +
+                  ` since_llm_request=${since(turnMarks.llmRequestAt)}`,
+                chunkTurn,
+              );
+            }
+            trace(
+              'AUDIO_ENQUEUED',
+              `segment=${chunkSegmentNo} mode=elevenlabs stream=true queue_pos=${audioQueueRef.current.pending.length}`,
+              chunkTurn,
+            );
+            playNextSegment();
+          } else {
+            existing.stream!.queue.push(chunkBytes);
+            existing.stream!.onData?.();
+          }
+          break;
+        }
+        case 'audio_end': {
+          // Phase 2: the segment is fully delivered — finalize its
+          // MediaSource once every queued chunk has been appended.
+          const endTurn = typeof event.turn === 'number' ? event.turn : null;
+          const endSegmentNo =
+            typeof event.segment === 'number' ? event.segment : 1;
+          const streamedItem =
+            streamedSegmentsRef.current.get(`${endTurn ?? 'n/a'}:${endSegmentNo}`) ??
+            null;
+          if (streamedItem?.stream) {
+            streamedItem.stream.ended = true;
+            streamedItem.stream.onData?.();
+            addLog(
+              'audio',
+              `segment=${endSegmentNo} stream end seq=${event.seq ?? 'n/a'}`,
+            );
+          }
+          break;
+        }
         case 'turn_metrics': {
           setTurnMetrics(event.data);
           const d = event.data;
@@ -1456,10 +1668,13 @@ export default function useRealtimeVoice(
           // Phase 6L: response TTS mode — elevenlabs (server MP3) or browser
           // (tts_text events + local speechSynthesis).
           startMsg.tts_mode = ttsModeState;
+          // Phase 2: advertise incremental MP3 delivery support — only then
+          // does the backend stream audio_chunk/audio_end for this session.
+          startMsg.audio_stream = AUDIO_STREAM_SUPPORTED;
           ws.send(JSON.stringify(startMsg));
           addLog(
             'ws',
-            `START sent sample_rate=${audioCtx.sampleRate} llm=${config.llmProvider}/${config.llmModel || 'default'} tts=${ttsModeState}`,
+            `START sent sample_rate=${audioCtx.sampleRate} llm=${config.llmProvider}/${config.llmModel || 'default'} tts=${ttsModeState} audio_stream=${AUDIO_STREAM_SUPPORTED}`,
           );
           trace(
             'WS_CONNECTED',
