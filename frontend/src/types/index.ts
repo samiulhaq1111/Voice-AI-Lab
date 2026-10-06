@@ -483,6 +483,10 @@ export interface RealtimeStartMessage {
   llm_provider?: string;
   /** LLM model override (optional). */
   llm_model?: string;
+  /** STT provider override (optional): 'deepgram' (default) or 'qwen'
+   * (Qwen ASR Kaggle WebSocket). Omitted keeps the backend environment
+   * resolution (STT_PROVIDER / DEFAULT_STT_PROVIDER). */
+  stt_provider?: string;
   /** Phase 6L: response TTS mode — 'elevenlabs' (server MP3, default) or
    * 'browser' (tts_text events spoken via speechSynthesis). */
   tts_mode?: RealtimeTtsMode;

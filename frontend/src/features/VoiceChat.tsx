@@ -109,6 +109,9 @@ function traceLine(e: TraceEntry): string {
 
 export default function VoiceChat() {
   const [providers, setProviders] = useState<ProviderAvailability | null>(null);
+  // STT provider selection — sent per session in START (stt_provider).
+  // Deepgram (default) preserves existing behavior; 'qwen' = Qwen ASR.
+  const [selectedSTTProvider, setSelectedSTTProvider] = useState('deepgram');
   const [selectedLLMProvider, setSelectedLLMProvider] = useState('openrouter');
   const [llmModel, setLlmModel] = useState('');
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -262,8 +265,12 @@ export default function VoiceChat() {
   const isBusy = connState !== 'disconnected';
 
   const handleStart = useCallback(() => {
-    start({ llmProvider: selectedLLMProvider, llmModel });
-  }, [start, selectedLLMProvider, llmModel]);
+    start({
+      sttProvider: selectedSTTProvider,
+      llmProvider: selectedLLMProvider,
+      llmModel,
+    });
+  }, [start, selectedSTTProvider, selectedLLMProvider, llmModel]);
 
   // Split the shared catalogue into free and paid groups for the dropdown.
   const llmProv = providers?.llm.find((p) => p.provider === selectedLLMProvider);
@@ -323,8 +330,19 @@ export default function VoiceChat() {
         </div>
       </div>
 
-      {/* Compact LLM + TTS selection (applies to the next session start) */}
+      {/* Compact STT + LLM + TTS selection (applies to the next session start) */}
       <div className="flex flex-wrap items-center gap-2 px-4 py-2 border-b border-gray-800 bg-gray-900/50">
+        <label className="text-xs text-gray-400">STT:</label>
+        <select
+          value={selectedSTTProvider}
+          onChange={(e) => setSelectedSTTProvider(e.target.value)}
+          disabled={isBusy}
+          title="Streaming speech-to-text provider for the next session"
+          className="text-xs bg-gray-800 text-gray-200 rounded px-2 py-1 border border-gray-700 disabled:opacity-50"
+        >
+          <option value="deepgram">Deepgram</option>
+          <option value="qwen">Qwen ASR</option>
+        </select>
         <label className="text-xs text-gray-400">LLM:</label>
         <select
           value={selectedLLMProvider}

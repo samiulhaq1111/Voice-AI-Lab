@@ -18,6 +18,7 @@ Realtime voice path with AgentRuntime integration:
 Client → Server protocol:
     {"type": "start", "sample_rate": 16000, "channels": 1,
      "encoding": "linear16", "language": "en", "model": "nova-3",
+     "stt_provider": "deepgram"|"qwen",
      "llm_provider": "openrouter", "llm_model": "openai/gpt-4o-mini",
      "utterance_end_ms": 1000, "tts_mode": "elevenlabs"|"browser",
      "audio_stream": true|false}
@@ -632,13 +633,18 @@ def _register_turn_metrics(
         _log_turn_latency_breakdown(turn, metrics, report)
 
 
-def _parse_start_message(msg: dict) -> tuple[StreamConfig, str, str | None, str]:
+def _parse_start_message(
+    msg: dict,
+) -> tuple[StreamConfig, str, str | None, str, str]:
     """Parse and validate a START message.
 
     Returns:
-        Tuple of (StreamConfig, llm_provider, llm_model, tts_mode).
+        Tuple of (StreamConfig, llm_provider, llm_model, tts_mode,
+        stt_provider).
 
         tts_mode (Phase 6L) is "elevenlabs" (default) or "browser".
+        stt_provider is "" (keep the backend environment resolution),
+        "deepgram", or "qwen" (per-session STT selection from the UI).
 
     Raises:
         ValueError: When invalid.
@@ -659,6 +665,9 @@ def _parse_start_message(msg: dict) -> tuple[StreamConfig, str, str | None, str]
     # Phase 6L: response TTS mode — "elevenlabs" (server MP3 audio, the
     # existing pipeline) or "browser" (tts_text events + speechSynthesis).
     tts_mode = msg.get("tts_mode", "elevenlabs")
+    # Per-session STT provider selection (Voice Chat UI). Empty = keep the
+    # backend environment resolution (STT_PROVIDER / DEFAULT_STT_PROVIDER).
+    stt_provider = msg.get("stt_provider", "") or ""
 
     if not isinstance(sample_rate, int):
         raise ValueError("sample_rate must be an integer")
@@ -672,6 +681,8 @@ def _parse_start_message(msg: dict) -> tuple[StreamConfig, str, str | None, str]
         raise ValueError("utterance_end_ms must be an integer")
     if tts_mode not in ("elevenlabs", "browser"):
         raise ValueError("tts_mode must be 'elevenlabs' or 'browser'")
+    if stt_provider not in ("", "deepgram", "qwen"):
+        raise ValueError("stt_provider must be 'deepgram' or 'qwen'")
 
     cfg_kwargs: dict[str, Any] = {
         "model": model,
@@ -686,7 +697,7 @@ def _parse_start_message(msg: dict) -> tuple[StreamConfig, str, str | None, str]
     error = cfg.validate()
     if error:
         raise ValueError(error)
-    return cfg, llm_provider, llm_model, tts_mode
+    return cfg, llm_provider, llm_model, tts_mode, stt_provider
 
 
 async def _safe_ws_send(
@@ -3217,7 +3228,9 @@ async def _handle_realtime_session(ws: WebSocket) -> None:
                     continue
 
                 try:
-                    cfg, llm_provider, llm_model, tts_mode = _parse_start_message(msg)
+                    cfg, llm_provider, llm_model, tts_mode, stt_provider = (
+                        _parse_start_message(msg)
+                    )
                 except ValueError as e:
                     await _safe_ws_send(
                         ws, state, {"type": "error", "message": str(e)}
@@ -3225,7 +3238,9 @@ async def _handle_realtime_session(ws: WebSocket) -> None:
                     continue
 
                 try:
-                    state.stt_session = open_streaming_session(cfg)
+                    state.stt_session = open_streaming_session(
+                        cfg, provider=stt_provider or None
+                    )
                     await state.stt_session.start()
                 except (StreamingSTTError, ValueError) as e:
                     logger.error(

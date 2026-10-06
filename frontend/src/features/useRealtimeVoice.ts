@@ -10,7 +10,8 @@
  * server in the START message instead (Deepgram accepts 8–48 kHz linear16).
  *
  * Protocol (matches backend app/api/voice_realtime.py):
- *   client → server: {"type":"start",...,"llm_provider":"...","llm_model":"...",
+ *   client → server: {"type":"start",...,"stt_provider":"deepgram"|"qwen",
+ *                     "llm_provider":"...","llm_model":"...",
  *                     "tts_mode":"elevenlabs"|"browser"} | binary PCM
  *                    | {"type":"tts_mode","mode":"browser"} | {"type":"stop"}
  *   server → client: session_started | transcript_partial | transcript_final
@@ -222,8 +223,12 @@ function clip(text: string, max: number): string {
   return flat.length > max ? `${flat.slice(0, max)}…` : flat;
 }
 
-/** Selected LLM provider/model for one realtime session start (sent in START). */
+/** Selected STT/LLM provider/model for one realtime session start (sent in
+ * START as stt_provider / llm_provider / llm_model). */
 export interface RealtimeStartConfig {
+  /** STT provider: 'deepgram' (default) or 'qwen' (Qwen ASR). Omitted keeps
+   * the backend environment resolution (STT_PROVIDER). */
+  sttProvider?: string;
   llmProvider?: string;
   llmModel?: string;
 }
@@ -1658,6 +1663,11 @@ export default function useRealtimeVoice(
             encoding: 'linear16',
             language: 'en',
           };
+          // STT provider selection (Voice Chat UI): 'deepgram' (default) or
+          // 'qwen'. Omitted keeps the backend environment resolution.
+          if (config.sttProvider) {
+            startMsg.stt_provider = config.sttProvider;
+          }
           // Add LLM configuration if selected
           if (config.llmProvider) {
             startMsg.llm_provider = config.llmProvider;
@@ -1674,7 +1684,7 @@ export default function useRealtimeVoice(
           ws.send(JSON.stringify(startMsg));
           addLog(
             'ws',
-            `START sent sample_rate=${audioCtx.sampleRate} llm=${config.llmProvider}/${config.llmModel || 'default'} tts=${ttsModeState} audio_stream=${AUDIO_STREAM_SUPPORTED}`,
+            `START sent sample_rate=${audioCtx.sampleRate} stt=${config.sttProvider || 'default'} llm=${config.llmProvider}/${config.llmModel || 'default'} tts=${ttsModeState} audio_stream=${AUDIO_STREAM_SUPPORTED}`,
           );
           trace(
             'WS_CONNECTED',

@@ -129,15 +129,21 @@ class StreamingSTTError(Exception):
 # ---------------------------------------------------------------------------
 
 
-def open_streaming_session(config: StreamConfig) -> StreamingSTTSession:
-    """Create a streaming STT session for the configured default provider.
+def open_streaming_session(
+    config: StreamConfig, provider: str | None = None
+) -> StreamingSTTSession:
+    """Create a streaming STT session for the configured provider.
 
-    The provider is resolved from settings (default_stt_provider), keeping
-    the gateway free of provider-specific imports.
+    Provider resolution: the explicit ``provider`` argument (per-session
+    selection from the realtime START message) when given, otherwise
+    ``STT_PROVIDER`` when set, otherwise ``DEFAULT_STT_PROVIDER`` (default:
+    deepgram). Supported values: "deepgram" (unchanged existing
+    implementation) and "qwen" (Qwen ASR Kaggle WebSocket). Keeping the
+    resolution here leaves the gateway free of provider-specific imports.
     """
-    provider = settings.default_stt_provider
+    resolved = provider or settings.stt_provider or settings.default_stt_provider
 
-    if provider == "deepgram":
+    if resolved == "deepgram":
         # Imported lazily to keep this module provider-agnostic
         from app.providers.stt.deepgram_streaming import DeepgramStreamingSession
 
@@ -148,6 +154,17 @@ def open_streaming_session(config: StreamConfig) -> StreamingSTTSession:
         logger.info("[STT:STREAM] Creating streaming session provider=deepgram")
         return DeepgramStreamingSession(config)
 
+    if resolved == "qwen":
+        # Imported lazily to keep this module provider-agnostic
+        from app.providers.stt.qwen_streaming import QwenKaggleStreamingSession
+
+        if not settings.qwen_asr_ws_url:
+            raise StreamingSTTError(
+                "Qwen ASR WebSocket URL not configured. Set QWEN_ASR_WS_URL."
+            )
+        logger.info("[STT:STREAM] Creating streaming session provider=qwen")
+        return QwenKaggleStreamingSession(config)
+
     raise StreamingSTTError(
-        f"Streaming STT not supported for provider: '{provider}'"
+        f"Streaming STT not supported for provider: '{resolved}'"
     )

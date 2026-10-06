@@ -33,8 +33,13 @@ class Settings(BaseSettings):
     telnyx_media_ws_url: str = ""
     qwen_ws_url: str = ""
     qwen_ws_api_key: str = ""
+    qwen_asr_ws_url: str = ""
+    qwen_asr_api_key: str = ""
 
     # --- Default Provider Selections ---
+    # Realtime streaming STT selection. Empty = use default_stt_provider.
+    # Supported: "deepgram" (default) | "qwen" (Qwen ASR Kaggle WebSocket).
+    stt_provider: str = ""
     default_stt_provider: str = "deepgram"
     default_stt_model: str = "nova-3"
     default_llm_provider: str = "openrouter"
