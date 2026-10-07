@@ -31,6 +31,7 @@ Audio contents and credentials are never logged.
 import asyncio
 import json
 import time
+import unicodedata
 from typing import Any
 
 import websockets
@@ -52,6 +53,25 @@ _QWEN_DEFAULT_INFERENCE_STEP_MS = 500
 _OPEN_TIMEOUT_CAP_S = 10.0
 _PING_INTERVAL_S = 20.0
 _PING_TIMEOUT_S = 20.0
+
+# Content-neutral minimum speech evidence for NON-FINAL partials: the Qwen
+# 0.6B decoder can emit degenerate one-glyph transcripts (a lone filler
+# character plus punctuation) for the non-speech audio that legitimately
+# keeps streaming after a final in this full-duplex design. A non-final
+# partial carrying fewer than this many content characters (whitespace and
+# Unicode punctuation stripped) is dropped at this provider boundary so it
+# can never count as turn-release or barge-in evidence. Finals are never
+# filtered.
+_MIN_PARTIAL_CONTENT_CHARS = 2
+
+
+def _content_char_count(text: str) -> int:
+    """Count characters that are neither whitespace nor Unicode punctuation."""
+    return sum(
+        1
+        for ch in text
+        if not ch.isspace() and not unicodedata.category(ch).startswith("P")
+    )
 
 
 class QwenKaggleStreamingSession(StreamingSTTSession):
@@ -248,6 +268,12 @@ class QwenKaggleStreamingSession(StreamingSTTSession):
 
         is_final = bool(data.get("is_final", False))
         speech_final = bool(data.get("speech_final", False))
+        if not is_final and _content_char_count(text) < _MIN_PARTIAL_CONTENT_CHARS:
+            # Degenerate non-final partial — not actionable speech evidence.
+            logger.debug(
+                '[QWEN:STT] degenerate_partial_ignored text="%s"', text[:40]
+            )
+            return None
         try:
             confidence = float(data.get("confidence") or 0.0)
         except (TypeError, ValueError):

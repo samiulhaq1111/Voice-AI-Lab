@@ -1,12 +1,16 @@
 """Focused tests for the Qwen ASR streaming STT provider (STT_PROVIDER=qwen).
 
-Exactly the four mandatory checks:
+The four mandatory checks:
     1. Provider lifecycle: connect → start → audio → partial → final → close
     2. Realtime integration: a Qwen final starts the existing LLM turn; a
        partial transcript alone does NOT
     3. Cleanup: cancellation/disconnect closes the provider, no leaked task
     4. Default guard: with no override, the existing Deepgram session is
        still selected
+
+Plus the content-neutral degenerate-partial filter: non-final Results with
+fewer than 2 content characters (whitespace/punctuation stripped) are
+dropped by the adapter; finals are never filtered.
 
 All Qwen interaction goes through an in-process loopback WebSocket server
 speaking the Kaggle ASR wire format — no external network calls, no Kaggle URL.
@@ -409,3 +413,53 @@ def test_default_selection_remains_deepgram(monkeypatch) -> None:
     session = open_streaming_session(StreamConfig())  # no I/O at construction
     assert isinstance(session, DeepgramStreamingSession)
     assert session.provider_name == "deepgram"
+
+
+# ---------------------------------------------------------------------------
+# Content-neutral degenerate-partial filter (non-final < 2 content chars)
+# ---------------------------------------------------------------------------
+
+
+def _results_frame(text: str, *, is_final: bool) -> str:
+    """One Kaggle-format Results JSON frame for the given transcript."""
+    return json.dumps(
+        {
+            "type": "Results",
+            "is_final": is_final,
+            "speech_final": is_final,
+            "text": text,
+            "confidence": 0.9,
+            "language": "English",
+        }
+    )
+
+
+def test_degenerate_non_final_partials_filtered(monkeypatch) -> None:
+    """Non-final partials with < 2 content chars are dropped; finals never.
+
+    Content-neutral rule: whitespace and Unicode punctuation never count as
+    speech evidence — no literal transcript text is special-cased.
+    """
+    monkeypatch.setattr(settings, "qwen_asr_ws_url", "ws://filter-check.invalid")
+    session = QwenKaggleStreamingSession(StreamConfig())
+
+    # Non-final degenerate transcripts → ignored (None), never surfaced.
+    for text in ["嗯。", ".", "a", "...", "。", " "]:
+        event = session._translate_message(_results_frame(text, is_final=False))
+        assert event is None, f"non-final {text!r} should be ignored"
+
+    # Non-final real speech → forwarded unchanged.
+    event = session._translate_message(_results_frame("Hey", is_final=False))
+    assert event is not None and event.type == "partial" and event.text == "Hey"
+    event = session._translate_message(_results_frame("Can you", is_final=False))
+    assert event is not None and event.type == "partial" and event.text == "Can you"
+
+    # Finals are NEVER filtered, however short.
+    for text in ["A", "Ok."]:
+        event = session._translate_message(_results_frame(text, is_final=True))
+        assert event is not None and event.type == "final" and event.text == text
+
+    # Suppressed partials must not arm the first-partial latency mark — the
+    # forwarded "Hey" partial does (and the "A" final arms the final mark).
+    assert session._first_partial_at is not None
+    assert session._first_final_at is not None
