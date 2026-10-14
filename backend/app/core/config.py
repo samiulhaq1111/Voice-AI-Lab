@@ -35,10 +35,16 @@ class Settings(BaseSettings):
     qwen_ws_api_key: str = ""
     qwen_asr_ws_url: str = ""
     qwen_asr_api_key: str = ""
+    # Microsoft MAI-Transcribe-2-Streaming (Azure AI) realtime STT.
+    # Resource root, e.g. "https://<resource>.services.ai.azure.com".
+    mai_stt_api_key: str = ""
+    mai_stt_resource_url: str = ""
+    mai_stt_deployment: str = "MAI-Transcribe-2-Streaming"
 
     # --- Default Provider Selections ---
     # Realtime streaming STT selection. Empty = use default_stt_provider.
-    # Supported: "deepgram" (default) | "qwen" (Qwen ASR Kaggle WebSocket).
+    # Supported: "deepgram" (default) | "qwen" (Qwen ASR Kaggle WebSocket)
+    # | "mai" (Microsoft MAI-Transcribe-2-Streaming Azure realtime API).
     stt_provider: str = ""
     default_stt_provider: str = "deepgram"
     default_stt_model: str = "nova-3"

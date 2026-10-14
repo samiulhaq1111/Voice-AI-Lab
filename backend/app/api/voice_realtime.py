@@ -18,7 +18,7 @@ Realtime voice path with AgentRuntime integration:
 Client → Server protocol:
     {"type": "start", "sample_rate": 16000, "channels": 1,
      "encoding": "linear16", "language": "en", "model": "nova-3",
-     "stt_provider": "deepgram"|"qwen",
+     "stt_provider": "deepgram"|"qwen"|"mai",
      "llm_provider": "openrouter", "llm_model": "openai/gpt-4o-mini",
      "utterance_end_ms": 1000, "tts_mode": "elevenlabs"|"browser",
      "audio_stream": true|false}
@@ -644,7 +644,7 @@ def _parse_start_message(
 
         tts_mode (Phase 6L) is "elevenlabs" (default) or "browser".
         stt_provider is "" (keep the backend environment resolution),
-        "deepgram", or "qwen" (per-session STT selection from the UI).
+        "deepgram", "qwen", or "mai" (per-session STT selection from the UI).
 
     Raises:
         ValueError: When invalid.
@@ -681,8 +681,8 @@ def _parse_start_message(
         raise ValueError("utterance_end_ms must be an integer")
     if tts_mode not in ("elevenlabs", "browser"):
         raise ValueError("tts_mode must be 'elevenlabs' or 'browser'")
-    if stt_provider not in ("", "deepgram", "qwen"):
-        raise ValueError("stt_provider must be 'deepgram' or 'qwen'")
+    if stt_provider not in ("", "deepgram", "qwen", "mai"):
+        raise ValueError("stt_provider must be 'deepgram', 'qwen' or 'mai'")
 
     cfg_kwargs: dict[str, Any] = {
         "model": model,

@@ -11,6 +11,9 @@ Conversion pipeline:
         → ulaw_to_linear() → PCM16 samples (16-bit signed)
         → pcm8k_to_pcm16k() → PCM16 @ 16kHz
         → Deepgram
+
+Also provides ``PCM16Resampler`` — a stateful streaming resampler used by
+the MAI-Transcribe-2-Streaming adapter (browser native rate → 16 kHz).
 """
 
 import struct
@@ -196,3 +199,66 @@ def mp3_to_pcmu_8k(mp3_data: bytes) -> bytes:
     from app.services.telnyx_media import _linear_to_ulaw
 
     return bytes(_linear_to_ulaw(s) for s in samples)
+
+
+class PCM16Resampler:
+    """Stateful streaming resampler for PCM16 mono little-endian audio.
+
+    Converts a continuous stream of 16-bit PCM chunks from ``src_rate`` to
+    ``dst_rate`` using linear interpolation. Continuity is preserved across
+    chunk boundaries: the fractional read position carries into the next
+    ``process()`` call, so a stream fed one ~50 ms frame at a time produces
+    the same output as if it had been resampled in one pass. Both integer
+    ratios (e.g. 48 kHz → 16 kHz) and fractional ratios (44.1 kHz → 16 kHz)
+    are handled correctly.
+
+    Intended for the MAI-Transcribe-2-Streaming adapter, which must forward
+    PCM16 mono at 16 kHz while the browser captures at its native rate.
+    The telephony conversion helpers above are unrelated and unchanged.
+    """
+
+    def __init__(self, src_rate: int, dst_rate: int) -> None:
+        if src_rate <= 0 or dst_rate <= 0:
+            raise ValueError("sample rates must be positive")
+        # Input samples advanced per output sample.
+        self._step: float = src_rate / dst_rate
+        # Input samples not yet fully consumed by interpolation.
+        self._buffer: list[int] = []
+        # Fractional read position within ``self._buffer``.
+        self._position: float = 0.0
+
+    def process(self, chunk: bytes) -> bytes:
+        """Resample one PCM16 chunk; returns the resampled PCM16 bytes.
+
+        Args:
+            chunk: 16-bit signed little-endian samples at the source rate.
+
+        Returns:
+            Resampled 16-bit signed little-endian samples at the target
+            rate. Output is held back until both interpolation neighbours
+            of a sample are known, so the stream lags by at most one input
+            sample — never by a full chunk.
+        """
+        num_samples = len(chunk) // 2
+        if num_samples == 0:
+            return b""
+        self._buffer.extend(struct.unpack(f"<{num_samples}h", chunk[: num_samples * 2]))
+
+        buffer = self._buffer
+        output: list[int] = []
+        while int(self._position) < len(buffer) - 1:
+            index = int(self._position)
+            fraction = self._position - index
+            value = buffer[index] + (buffer[index + 1] - buffer[index]) * fraction
+            output.append(int(round(value)))
+            self._position += self._step
+
+        # Drop the fully consumed prefix; keep the interpolation neighbour.
+        consumed = int(self._position)
+        if consumed:
+            del buffer[:consumed]
+            self._position -= consumed
+
+        if not output:
+            return b""
+        return struct.pack(f"<{len(output)}h", *output)

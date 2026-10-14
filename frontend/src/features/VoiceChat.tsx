@@ -110,7 +110,8 @@ function traceLine(e: TraceEntry): string {
 export default function VoiceChat() {
   const [providers, setProviders] = useState<ProviderAvailability | null>(null);
   // STT provider selection — sent per session in START (stt_provider).
-  // Deepgram (default) preserves existing behavior; 'qwen' = Qwen ASR.
+  // Deepgram (default) preserves existing behavior; 'qwen' = Qwen ASR;
+  // 'mai' = Microsoft MAI-Transcribe-2-Streaming (Azure realtime API).
   const [selectedSTTProvider, setSelectedSTTProvider] = useState('deepgram');
   const [selectedLLMProvider, setSelectedLLMProvider] = useState('openrouter');
   const [llmModel, setLlmModel] = useState('');
@@ -342,6 +343,7 @@ export default function VoiceChat() {
         >
           <option value="deepgram">Deepgram</option>
           <option value="qwen">Qwen ASR</option>
+          <option value="mai">MAI-Transcribe-2</option>
         </select>
         <label className="text-xs text-gray-400">LLM:</label>
         <select

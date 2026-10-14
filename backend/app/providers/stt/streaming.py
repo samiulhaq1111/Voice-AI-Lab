@@ -138,7 +138,8 @@ def open_streaming_session(
     selection from the realtime START message) when given, otherwise
     ``STT_PROVIDER`` when set, otherwise ``DEFAULT_STT_PROVIDER`` (default:
     deepgram). Supported values: "deepgram" (unchanged existing
-    implementation) and "qwen" (Qwen ASR Kaggle WebSocket). Keeping the
+    implementation), "qwen" (Qwen ASR Kaggle WebSocket) and "mai"
+    (Microsoft MAI-Transcribe-2-Streaming Azure realtime API). Keeping the
     resolution here leaves the gateway free of provider-specific imports.
     """
     resolved = provider or settings.stt_provider or settings.default_stt_provider
@@ -164,6 +165,22 @@ def open_streaming_session(
             )
         logger.info("[STT:STREAM] Creating streaming session provider=qwen")
         return QwenKaggleStreamingSession(config)
+
+    if resolved == "mai":
+        # Imported lazily to keep this module provider-agnostic
+        from app.providers.stt.mai_streaming import MaiTranscribeStreamingSession
+
+        if not settings.mai_stt_api_key:
+            raise StreamingSTTError(
+                "MAI-Transcribe API key not configured. Set MAI_STT_API_KEY."
+            )
+        if not settings.mai_stt_resource_url:
+            raise StreamingSTTError(
+                "MAI-Transcribe resource URL not configured. "
+                "Set MAI_STT_RESOURCE_URL."
+            )
+        logger.info("[STT:STREAM] Creating streaming session provider=mai")
+        return MaiTranscribeStreamingSession(config)
 
     raise StreamingSTTError(
         f"Streaming STT not supported for provider: '{resolved}'"
