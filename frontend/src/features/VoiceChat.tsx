@@ -17,6 +17,7 @@ import type {
   RealtimeLogEntry,
   RealtimeTraceEvent,
 } from '../types';
+import SearchableModelSelect from '../components/SearchableModelSelect';
 import { getProviders } from '../services/api';
 import useRealtimeVoice from './useRealtimeVoice';
 
@@ -358,34 +359,22 @@ export default function VoiceChat() {
             </option>
           )) || <option value="openrouter">openrouter</option>}
         </select>
-        <select
+        <SearchableModelSelect
           value={llmModel}
-          onChange={(e) => setLlmModel(e.target.value)}
+          onChange={setLlmModel}
           disabled={isBusy}
-          className="text-xs bg-gray-800 text-gray-200 rounded px-2 py-1 border border-gray-700 max-w-[240px] disabled:opacity-50"
-        >
-          <option value="">
-            default ({llmProv?.default_model || 'nvidia/nemotron-3.5-lightning:free'})
-          </option>
-          {freeModels.length > 0 && (
-            <optgroup label="FREE / EXPERIMENTAL">
-              {freeModels.map((m) => (
-                <option key={m} value={m}>
-                  {m}
-                </option>
-              ))}
-            </optgroup>
-          )}
-          {paidModels.length > 0 && (
-            <optgroup label="PAID / PAYG">
-              {paidModels.map((m) => (
-                <option key={m} value={m}>
-                  {m}
-                </option>
-              ))}
-            </optgroup>
-          )}
-        </select>
+          defaultOption={{
+            value: '',
+            label: `default (${
+              llmProv?.default_model || 'nvidia/nemotron-3.5-lightning:free'
+            })`,
+          }}
+          groups={[
+            { label: 'FREE / EXPERIMENTAL', models: freeModels },
+            { label: 'PAID / PAYG', models: paidModels },
+          ]}
+          selectClassName="text-xs bg-gray-800 text-gray-200 rounded px-2 py-1 border border-gray-700 max-w-[240px] disabled:opacity-50"
+        />
         <span className="ml-auto flex items-center gap-1">
           <span className="text-xs text-gray-500">TTS:</span>
           <button

@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { ChatResponse, ProviderAvailability, ToolCallInfo } from '../types';
+import SearchableModelSelect from '../components/SearchableModelSelect';
 import { getProviders, sendChat } from '../services/api';
 
 interface DisplayMessage {
@@ -121,33 +122,21 @@ export default function TextChat() {
           )) || <option value="openrouter">openrouter</option>}
         </select>
         <label className="text-xs text-gray-400">Model:</label>
-        <select
+        <SearchableModelSelect
           value={model}
-          onChange={(e) => setModel(e.target.value)}
-          className="text-xs bg-gray-800 text-gray-200 rounded px-2 py-1 border border-gray-700"
-        >
-          <option value="">
-            default ({llmProv?.default_model || 'nvidia/nemotron-3.5-lightning:free'})
-          </option>
-          {freeModels.length > 0 && (
-            <optgroup label="FREE / EXPERIMENTAL">
-              {freeModels.map((m) => (
-                <option key={m} value={m}>
-                  {m}
-                </option>
-              ))}
-            </optgroup>
-          )}
-          {paidModels.length > 0 && (
-            <optgroup label="PAID / PAYG">
-              {paidModels.map((m) => (
-                <option key={m} value={m}>
-                  {m}
-                </option>
-              ))}
-            </optgroup>
-          )}
-        </select>
+          onChange={setModel}
+          defaultOption={{
+            value: '',
+            label: `default (${
+              llmProv?.default_model || 'nvidia/nemotron-3.5-lightning:free'
+            })`,
+          }}
+          groups={[
+            { label: 'FREE / EXPERIMENTAL', models: freeModels },
+            { label: 'PAID / PAYG', models: paidModels },
+          ]}
+          selectClassName="text-xs bg-gray-800 text-gray-200 rounded px-2 py-1 border border-gray-700"
+        />
       </div>
 
       {/* Messages */}

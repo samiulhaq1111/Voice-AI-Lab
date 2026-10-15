@@ -10,6 +10,7 @@ import type {
   VoiceToolCall,
   VoiceTurnMetrics,
 } from '../types';
+import SearchableModelSelect from '../components/SearchableModelSelect';
 import { getProviders } from '../services/api';
 import RealtimeStt from './RealtimeStt';
 
@@ -446,33 +447,22 @@ export default function VoiceTest() {
             </div>
             <div>
               <label className="text-xs text-gray-400 font-medium">Model</label>
-              <select
+              <SearchableModelSelect
                 value={llmModel}
-                onChange={(e) => setLlmModel(e.target.value)}
-                className="w-full text-xs bg-gray-800 text-gray-200 rounded px-2 py-1.5 border border-gray-700 min-w-0"
-              >
-                <option value="">
-                  default ({llmProv?.default_model || 'nvidia/nemotron-3.5-lightning:free'})
-                </option>
-                {freeModels.length > 0 && (
-                  <optgroup label="FREE / EXPERIMENTAL">
-                    {freeModels.map((m) => (
-                      <option key={m} value={m}>
-                        {m}
-                      </option>
-                    ))}
-                  </optgroup>
-                )}
-                {paidModels.length > 0 && (
-                  <optgroup label="PAID / PAYG">
-                    {paidModels.map((m) => (
-                      <option key={m} value={m}>
-                        {m}
-                      </option>
-                    ))}
-                  </optgroup>
-                )}
-              </select>
+                onChange={setLlmModel}
+                defaultOption={{
+                  value: '',
+                  label: `default (${
+                    llmProv?.default_model || 'nvidia/nemotron-3.5-lightning:free'
+                  })`,
+                }}
+                groups={[
+                  { label: 'FREE / EXPERIMENTAL', models: freeModels },
+                  { label: 'PAID / PAYG', models: paidModels },
+                ]}
+                className="flex flex-col gap-1 w-full"
+                selectClassName="w-full text-xs bg-gray-800 text-gray-200 rounded px-2 py-1.5 border border-gray-700 min-w-0"
+              />
             </div>
           </div>
 

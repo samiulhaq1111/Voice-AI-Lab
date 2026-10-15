@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
+from app.api.providers import _merge_dynamic_models
 from app.core.config import settings
 from app.providers.factory import (
     LLM_FREE_MODELS,
@@ -62,10 +63,32 @@ class TestProviderCatalogue:
             assert model_id in entry["models"], f"free model dropped: {model_id}"
             assert model_id not in entry["paid_models"]
 
-    def test_models_equals_free_plus_paid(self) -> None:
+    def test_models_curated_base_plus_dynamic_merge(self) -> None:
+        """The factory catalogue stays static; the endpoint merge is additive.
+
+        Dynamic OpenRouter models are appended after the curated lists with
+        their exact IDs; curated models keep their order and free/paid
+        classification and are never duplicated or reclassified.
+        """
+        base_models = [*LLM_FREE_MODELS, *LLM_PAID_MODELS]
         entry = _llm_entry()
-        assert entry["models"] == [*LLM_FREE_MODELS, *LLM_PAID_MODELS]
+        assert entry["models"] == base_models
         assert entry["paid_models"] == list(LLM_PAID_MODELS)
+
+        merged = _merge_dynamic_models(
+            entry,
+            dynamic_free=["openai/gpt-5-nano:free", base_models[0]],
+            dynamic_paid=["openai/gpt-5", "openai/gpt-5-mini"],
+        )
+        # Curated block unchanged and first; exact dynamic IDs appended;
+        # curated duplicates dropped (base_models[0] free, gpt-5-mini paid).
+        assert merged["models"] == [
+            *base_models,
+            "openai/gpt-5-nano:free",
+            "openai/gpt-5",
+        ]
+        assert merged["paid_models"] == [*LLM_PAID_MODELS, "openai/gpt-5"]
+        assert merged["dynamic"] is True
 
     def test_provider_identity_unchanged(self) -> None:
         info = get_available_providers()

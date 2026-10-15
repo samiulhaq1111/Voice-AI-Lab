@@ -11,6 +11,7 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import type { ProviderAvailability, RealtimeLogEntry } from '../types';
+import SearchableModelSelect from '../components/SearchableModelSelect';
 import { getProviders } from '../services/api';
 import useRealtimeVoice from './useRealtimeVoice';
 
@@ -167,20 +168,21 @@ export default function RealtimeStt() {
               <label className="block text-xs text-gray-500 mb-1 font-medium uppercase">
                 LLM Model (optional)
               </label>
-              <select
+              <SearchableModelSelect
                 value={llmModel}
-                onChange={(e) => setLlmModel(e.target.value)}
-                className="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-sm text-white"
-              >
-                <option value="">Default</option>
-                {providers?.llm
-                  .find((p) => p.provider === selectedLLMProvider)
-                  ?.models.map((m) => (
-                    <option key={m} value={m}>
-                      {m}
-                    </option>
-                  ))}
-              </select>
+                onChange={setLlmModel}
+                defaultOption={{ value: '', label: 'Default' }}
+                groups={[
+                  {
+                    label: '',
+                    models:
+                      providers?.llm.find((p) => p.provider === selectedLLMProvider)
+                        ?.models ?? [],
+                  },
+                ]}
+                className="w-full"
+                selectClassName="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-sm text-white"
+              />
             </div>
           </div>
         </div>
