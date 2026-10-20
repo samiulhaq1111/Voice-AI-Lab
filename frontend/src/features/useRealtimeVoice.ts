@@ -223,6 +223,29 @@ function clip(text: string, max: number): string {
   return flat.length > max ? `${flat.slice(0, max)}…` : flat;
 }
 
+/** Standalone filler sounds STT sometimes transcribes as full utterances
+ * ("Mm.", "Hmm?", "Uh-huh."). Mirrors the backend guard in voice_realtime.py
+ * so both layers agree on what counts as filler. */
+const FILLER_TOKENS = new Set([
+  'mm', 'mmm', 'mmmm', 'hm', 'hmm', 'hmmm', 'hmmmm', 'hum',
+  'um', 'uh', 'uhh', 'uhhh', 'uhhuh', 'mmhmm', 'er', 'erm',
+]);
+
+/** True when every token of `text` is a standalone filler sound. Case- and
+ * punctuation-insensitive per token ("Mm-hmm." -> "mmhmm"); digits are kept
+ * ("Mm2" is not filler) and pure-punctuation tokens are skipped as noise.
+ * Sentences mixing filler with real words are NOT filler-only. Empty text
+ * counts as filler. Mirrors _is_filler_only_transcript in voice_realtime.py. */
+function isFillerOnlyTranscript(text: string): boolean {
+  const tokens = (text ?? '').trim().split(/\s+/).filter(Boolean);
+  return tokens.every((token) => {
+    const normalized = Array.from(token.toLowerCase())
+      .filter((ch) => /[a-z0-9]/.test(ch))
+      .join('');
+    return normalized === '' || FILLER_TOKENS.has(normalized);
+  });
+}
+
 /** Selected STT/LLM provider/model for one realtime session start (sent in
  * START as stt_provider / llm_provider / llm_model). */
 export interface RealtimeStartConfig {
@@ -582,6 +605,10 @@ export default function useRealtimeVoice(
    * extends the cutoff. start()/teardown() reset the gate. */
   const maybeBargeIn = useCallback(
     (source: string, text: string) => {
+      // Standalone filler ("Mm.", "Hmm?") is not actionable user speech — it
+      // must not interrupt assistant playback. Sentences containing filler
+      // words alongside real words still barge in normally.
+      if (isFillerOnlyTranscript(text)) return;
       const playbackActive =
         audioQueueRef.current.current !== null ||
         audioQueueRef.current.pending.length > 0 ||

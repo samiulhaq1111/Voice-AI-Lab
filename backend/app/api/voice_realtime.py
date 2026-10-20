@@ -785,6 +785,39 @@ def _cancel_pending_release(
     return None
 
 
+# Standalone filler sounds that STT sometimes transcribes as complete
+# utterances ("Mm.", "Hmm?", "Uh-huh."). Repeated filler-only finals must
+# never create agent turns (or barge in client-side) — only whole-utterance
+# filler is filtered; sentences containing filler words alongside real
+# speech are always preserved.
+_FILLER_TOKENS = frozenset(
+    {
+        "mm", "mmm", "mmmm", "hm", "hmm", "hmmm", "hmmmm", "hum",
+        "um", "uh", "uhh", "uhhh", "uhhuh", "mmhmm", "er", "erm",
+    }
+)
+
+
+def _is_filler_only_transcript(text: str | None) -> bool:
+    """True when every token of ``text`` is a standalone filler sound.
+
+    Normalizes case and punctuation per token ("Mm-hmm." -> "mmhmm"), so STT
+    variants of the same filler all match; digits are kept ("Mm2" is not
+    filler) and pure-punctuation tokens are skipped as noise. An empty
+    transcript counts as filler-only (no actionable content). The guard is
+    shared by the speech_final release gate and the utterance_end fallback so
+    no provider's transcript style can turn filler into an LLM turn.
+    """
+    tokens = text.split() if text else []
+    for token in tokens:
+        normalized = "".join(ch for ch in token.lower() if ch.isalnum())
+        if not normalized:
+            continue  # pure punctuation — no content either way
+        if normalized not in _FILLER_TOKENS:
+            return False
+    return True
+
+
 def _schedule_turn_release(
     timings: RealtimeTimings,
     state: RealtimeSessionState,
@@ -1180,6 +1213,13 @@ async def _pump_provider_events(
                     speech_final
                     and not state.stop_requested
                     and not state.stopping
+                    # Filler-only utterances ("Mm.", "Hmm.") never schedule a
+                    # release — repeated hums must not become agent turns. The
+                    # segment still accumulates, so real speech that follows
+                    # releases normally with the full text.
+                    and not _is_filler_only_transcript(
+                        state.current_utterance_text
+                    )
                 ):
                     # Early release: ~600 ms after the endpointing final the
                     # turn is handed to the agent. New speech evidence inside
@@ -1231,6 +1271,16 @@ async def _pump_provider_events(
                         "[REALTIME] utterance_release_reason turn=%d "
                         "reason=empty_buffer",
                         timings.agent_response_count + 1,
+                    )
+                    continue
+                if _is_filler_only_transcript(state.current_utterance_text):
+                    # Filler-only buffer ("Mm."): keep it accumulated for the
+                    # next real utterance, but do not release an agent turn.
+                    logger.info(
+                        "[REALTIME] utterance_release_reason turn=%d "
+                        "reason=filler_only_buffer accumulated='%s'",
+                        timings.agent_response_count + 1,
+                        state.current_utterance_text[:60],
                     )
                     continue
                 # Fallback trigger (v2): UtteranceEnd only releases the turn

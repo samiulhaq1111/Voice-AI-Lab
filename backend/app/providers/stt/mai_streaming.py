@@ -61,7 +61,11 @@ This adapter therefore runs a minimal client-side endpoint check on the
 trailing-silence window of ``StreamConfig.endpointing_ms``) and commits
 when speech is followed by that much silence — the same endpointing
 semantics Deepgram/Qwen provide server-side. A safety cap also commits
-audio that stays uncommitted for too long. Sessions are limited to one
+speech that stays uncommitted for too long; a buffer of pure silence is
+never committed, because MAI hallucinates transcripts from committed
+silent audio. Commits also require a minimum cumulative duration of
+above-threshold audio (``_MIN_COMMIT_SPEECH_MS``), so brief excursions
+cannot commit a buffer of mostly silence. Sessions are limited to one
 hour by the service; this adapter does not add reconnection.
 
 Audio contents and credentials are never logged.
@@ -105,8 +109,18 @@ _PING_TIMEOUT_S = 20.0
 # mirroring the endpointing the other providers apply server-side).
 _SPEECH_RMS_THRESHOLD = 250.0
 
+# RMS level is a proxy, not proof of speech: a commit additionally requires
+# at least this much cumulative above-threshold audio in the current
+# uncommitted buffer, so a brief excursion (a single frame of noise or
+# playback leakage) cannot commit a buffer of mostly silence — audio MAI
+# transcribes into hallucinated text.
+_MIN_COMMIT_SPEECH_MS = 200.0
+
 # Safety cap: commit uncommitted audio at this age even without a silence
 # gap, so continuous speech still produces finals within a bounded time.
+# It only fires once speech was detected in the buffer (see
+# _track_endpointing): pure silence is never committed, because MAI
+# hallucinates transcripts from committed silent audio.
 _MAX_UNCOMMITTED_MS = 15000.0
 
 # MAI realtime transcription wire contract (verified against the Azure
@@ -185,6 +199,7 @@ class MaiTranscribeStreamingSession(StreamingSTTSession):
         self._uncommitted_ms = 0.0
         self._silence_ms = 0.0
         self._has_speech = False
+        self._speech_ms = 0.0
         # Provisional transcript state for the item being transcribed.
         self._item_id: str | None = None
         self._delta_text = ""
@@ -387,7 +402,12 @@ class MaiTranscribeStreamingSession(StreamingSTTSession):
         below the RMS threshold extend the trailing-silence window once
         speech has been forwarded; a commit is due when that window reaches
         ``StreamConfig.endpointing_ms``. The max-uncommitted cap commits
-        continuous speech that never pauses long enough.
+        continuous speech that never pauses long enough. Both commits
+        require detected speech (``_has_speech``) plus at least
+        ``_MIN_COMMIT_SPEECH_MS`` of cumulative above-threshold audio in
+        the buffer: RMS level is a proxy, not proof of speech, so brief
+        excursions cannot commit a buffer of mostly silence (MAI
+        hallucinates transcripts from committed silent audio).
 
         Returns the commit reason ("" = no commit due).
         """
@@ -405,12 +425,16 @@ class MaiTranscribeStreamingSession(StreamingSTTSession):
         if rms >= _SPEECH_RMS_THRESHOLD:
             self._has_speech = True
             self._silence_ms = 0.0
+            self._speech_ms += frame_ms
         else:
             self._silence_ms += frame_ms
 
-        if self._has_speech and self._silence_ms >= self._config.endpointing_ms:
+        has_enough_speech = (
+            self._has_speech and self._speech_ms >= _MIN_COMMIT_SPEECH_MS
+        )
+        if has_enough_speech and self._silence_ms >= self._config.endpointing_ms:
             return "endpoint"
-        if self._uncommitted_ms >= _MAX_UNCOMMITTED_MS:
+        if has_enough_speech and self._uncommitted_ms >= _MAX_UNCOMMITTED_MS:
             return "max_uncommitted"
         return ""
 
@@ -442,6 +466,7 @@ class MaiTranscribeStreamingSession(StreamingSTTSession):
         self._uncommitted_ms = 0.0
         self._silence_ms = 0.0
         self._has_speech = False
+        self._speech_ms = 0.0
 
     async def receive(self) -> StreamEvent | None:
         """Await the next *meaningful* provider event.
