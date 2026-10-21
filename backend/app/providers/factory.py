@@ -12,7 +12,7 @@ from app.providers.tts.interface import TTSInterface
 # Supported provider names per type
 SUPPORTED_STT_PROVIDERS = {"deepgram"}
 SUPPORTED_LLM_PROVIDERS = {"openrouter", "qwen_ws"}
-SUPPORTED_TTS_PROVIDERS = {"elevenlabs"}
+SUPPORTED_TTS_PROVIDERS = {"elevenlabs", "azure"}
 
 # Curated OpenRouter LLM model catalogue for the Chat and Voice UIs.
 # NOTE: Benchmark configurations are separate (app/benchmarks/configurations.py)
@@ -144,6 +144,14 @@ def get_tts_provider(
             default_model=model,
         )
 
+    if name == "azure":
+        from app.providers.tts.azure import AzureTTSAdapter
+
+        return AzureTTSAdapter(
+            api_key=api_key,
+            default_voice=voice,
+        )
+
     raise ProviderError(
         f"Unsupported TTS provider: '{name}'. Supported: {sorted(SUPPORTED_TTS_PROVIDERS)}"
     )
@@ -185,6 +193,13 @@ def get_available_providers() -> dict:
                 "default_voice": settings.default_tts_voice or "JBFqnCBsd6RMkjVDRZzb",
                 "models": ["eleven_flash_v2_5", "eleven_multilingual_v2", "eleven_v3"],
                 "configured": settings.is_provider_configured("elevenlabs"),
+            },
+            {
+                "provider": "azure",
+                "display_name": "Azure AI Speech (Neural TTS)",
+                "default_voice": settings.azure_tts_voice or "en-US-JennyNeural",
+                "models": [],
+                "configured": settings.is_provider_configured("azure"),
             },
         ],
     }

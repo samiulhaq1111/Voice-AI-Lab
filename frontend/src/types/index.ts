@@ -460,9 +460,16 @@ export type RealtimeEvent =
   | RealtimeCompleted
   | RealtimeError;
 
-/** Phase 6L: realtime response TTS mode. 'elevenlabs' (default) keeps the
- * server-side MP3 pipeline; 'browser' speaks tts_text events locally. */
+/** Realtime response TTS transport. 'elevenlabs' (default) requests
+ * server-side synthesized audio; the actual server provider is chosen by
+ * `tts_provider`. 'browser' speaks tts_text events locally. */
 export type RealtimeTtsMode = 'elevenlabs' | 'browser';
+
+/** Server-side TTS provider selectable for one realtime session. */
+export type RealtimeTtsProvider = 'elevenlabs' | 'azure';
+
+/** Unified TTS dropdown selection: a server provider or browser speech. */
+export type RealtimeTtsSelection = RealtimeTtsProvider | 'browser';
 
 /** Phase 6L: client → server mid-session TTS mode switch. The backend
  * applies it to the NEXT turn's TTS consumer. */
@@ -487,9 +494,13 @@ export interface RealtimeStartMessage {
    * (Qwen ASR Kaggle WebSocket). Omitted keeps the backend environment
    * resolution (STT_PROVIDER / DEFAULT_STT_PROVIDER). */
   stt_provider?: string;
-  /** Phase 6L: response TTS mode — 'elevenlabs' (server MP3, default) or
+  /** Response TTS transport — 'elevenlabs' (server audio, default) or
    * 'browser' (tts_text events spoken via speechSynthesis). */
   tts_mode?: RealtimeTtsMode;
+  /** Per-session server TTS provider (only meaningful when tts_mode is
+   * 'elevenlabs'). Omitted keeps the backend default (DEFAULT_TTS_PROVIDER).
+   * Browser TTS omits this field and never uses a server adapter. */
+  tts_provider?: RealtimeTtsProvider;
   /** Phase 2: true advertises MediaSource MP3 support — the backend then
    * delivers each sentence as ordered audio_chunk/audio_end messages while
    * it is still being synthesized. Omitted/false keeps complete segments. */

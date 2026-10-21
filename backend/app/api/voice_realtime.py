@@ -21,7 +21,9 @@ Client → Server protocol:
      "stt_provider": "deepgram"|"qwen"|"mai",
      "llm_provider": "openrouter", "llm_model": "openai/gpt-4o-mini",
      "utterance_end_ms": 1000, "tts_mode": "elevenlabs"|"browser",
-     "audio_stream": true|false}
+     "tts_provider": "elevenlabs"|"azure", "audio_stream": true|false}
+         (tts_provider selects the server provider for this session only;
+          omitted keeps DEFAULT_TTS_PROVIDER. Browser TTS never sends it.)
          (Phase 2: true advertises browser-side MediaSource MP3 support —
           each sentence is then delivered as audio_chunk/audio_end while it
           is still being synthesized. Omitted/false keeps the complete-MP3
@@ -100,7 +102,11 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.database import SessionLocal
 from app.core.logging import logger
-from app.providers.factory import get_llm_provider, get_tts_provider
+from app.providers.factory import (
+    SUPPORTED_TTS_PROVIDERS,
+    get_llm_provider,
+    get_tts_provider,
+)
 from app.providers.llm.interface import LLMInterface
 from app.providers.stt.streaming import (
     StreamConfig,
@@ -589,14 +595,18 @@ class RealtimeSessionState:
     completed_turn_metrics: dict[int, dict] = field(default_factory=dict)
     # Phase 6H: per-turn sentence-streaming TTS consumer (session-owned task)
     tts_task: asyncio.Task | None = None
-    # Phase 6L: response TTS mode for this session. "elevenlabs" (default)
-    # synthesizes MP3 audio server-side; "browser" forwards sentence text
-    # (tts_text events) and the browser speaks it via speechSynthesis — no
-    # ElevenL request, no MP3, no base64 audio. Set from the START message
-    # and switchable mid-session via the tts_mode control message; each
-    # turn's consumer reads it at creation, so a switch applies to the next
-    # turn (an in-flight response is never interrupted).
+    # Phase 6L: response TTS transport for this session. "elevenlabs"
+    # (default) synthesizes audio server-side; "browser" forwards sentence
+    # text (tts_text events) and the browser speaks it via speechSynthesis —
+    # no server request, no MP3, no base64 audio. Set from START and
+    # switchable mid-session via the tts_mode control message; each turn's
+    # consumer reads it at creation, so a switch applies to the next turn
+    # (an in-flight response is never interrupted).
     tts_mode: str = "elevenlabs"
+    # Per-session server TTS provider ("elevenlabs" or "azure"). Empty keeps
+    # the backend default (DEFAULT_TTS_PROVIDER). Only used when tts_mode is
+    # "elevenlabs"; browser mode never routes through a server adapter.
+    tts_provider: str = ""
     # Phase 2: incremental audio delivery. Set from START ("audio_stream":
     # true — the browser advertises MediaSource MP3 support): the TTS
     # consumer then forwards each sentence's provider chunks as
@@ -635,14 +645,17 @@ def _register_turn_metrics(
 
 def _parse_start_message(
     msg: dict,
-) -> tuple[StreamConfig, str, str | None, str, str]:
+) -> tuple[StreamConfig, str, str | None, str, str, str]:
     """Parse and validate a START message.
 
     Returns:
         Tuple of (StreamConfig, llm_provider, llm_model, tts_mode,
-        stt_provider).
+        tts_provider, stt_provider).
 
         tts_mode (Phase 6L) is "elevenlabs" (default) or "browser".
+        tts_provider is "" (keep the backend default DEFAULT_TTS_PROVIDER),
+        "elevenlabs", or "azure" (per-session server provider from the Voice
+        Chat dropdown; browser TTS never sends it).
         stt_provider is "" (keep the backend environment resolution),
         "deepgram", "qwen", or "mai" (per-session STT selection from the UI).
 
@@ -665,6 +678,9 @@ def _parse_start_message(
     # Phase 6L: response TTS mode — "elevenlabs" (server MP3 audio, the
     # existing pipeline) or "browser" (tts_text events + speechSynthesis).
     tts_mode = msg.get("tts_mode", "elevenlabs")
+    # Per-session server TTS provider (Voice Chat dropdown). Empty = keep the
+    # backend default (DEFAULT_TTS_PROVIDER). Browser mode never sends it.
+    tts_provider = msg.get("tts_provider", "") or ""
     # Per-session STT provider selection (Voice Chat UI). Empty = keep the
     # backend environment resolution (STT_PROVIDER / DEFAULT_STT_PROVIDER).
     stt_provider = msg.get("stt_provider", "") or ""
@@ -681,6 +697,11 @@ def _parse_start_message(
         raise ValueError("utterance_end_ms must be an integer")
     if tts_mode not in ("elevenlabs", "browser"):
         raise ValueError("tts_mode must be 'elevenlabs' or 'browser'")
+    if tts_provider and (
+        not isinstance(tts_provider, str)
+        or tts_provider not in SUPPORTED_TTS_PROVIDERS
+    ):
+        raise ValueError("tts_provider must be 'elevenlabs' or 'azure'")
     if stt_provider not in ("", "deepgram", "qwen", "mai"):
         raise ValueError("stt_provider must be 'deepgram', 'qwen' or 'mai'")
 
@@ -697,7 +718,7 @@ def _parse_start_message(
     error = cfg.validate()
     if error:
         raise ValueError(error)
-    return cfg, llm_provider, llm_model, tts_mode, stt_provider
+    return cfg, llm_provider, llm_model, tts_mode, tts_provider, stt_provider
 
 
 async def _safe_ws_send(
@@ -3278,9 +3299,14 @@ async def _handle_realtime_session(ws: WebSocket) -> None:
                     continue
 
                 try:
-                    cfg, llm_provider, llm_model, tts_mode, stt_provider = (
-                        _parse_start_message(msg)
-                    )
+                    (
+                        cfg,
+                        llm_provider,
+                        llm_model,
+                        tts_mode,
+                        tts_provider,
+                        stt_provider,
+                    ) = _parse_start_message(msg)
                 except ValueError as e:
                     await _safe_ws_send(
                         ws, state, {"type": "error", "message": str(e)}
@@ -3324,6 +3350,8 @@ async def _handle_realtime_session(ws: WebSocket) -> None:
                     # keeps the Phase 6K audio pipeline; "browser" forwards
                     # tts_text and the browser speaks it).
                     state.tts_mode = tts_mode
+                    # Per-session server TTS provider ("" = backend default).
+                    state.tts_provider = tts_provider
                     # Phase 2: incremental audio delivery — enabled only when
                     # the browser advertised MediaSource MP3 support in START
                     # ("audio_stream": true). Absent/false keeps the
@@ -3345,7 +3373,7 @@ async def _handle_realtime_session(ws: WebSocket) -> None:
 
                     # Pre-create TTS provider for reuse (session-level)
                     try:
-                        state.tts = get_tts_provider()
+                        state.tts = get_tts_provider(state.tts_provider or None)
                         logger.debug(
                             "[VOICE:REALTIME] TTS provider created provider=%s",
                             state.tts.provider_name,
@@ -3379,7 +3407,7 @@ async def _handle_realtime_session(ws: WebSocket) -> None:
                 logger.info(
                     "[VOICE:REALTIME] Session started connection_id=%s "
                     "voice_session_id=%s provider=%s model=%s sample_rate=%d "
-                    "llm_provider=%s llm_model=%s tts_mode=%s",
+                    "llm_provider=%s llm_model=%s tts_mode=%s tts_provider=%s",
                     connection_id,
                     state.voice_session_id,
                     state.stt_session.provider_name,
@@ -3388,6 +3416,7 @@ async def _handle_realtime_session(ws: WebSocket) -> None:
                     state.llm_provider,
                     state.llm_model,
                     state.tts_mode,
+                    state.tts_provider or "default",
                 )
                 if not await _safe_ws_send(
                     ws,

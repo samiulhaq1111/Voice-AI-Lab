@@ -16,10 +16,12 @@ import type {
   ProviderAvailability,
   RealtimeLogEntry,
   RealtimeTraceEvent,
+  RealtimeTtsSelection,
 } from '../types';
 import SearchableModelSelect from '../components/SearchableModelSelect';
 import { getProviders } from '../services/api';
 import useRealtimeVoice from './useRealtimeVoice';
+import { TTS_SELECTION_OPTIONS } from './ttsSelection';
 
 /** Subtle per-category colors for the trace rows (existing palette only). */
 const TRACE_EVENT_COLORS: Record<RealtimeTraceEvent, string> = {
@@ -167,11 +169,11 @@ export default function VoiceChat() {
     ttsProcessing,
     conversation,
     currentTurn,
-    ttsMode,
+    ttsSelection,
     browserTtsSupported,
     start,
     stop,
-    setTtsMode,
+    setTtsSelection,
   } = useRealtimeVoice({ onDiagnostic: handleDiagnostic });
 
   // Load providers on mount (same catalogue as the other screens).
@@ -224,7 +226,7 @@ export default function VoiceChat() {
       '=== VOICE CHAT REALTIME TRACE ===',
       `Session: ${sessionId ?? 'n/a'}`,
       `Started: ${meta.started || 'n/a'}`,
-      `TTS Mode: ${ttsMode}`,
+      `TTS: ${ttsSelection}`,
       `Model: ${meta.llm || 'default'}`,
       `Events: ${traceEntries.length}`,
       '==================================',
@@ -255,7 +257,7 @@ export default function VoiceChat() {
       if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
       copiedTimerRef.current = setTimeout(() => setTraceCopied(false), 1500);
     }
-  }, [sessionId, ttsMode, traceEntries]);
+  }, [sessionId, ttsSelection, traceEntries]);
 
   /** Clear ONLY the drawer history — never touches the live session. */
   const handleClearTrace = useCallback(() => {
@@ -332,33 +334,43 @@ export default function VoiceChat() {
         </div>
       </div>
 
-      {/* Compact STT + LLM + TTS selection (applies to the next session start) */}
-      <div className="flex flex-wrap items-center gap-2 px-4 py-2 border-b border-gray-800 bg-gray-900/50">
-        <label className="text-xs text-gray-400">STT:</label>
-        <select
-          value={selectedSTTProvider}
-          onChange={(e) => setSelectedSTTProvider(e.target.value)}
-          disabled={isBusy}
-          title="Streaming speech-to-text provider for the next session"
-          className="text-xs bg-gray-800 text-gray-200 rounded px-2 py-1 border border-gray-700 disabled:opacity-50"
-        >
-          <option value="deepgram">Deepgram</option>
-          <option value="qwen">Qwen ASR</option>
-          <option value="mai">MAI-Transcribe-2</option>
-        </select>
-        <label className="text-xs text-gray-400">LLM:</label>
-        <select
-          value={selectedLLMProvider}
-          onChange={(e) => setSelectedLLMProvider(e.target.value)}
-          disabled={isBusy}
-          className="text-xs bg-gray-800 text-gray-200 rounded px-2 py-1 border border-gray-700 disabled:opacity-50"
-        >
-          {providers?.llm.map((p) => (
-            <option key={p.provider} value={p.provider}>
-              {p.provider} {p.configured ? '(configured)' : '(not configured)'}
-            </option>
-          )) || <option value="openrouter">openrouter</option>}
-        </select>
+      {/* Compact STT + LLM + TTS selection (applied at the next session start) */}
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-2 px-4 py-2 border-b border-gray-800 bg-gray-900/50">
+        <div className="flex items-center gap-1">
+          <label htmlFor="voice-stt" className="text-xs text-gray-400">
+            STT:
+          </label>
+          <select
+            id="voice-stt"
+            value={selectedSTTProvider}
+            onChange={(e) => setSelectedSTTProvider(e.target.value)}
+            disabled={isBusy}
+            title="Streaming speech-to-text provider for the next session"
+            className="text-xs bg-gray-800 text-gray-200 rounded px-2 py-1 border border-gray-700 max-w-[10rem] disabled:opacity-50"
+          >
+            <option value="deepgram">Deepgram</option>
+            <option value="qwen">Qwen ASR</option>
+            <option value="mai">MAI-Transcribe-2</option>
+          </select>
+        </div>
+        <div className="flex items-center gap-1">
+          <label htmlFor="voice-llm" className="text-xs text-gray-400">
+            LLM:
+          </label>
+          <select
+            id="voice-llm"
+            value={selectedLLMProvider}
+            onChange={(e) => setSelectedLLMProvider(e.target.value)}
+            disabled={isBusy}
+            className="text-xs bg-gray-800 text-gray-200 rounded px-2 py-1 border border-gray-700 max-w-[12rem] disabled:opacity-50"
+          >
+            {providers?.llm.map((p) => (
+              <option key={p.provider} value={p.provider}>
+                {p.provider} {p.configured ? '(configured)' : '(not configured)'}
+              </option>
+            )) || <option value="openrouter">openrouter</option>}
+          </select>
+        </div>
         <SearchableModelSelect
           value={llmModel}
           onChange={setLlmModel}
@@ -373,37 +385,34 @@ export default function VoiceChat() {
             { label: 'FREE / EXPERIMENTAL', models: freeModels },
             { label: 'PAID / PAYG', models: paidModels },
           ]}
-          selectClassName="text-xs bg-gray-800 text-gray-200 rounded px-2 py-1 border border-gray-700 max-w-[240px] disabled:opacity-50"
+          className="min-w-[190px] flex-1 basis-[240px] max-w-[280px]"
+          selectClassName="text-xs bg-gray-800 text-gray-200 rounded px-2 py-1 border border-gray-700 w-full disabled:opacity-50"
         />
-        <span className="ml-auto flex items-center gap-1">
-          <span className="text-xs text-gray-500">TTS:</span>
-          <button
-            onClick={() => setTtsMode('elevenlabs')}
-            className={
-              ttsMode === 'elevenlabs'
-                ? 'px-2 py-0.5 bg-blue-600 text-white rounded text-xs font-medium'
-                : 'px-2 py-0.5 bg-gray-700 text-gray-300 rounded text-xs hover:bg-gray-600'
+        <div className="ml-auto flex items-center gap-1">
+          <label htmlFor="voice-tts" className="text-xs text-gray-400">
+            TTS:
+          </label>
+          <select
+            id="voice-tts"
+            value={ttsSelection}
+            onChange={(e) =>
+              setTtsSelection(e.target.value as RealtimeTtsSelection)
             }
+            disabled={isBusy}
+            title="Response speech for the next session: a server-side provider or browser speechSynthesis"
+            className="text-xs bg-gray-800 text-gray-200 rounded px-2 py-1 border border-gray-700 min-w-[8.5rem] disabled:opacity-50"
           >
-            ElevenLabs
-          </button>
-          <button
-            onClick={() => setTtsMode('browser')}
-            disabled={!browserTtsSupported}
-            title={
-              browserTtsSupported
-                ? 'Speak responses locally via speechSynthesis'
-                : 'speechSynthesis is not available in this browser'
-            }
-            className={
-              ttsMode === 'browser'
-                ? 'px-2 py-0.5 bg-blue-600 text-white rounded text-xs font-medium'
-                : 'px-2 py-0.5 bg-gray-700 text-gray-300 rounded text-xs hover:bg-gray-600 disabled:opacity-40 disabled:hover:bg-gray-700 disabled:cursor-not-allowed'
-            }
-          >
-            Browser
-          </button>
-        </span>
+            {TTS_SELECTION_OPTIONS.map((option) => (
+              <option
+                key={option.value}
+                value={option.value}
+                disabled={option.value === 'browser' && !browserTtsSupported}
+              >
+                {option.label}
+              </option>
+            ))}
+          </select>
+        </div>
       </div>
 
       {/* Conversation */}

@@ -28,6 +28,10 @@ class Settings(BaseSettings):
     openrouter_api_key: str = ""
     deepgram_api_key: str = ""
     elevenlabs_api_key: str = ""
+    # Microsoft Azure AI Speech TTS (optional provider).
+    azure_tts_key: str = ""
+    azure_tts_region: str = ""
+    azure_tts_voice: str = "en-US-JennyNeural"
     telnyx_api_key: str = ""
     telnyx_speak_voice: str = "female"
     telnyx_media_ws_url: str = ""
@@ -70,6 +74,9 @@ class Settings(BaseSettings):
 
     def is_provider_configured(self, provider: str) -> bool:
         """Check whether a provider has its API key set."""
+        if provider == "azure":
+            # Azure needs both a key and a region to reach the resource.
+            return bool(self.azure_tts_key and self.azure_tts_region)
         key_map = {
             "deepgram": self.deepgram_api_key,
             "openrouter": self.openrouter_api_key,

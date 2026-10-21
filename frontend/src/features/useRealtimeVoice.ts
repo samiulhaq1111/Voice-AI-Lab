@@ -30,6 +30,8 @@ import type {
   RealtimeTimings,
   RealtimeTtsMode,
   RealtimeTtsModeMessage,
+  RealtimeTtsProvider,
+  RealtimeTtsSelection,
   RealtimeTraceEvent,
   RealtimeTurnMetrics,
 } from '../types';
@@ -48,6 +50,7 @@ import {
   markTurnReported,
 } from './realtimeAudioQueue';
 import type { AudioQueueState, AudioSegment } from './realtimeAudioQueue';
+import { ttsSelectionOf, ttsStartFields } from './ttsSelection';
 
 const WS_BASE = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000').replace(
   'http',
@@ -279,10 +282,13 @@ export interface UseRealtimeVoiceResult {
   turnMetrics: RealtimeTurnMetrics | null;
   browserPlaybackLatencyMs: number | null;
   ttsMode: RealtimeTtsMode;
+  ttsProvider: RealtimeTtsProvider;
+  ttsSelection: RealtimeTtsSelection;
   browserTtsSupported: boolean;
   start: (config: RealtimeStartConfig) => Promise<void>;
   stop: () => void;
   setTtsMode: (mode: RealtimeTtsMode) => void;
+  setTtsSelection: (selection: RealtimeTtsSelection) => void;
 }
 
 export default function useRealtimeVoice(
@@ -320,9 +326,13 @@ export default function useRealtimeVoice(
     null,
   );
 
-  // Phase 6L: response TTS mode — 'elevenlabs' (server MP3, default) or
+  // Response TTS transport — 'elevenlabs' (server audio, default) or
   // 'browser' (tts_text events spoken locally via speechSynthesis).
   const [ttsModeState, setTtsModeState] = useState<RealtimeTtsMode>('elevenlabs');
+  // Per-session server TTS provider. ElevenLabs preserves the prior default;
+  // Azure is sent explicitly in START and never changes global configuration.
+  const [ttsProviderState, setTtsProviderState] =
+    useState<RealtimeTtsProvider>('elevenlabs');
 
   const wsRef = useRef<WebSocket | null>(null);
   // Generation counter: incremented on every start(). Socket
@@ -1702,21 +1712,30 @@ export default function useRealtimeVoice(
           if (config.llmModel) {
             startMsg.llm_model = config.llmModel;
           }
-          // Phase 6L: response TTS mode — elevenlabs (server MP3) or browser
-          // (tts_text events + local speechSynthesis).
-          startMsg.tts_mode = ttsModeState;
+          // TTS selection: server transport + provider, or browser speech.
+          // Browser TTS omits tts_provider — no server adapter is involved.
+          const ttsFields = ttsStartFields(
+            ttsSelectionOf(ttsModeState, ttsProviderState),
+          );
+          startMsg.tts_mode = ttsFields.tts_mode;
+          if (ttsFields.tts_provider) {
+            startMsg.tts_provider = ttsFields.tts_provider;
+          }
           // Phase 2: advertise incremental MP3 delivery support — only then
           // does the backend stream audio_chunk/audio_end for this session.
           startMsg.audio_stream = AUDIO_STREAM_SUPPORTED;
           ws.send(JSON.stringify(startMsg));
           addLog(
             'ws',
-            `START sent sample_rate=${audioCtx.sampleRate} stt=${config.sttProvider || 'default'} llm=${config.llmProvider}/${config.llmModel || 'default'} tts=${ttsModeState} audio_stream=${AUDIO_STREAM_SUPPORTED}`,
+            `START sent sample_rate=${audioCtx.sampleRate} stt=${config.sttProvider || 'default'} llm=${config.llmProvider}/${config.llmModel || 'default'} tts=${ttsSelectionOf(ttsModeState, ttsProviderState)} audio_stream=${AUDIO_STREAM_SUPPORTED}`,
           );
           trace(
             'WS_CONNECTED',
             `url=${REALTIME_WS_URL.replace(/^wss?:\/\//, '')}` +
-              ` rate=${audioCtx.sampleRate} tts_mode=${ttsModeState}`,
+              ` rate=${audioCtx.sampleRate} tts_mode=${ttsModeState}` +
+                (ttsModeState === 'elevenlabs'
+                  ? ` tts_provider=${ttsProviderState}`
+                  : ''),
             null,
           );
 
@@ -1800,7 +1819,15 @@ export default function useRealtimeVoice(
         trace('SESSION_ERROR', `stage=start message="${clip(msg, 80)}"`, null);
       }
     },
-    [addLog, connState, handleServerEvent, teardownAudio, ttsModeState, trace],
+    [
+      addLog,
+      connState,
+      handleServerEvent,
+      teardownAudio,
+      ttsModeState,
+      ttsProviderState,
+      trace,
+    ],
   );
 
   const stop = useCallback(() => {
@@ -1873,6 +1900,31 @@ export default function useRealtimeVoice(
     [addLog, ttsModeState],
   );
 
+  /** Unified TTS dropdown selection.
+   *
+   * The server provider is fixed when a session starts, so a provider change
+   * while connected is ignored (the Voice Chat dropdown is disabled then).
+   * Mode-only switches (server ↔ browser) keep the existing next-turn
+   * behavior. Browser selection never sends a server provider.
+   */
+  const setTtsSelection = useCallback(
+    (selection: RealtimeTtsSelection) => {
+      if (selection === 'browser') {
+        setTtsMode('browser');
+        return;
+      }
+      if (selection !== ttsProviderState) {
+        if (connState !== 'disconnected') {
+          addLog('ws', `tts_provider=${selection} requires a new session`);
+          return;
+        }
+        setTtsProviderState(selection);
+      }
+      setTtsMode('elevenlabs');
+    },
+    [addLog, connState, setTtsMode, ttsProviderState],
+  );
+
   const currentTurn = currentTurnText(conversation);
 
   return {
@@ -1887,9 +1939,12 @@ export default function useRealtimeVoice(
     turnMetrics,
     browserPlaybackLatencyMs,
     ttsMode: ttsModeState,
+    ttsProvider: ttsProviderState,
+    ttsSelection: ttsSelectionOf(ttsModeState, ttsProviderState),
     browserTtsSupported: BROWSER_TTS_SUPPORTED,
     start,
     stop,
     setTtsMode,
+    setTtsSelection,
   };
 }
