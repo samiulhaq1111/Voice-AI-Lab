@@ -67,10 +67,40 @@ class Settings(BaseSettings):
     max_agent_iterations: int = 5
     max_conversation_messages: int = 50
 
+    # --- MCP Tools (optional; disabled by default) ---
+    # When enabled, the backend connects at startup to ONE local stdio MCP
+    # server and registers ONLY the explicitly allowlisted tools as native
+    # tools (named mcp_<label>_<tool>) through the existing tool registry.
+    # Startup is fail-soft: an unavailable server never blocks the app.
+    mcp_enabled: bool = False
+    mcp_server_label: str = "local"
+    mcp_server_command: str = ""
+    # Comma-separated stdio server arguments (empty = none).
+    mcp_server_args: str = ""
+    # Comma-separated MCP tool names to bridge. Explicit allowlist only;
+    # tools are never selected implicitly from the server's listing.
+    mcp_allowed_tools: str = ""
+    mcp_tool_timeout: float = 10.0
+    mcp_connect_timeout: float = 10.0
+    # Shared secret for the runtime enable/disable control endpoints.
+    # Empty (the default) restricts control to loopback clients; when set,
+    # non-local callers must send it as the X-MCP-Control-Token header.
+    mcp_control_token: str = ""
+
     @property
     def cors_origin_list(self) -> list[str]:
         """Parse comma-separated CORS origins into a list."""
         return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
+
+    @property
+    def mcp_server_arg_list(self) -> list[str]:
+        """Parse comma-separated MCP stdio server arguments into a list."""
+        return [arg.strip() for arg in self.mcp_server_args.split(",") if arg.strip()]
+
+    @property
+    def mcp_allowed_tool_list(self) -> list[str]:
+        """Parse comma-separated allowlisted MCP tool names into a list."""
+        return [name.strip() for name in self.mcp_allowed_tools.split(",") if name.strip()]
 
     def is_provider_configured(self, provider: str) -> bool:
         """Check whether a provider has its API key set."""

@@ -87,6 +87,31 @@ class ToolListResponse(BaseModel):
     count: int
 
 
+# --- MCP Status ---
+class MCPToolStatusResponse(BaseModel):
+    """One MCP-bridged tool registered in the native tool registry."""
+
+    name: str
+    description: str
+    mcp_tool: str
+
+
+class MCPStatusResponse(BaseModel):
+    """Read-only MCP integration status.
+
+    Safe fields only: no environment values, command lines, subprocess
+    arguments, or raw exception details.
+    """
+
+    enabled: bool
+    connected: bool
+    state: str
+    server_label: str
+    error: str | None = None
+    mcp_tools: list[MCPToolStatusResponse] = Field(default_factory=list)
+    native_tools: list[str] = Field(default_factory=list)
+
+
 # --- Provider ---
 class ProviderInfoResponse(BaseModel):
     """Information about a configured provider."""

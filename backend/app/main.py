@@ -10,6 +10,7 @@ from sqlalchemy import inspect, text
 from app.api.benchmarks import router as benchmarks_router
 from app.api.chat import router as chat_router
 from app.api.health import router as health_router
+from app.api.mcp import router as mcp_router
 from app.api.providers import router as providers_router
 from app.api.retell import router as retell_router
 from app.api.tools import router as tools_router
@@ -19,6 +20,7 @@ from app.api.voice_telephony import router as voice_telephony_router
 from app.core.config import settings
 from app.core.database import Base, engine
 from app.core.logging import logger, setup_logging
+from app.services.mcp_service import shutdown_mcp, startup_mcp
 from app.services.tool_service import get_tool_registry
 
 
@@ -96,9 +98,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     registry = get_tool_registry()
     logger.info("Tool registry initialized with %d tools", registry.count)
 
+    # Optional MCP stdio tools (disabled by default; fail-soft on any error,
+    # so native tools always remain available).
+    if await startup_mcp(registry):
+        logger.info("MCP connected; tool registry now holds %d tools", registry.count)
+
     yield
 
     # Shutdown
+    await shutdown_mcp()
     logger.info("Shutting down Voice AI Lab backend...")
 
 
@@ -123,6 +131,7 @@ def create_app() -> FastAPI:
     # Routers
     app.include_router(health_router)
     app.include_router(tools_router, prefix="/api/v1")
+    app.include_router(mcp_router, prefix="/api/v1")
     app.include_router(providers_router, prefix="/api/v1")
     app.include_router(chat_router, prefix="/api/v1")
     app.include_router(benchmarks_router, prefix="/api/v1")

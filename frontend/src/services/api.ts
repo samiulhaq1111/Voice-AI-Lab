@@ -16,11 +16,15 @@ import type {
   ChatRequest,
   ChatResponse,
   HealthStatus,
+  MCPStatus,
   ProviderAvailability,
   ToolInfo,
 } from '../types';
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
+
+/** Optional shared secret for the MCP runtime control endpoints. */
+const MCP_CONTROL_TOKEN = import.meta.env.VITE_MCP_CONTROL_TOKEN as string | undefined;
 
 async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, init);
@@ -40,6 +44,32 @@ export async function getHealth(): Promise<HealthStatus> {
 /** List all registered tools. */
 export async function getTools(): Promise<{ tools: ToolInfo[]; count: number }> {
   return fetchJson<{ tools: ToolInfo[]; count: number }>('/api/v1/tools');
+}
+
+/** Get MCP integration status (read-only). */
+export async function getMCPStatus(): Promise<MCPStatus> {
+  return fetchJson<MCPStatus>('/api/v1/mcp/status');
+}
+
+/** Auth header for MCP control when the backend requires a token. */
+function mcpControlHeaders(): Record<string, string> {
+  return MCP_CONTROL_TOKEN ? { 'X-MCP-Control-Token': MCP_CONTROL_TOKEN } : {};
+}
+
+/** Runtime-enable MCP; returns the backend's actual resulting state. */
+export async function enableMCP(): Promise<MCPStatus> {
+  return fetchJson<MCPStatus>('/api/v1/mcp/enable', {
+    method: 'POST',
+    headers: mcpControlHeaders(),
+  });
+}
+
+/** Runtime-disable MCP; returns the backend's actual resulting state. */
+export async function disableMCP(): Promise<MCPStatus> {
+  return fetchJson<MCPStatus>('/api/v1/mcp/disable', {
+    method: 'POST',
+    headers: mcpControlHeaders(),
+  });
 }
 
 /** Get available providers. */

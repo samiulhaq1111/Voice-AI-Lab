@@ -101,6 +101,32 @@ export interface ToolInfo {
   enabled: boolean;
 }
 
+// --- MCP Status ---
+
+/** Backend-derived MCP lifecycle state: `disabled` (default), `connected`
+ * (live session held by the lifespan), `failed` (startup failed — see
+ * `error`), or `not_started` (enabled but no live session and no recorded
+ * failure). `connected` is never inferred from the enable flag alone. */
+export type MCPState = 'disabled' | 'connected' | 'failed' | 'not_started';
+
+/** One MCP-bridged tool registered in the native tool registry. */
+export interface MCPToolStatus {
+  name: string;
+  description: string;
+  mcp_tool: string;
+}
+
+export interface MCPStatus {
+  enabled: boolean;
+  connected: boolean;
+  state: MCPState;
+  server_label: string;
+  /** Sanitized failure message (exception type only) or null. */
+  error: string | null;
+  mcp_tools: MCPToolStatus[];
+  native_tools: string[];
+}
+
 // --- Health ---
 
 export interface HealthStatus {

@@ -20,6 +20,7 @@ import type {
 } from '../types';
 import SearchableModelSelect from '../components/SearchableModelSelect';
 import { getProviders } from '../services/api';
+import MCPStatus from './MCPStatus';
 import useRealtimeVoice from './useRealtimeVoice';
 import { TTS_SELECTION_OPTIONS } from './ttsSelection';
 
@@ -413,6 +414,11 @@ export default function VoiceChat() {
             ))}
           </select>
         </div>
+      </div>
+
+      {/* MCP tools — runtime enable/disable; all state from the backend */}
+      <div className="px-4 py-2 border-b border-gray-800 bg-gray-900/40">
+        <MCPStatus />
       </div>
 
       {/* Conversation */}
